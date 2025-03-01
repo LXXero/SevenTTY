@@ -8,6 +8,7 @@
 #include "ssheven.h"
 #include "ssheven-console.h"
 #include "ssheven-net.h"
+#include "ssheven-unicode.h"
 
 #include <string.h>
 
@@ -18,8 +19,6 @@
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
 
-// printable lozenge character in the Mac Roman encoding
-const char MAC_ROMAN_LOZENGE = 0xD7;
 
 char key_to_vterm[256] = { VTERM_KEY_NONE };
 
@@ -445,12 +444,19 @@ void draw_screen_color(Rect* r)
 
 			uint32_t glyph = vtsc.chars[0];
 
-			if (glyph == '\0') glyph = ' ';
+			if (glyph == 0) glyph = ' ';
 
-			// turn any non-ASCII into apples
+			// normalize some unicode
 			if (glyph > 127)
 			{
-				glyph = MAC_ROMAN_LOZENGE;
+				if (glyph <= 0xFFFF)
+				{
+					glyph = UNICODE_BMP_NORMALIZER[glyph];
+				}
+				else
+				{
+					glyph = MAC_ROMAN_LOZENGE;
+				}
 			}
 
 			row_text[pos.col] = glyph;
@@ -612,12 +618,19 @@ void draw_screen_fast(Rect* r)
 
 			uint32_t glyph = here.chars[0];
 
-			if (glyph == '\0') glyph = ' ';
+			if (glyph == 0) glyph = ' ';
 
-			// turn any non-ASCII into apples
+			// normalize some unicode
 			if (glyph > 127)
 			{
-				glyph = MAC_ROMAN_LOZENGE;
+				if (glyph <= 0xFFFF)
+				{
+					glyph = UNICODE_BMP_NORMALIZER[glyph];
+				}
+				else
+				{
+					glyph = MAC_ROMAN_LOZENGE;
+				}
 			}
 
 			row_text[pos.col] = glyph;
