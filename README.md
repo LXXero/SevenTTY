@@ -1,53 +1,64 @@
-![ssheven box](http://www.cy384.com/media/img/ssheven_box_front_small.png)
+SevenTTY
+========
+SSH client, local shell, and terminal emulator for classic Mac OS 7/8/9.
 
-ssheven
--------
-A minimal new SSH client for Mac OS 7/8/9.
+A fork of [ssheven](https://github.com/cy384/ssheven) by cy384, expanded into a full-featured terminal environment.
 
-Project status: as of 0.8.0 ([see github releases](https://github.com/cy384/ssheven/releases)), fairly secure and usable, but without a polished UX or all planned features.  Versions prior to 1.0.0 should be considered alpha/beta quality.
+![SevenTTY screenshot](screenshot.png)
 
-![ssheven screenshot](http://www.cy384.com/media/img/ssheven-0.8.8.png)
+features
+--------
+* **Multi-window**: Cmd+N opens independent windows, each with their own tabs
+* **Tabbed sessions**: Cmd+T for local shell tabs, Cmd+S for SSH tabs, Cmd+1-8 to switch
+* **Local shell**: built-in command interpreter with 30+ commands
+  * File operations: `ls`, `cd`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `touch`, and more
+  * System info: `ps`, `free`, `df`, `uname`, `date`
+  * Mac-specific: `getinfo`, `chown`, `settype`, `setcreator`, `chmod`, `label`
+  * Tab completion, command history (up/down arrows), colorized `ls` output
+* **SSH client**: password and public key authentication, known hosts verification
+* **Scrollback**: Shift+Page Up/Down to scroll through history (100 lines per session)
+* **Copy/paste**: mouse text selection with Cmd+C/V
+* **16-color terminal**: xterm-compatible with bold, italic, underline, reverse video
+* **Configurable**: font size, foreground/background colors, terminal type string
 
 system requirements
 -------------------
-* CPU: Any PPC processor, or at least a 68030 (68040 strongly recommended).
-* RAM: 2MB.
-* Disk space: fits on a floppy.
-* System 7.1 or later. Versions below 7.5 require the Thread Manager extension.
-* Open Transport networking required, latest version possible highly recommended.
+* **CPU**: any PPC processor, or at least a 68030 (68040 strongly recommended)
+* **RAM**: 2 MB
+* **Disk**: fits on a floppy
+* **System**: 7.1 or later (versions below 7.5 require the Thread Manager extension)
+* **Network**: Open Transport required for SSH (local shell works without it)
 
-features that might happen
---------------------------
-* improved unicode support
-* basic scp file transfer
-* configurable terminal string
-* configurable/auto-choosing SSH buffer size (improves feel for faster machines)
-* nicer error presentation for more failure cases
-* add `known_hosts` reset option
-* read Apple HIG and clean up UI/UX
-* all license info in an about box type thing
-* finish and upload papercraft box, floppy sticker artwork, icon/logo svg
-* more complete color support
-* keyboard-interactive login
-* better debug output
-* multiple terminal windows open at once
-
-known problems
---------------
-* drawing the screen is somewhat slow
-* input latency feels high because redrawing the screen is slow (along with all the encryption, which is also slow)
-* receiving a large amount of data may break the channel or cause lockups (e.g. `cat /dev/zero`)
-* non-US keyboard input may or may not have issues
+keyboard shortcuts
+------------------
+| Shortcut | Action |
+|----------|--------|
+| Cmd+N | New window |
+| Cmd+T | New local shell tab |
+| Cmd+S | New SSH tab |
+| Cmd+W | Close tab/window |
+| Cmd+D | Disconnect SSH / close tab / quit |
+| Cmd+K | Connect (SSH) |
+| Cmd+1-8 | Switch tabs |
+| Cmd+C/V | Copy/paste |
+| Shift+PgUp/PgDn | Scroll through history |
 
 build
 -----
-Uses [Retro68](https://github.com/autc04/Retro68/) (requires the Universal headers) and cmake.
+Requires [Retro68](https://github.com/autc04/Retro68/) with Universal Headers and cmake.
 
-Requires mbedtls, libssh2, and libvterm, see my (cy384's) hackjobs of those libraries for details.  These are now pulled in as submodules, and everything should get built with a single CMake build.
+Dependencies (mbedtls, libssh2, libvterm) are pulled in as submodules and built automatically.
 
-The script `build-ssheven.bash` can be used to build a fat binary, or just as reference for build commands.
+```bash
+mkdir build-m68k && cd build-m68k
+cmake .. -DCMAKE_TOOLCHAIN_FILE=/path/to/Retro68-build/toolchain/m68k-apple-macos/cmake/retro68.toolchain.cmake
+cmake --build . --parallel $(nproc)
+```
+
+The script `build-ssheven.bash` can also be used to build a fat binary.
 
 license
 -------
 Licensed under the BSD 2 clause license, see `LICENSE` file.
 
+Based on ssheven by [cy384](https://github.com/cy384/ssheven).
