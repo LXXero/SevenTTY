@@ -55,7 +55,7 @@ cmake .. -DCMAKE_TOOLCHAIN_FILE=/path/to/Retro68-build/toolchain/m68k-apple-maco
 cmake --build . --parallel $(nproc)
 ```
 
-The script `build-ssheven.bash` can also be used to build a fat binary.
+The script `build-fat.bash` can also be used to build a fat binary.
 
 license
 -------

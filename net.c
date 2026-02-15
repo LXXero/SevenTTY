@@ -1,14 +1,14 @@
 /*
- * ssheven
+ * SevenTTY (based on ssheven by cy384)
  *
  * Copyright (c) 2021 by cy384 <cy384@cy384.com>
  * See LICENSE file for details
  */
 
-#include "ssheven.h"
-#include "ssheven-net.h"
-#include "ssheven-console.h"
-#include "ssheven-debug.h"
+#include "app.h"
+#include "net.h"
+#include "console.h"
+#include "debug.h"
 
 #include <errno.h>
 #include <Script.h>
@@ -41,7 +41,7 @@ void ssh_write(char* buf, size_t len)
 void ssh_read(int session_idx)
 {
 	struct session* s = &sessions[session_idx];
-	ssize_t rc = libssh2_channel_read(s->channel, s->recv_buffer, SSHEVEN_BUFFER_SIZE);
+	ssize_t rc = libssh2_channel_read(s->channel, s->recv_buffer, SSH_BUFFER_SIZE);
 
 	if (rc == 0) return;
 

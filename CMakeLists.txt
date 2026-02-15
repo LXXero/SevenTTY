@@ -1,12 +1,12 @@
-# ssheven
+# SevenTTY
 #
-# Copyright (c) 2021 by cy384 <cy384@cy384.com>
+# Based on ssheven by cy384 <cy384@cy384.com>
 # See LICENSE file for details
 
 cmake_minimum_required(VERSION 3.9)
 
-project(ssheven)
-add_application(ssheven CREATOR "SSH7" ssheven.c ssheven-console.c ssheven.r ssheven-net.c ssheven-debug.c ssheven-shell.c)
+project(SevenTTY)
+add_application(SevenTTY CREATOR "SSH7" app.c console.c resources.r net.c debug.c shell.c)
 
 # set up and build mbedtls
 set(ENABLE_PROGRAMS OFF CACHE BOOL "disable mbedtls programs" FORCE)
@@ -26,12 +26,12 @@ add_subdirectory(libvterm)
 
 IF(CMAKE_SYSTEM_NAME MATCHES Retro68)
 # for 68k
-  set_target_properties(ssheven PROPERTIES COMPILE_FLAGS "-ffunction-sections -mcpu=68020 -O3 -Wall -Wextra -Wno-unused-parameter")
-  set_target_properties(ssheven PROPERTIES LINK_FLAGS "-Wl,-gc-sections -Wl,--mac-segments -Wl,${CMAKE_CURRENT_SOURCE_DIR}/ssheven.segmap")
-  target_link_libraries(ssheven libssh2 mbedtls mbedx509 mbedcrypto OpenTransportApp OpenTransport OpenTptInet vterm retrocrt)
+  set_target_properties(SevenTTY PROPERTIES COMPILE_FLAGS "-ffunction-sections -mcpu=68020 -O3 -Wall -Wextra -Wno-unused-parameter")
+  set_target_properties(SevenTTY PROPERTIES LINK_FLAGS "-Wl,-gc-sections")
+  target_link_libraries(SevenTTY libssh2 mbedtls mbedx509 mbedcrypto OpenTransportApp OpenTransport OpenTptInet vterm retrocrt)
 ELSE()
 # for PPC
-  set_target_properties(ssheven PROPERTIES COMPILE_FLAGS "-ffunction-sections -mcpu=601 -O3 -Wall -Wextra -Wno-unused-parameter")
-  set_target_properties(ssheven PROPERTIES LINK_FLAGS "-Wl,-gc-sections")
-  target_link_libraries(ssheven ThreadsLib libssh2 mbedtls mbedx509 mbedcrypto OpenTransportAppPPC OpenTransportLib OpenTptInternetLib vterm retrocrt)
+  set_target_properties(SevenTTY PROPERTIES COMPILE_FLAGS "-ffunction-sections -mcpu=601 -O3 -Wall -Wextra -Wno-unused-parameter")
+  set_target_properties(SevenTTY PROPERTIES LINK_FLAGS "-Wl,-gc-sections")
+  target_link_libraries(SevenTTY ThreadsLib libssh2 mbedtls mbedx509 mbedcrypto OpenTransportAppPPC OpenTransportLib OpenTptInternetLib vterm retrocrt)
 ENDIF()

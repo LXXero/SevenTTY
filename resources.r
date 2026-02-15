@@ -1,5 +1,5 @@
-#include "ssheven-constants.r"
-#include "ssheven-icons.r"
+#include "constants.r"
+#include "icons.r"
 
 #include "Dialogs.r"
 #include "Processes.r"
@@ -29,7 +29,7 @@ resource 'DITL' (DITL_ABOUT, purgeable) {
 		StaticText { disabled, "SevenTTY" };
 
 		{ 64, 160, 84, 410},
-		StaticText { disabled, SSHEVEN_LONG_VERSION };
+		StaticText { disabled, APP_LONG_VERSION };
 
 		{ 94, 160, 114, 410},
 		StaticText { disabled, "https://github.com/LXXero/SevenTTY" };
@@ -159,7 +159,7 @@ resource 'DITL' (DITL_CPU_BAD) {
 		Button { enabled, "OK" };
 
 		{ 10, 70, 30, 340 },
-		StaticText { enabled, "SSHeven requires a 68020 or later!" };
+		StaticText { enabled, "SevenTTY requires a 68020 or later!" };
 	}
 };
 
@@ -386,55 +386,55 @@ resource 'SIZE' (-1) {
 	reserved,
 	reserved,
 	reserved,
-	SSHEVEN_MINIMUM_PARTITION,
-	SSHEVEN_REQUIRED_PARTITION
+	APP_MINIMUM_PARTITION,
+	APP_REQUIRED_PARTITION
 };
 
 /* see macintosh tb essentials page 7-31 */
 /* yes, we need two */
 /* first one displayed in version field of info window */
 resource 'vers' (1, purgeable) {
-	SSHEVEN_VERSION_MAJOR, SSHEVEN_VERSION_MINOR,
-	SSHEVEN_RELEASE_TYPE, SSHEVEN_VERSION_PRERELEASE,
-	SSHEVEN_RELEASE_REGION,
-	SSHEVEN_VERSION,
-	SSHEVEN_LONG_VERSION
+	APP_VERSION_MAJOR, APP_VERSION_MINOR,
+	APP_RELEASE_TYPE, APP_VERSION_PRERELEASE,
+	APP_RELEASE_REGION,
+	APP_VERSION,
+	APP_LONG_VERSION
 };
 
 /* second one displayed beneath icon at top of info window */
 resource 'vers' (2, purgeable) {
-	SSHEVEN_VERSION_MAJOR, SSHEVEN_VERSION_MINOR,
-	SSHEVEN_RELEASE_TYPE, SSHEVEN_VERSION_PRERELEASE,
-	SSHEVEN_RELEASE_REGION,
-	SSHEVEN_VERSION,
-	SSHEVEN_LONG_VERSION
+	APP_VERSION_MAJOR, APP_VERSION_MINOR,
+	APP_RELEASE_TYPE, APP_VERSION_PRERELEASE,
+	APP_RELEASE_REGION,
+	APP_VERSION,
+	APP_LONG_VERSION
 };
 
 /* signature resource */
 type 'SSH7' as 'STR ';
 resource 'SSH7' (0, purgeable) {
-	SSHEVEN_DESCRIPTION
+	APP_DESCRIPTION
 };
 
 /* application -> icon relation */
-resource 'FREF' (SSHEVEN_APPLICATION_ICON, purgeable) {
+resource 'FREF' (APP_ICON, purgeable) {
 	'APPL', 0, ""
 };
 
 /* preferences file -> icon relation */
-resource 'FREF' (SSHEVEN_FILE_ICON, purgeable) {
+resource 'FREF' (FILE_ICON, purgeable) {
 	'SH7p', 1, ""
 };
 
 resource 'BNDL' (128, purgeable) {
 	'SSH7', 0,
 	{
-		'ICN#', {0, SSHEVEN_APPLICATION_ICON, 1, SSHEVEN_FILE_ICON},
-		'FREF', {0, SSHEVEN_APPLICATION_ICON, 1, SSHEVEN_FILE_ICON}
+		'ICN#', {0, APP_ICON, 1, FILE_ICON},
+		'FREF', {0, APP_ICON, 1, FILE_ICON}
 	}
 };
 
-resource 'MBAR' (MBAR_SSHEVEN, preload)
+resource 'MBAR' (MBAR_MAIN, preload)
 {
 	{ MENU_APPLE, MENU_FILE, MENU_EDIT };
 };

@@ -1,15 +1,15 @@
 /*
- * ssheven
+ * SevenTTY (based on ssheven by cy384)
  *
  * Copyright (c) 2020 by cy384 <cy384@cy384.com>
  * See LICENSE file for details
  */
 
-#include "ssheven.h"
-#include "ssheven-console.h"
-#include "ssheven-net.h"
-#include "ssheven-shell.h"
-#include "ssheven-debug.h"
+#include "app.h"
+#include "console.h"
+#include "net.h"
+#include "shell.h"
+#include "debug.h"
 
 #include <Threads.h>
 #include <MacMemory.h>
@@ -30,7 +30,7 @@ int qd_color_to_menu_item(int qd_color);
 int font_size_to_menu_item(int font_size);
 
 // sinful globals
-struct ssheven_console con = { 0, 0 };
+struct console_metrics con = { 0, 0 };
 struct session sessions[MAX_SESSIONS] = {0};
 struct window_context windows[MAX_WINDOWS] = {0};
 int num_windows = 0;
@@ -155,7 +155,7 @@ void set_terminal_string(void)
 			prefs.terminal_string = "xterm-16color";
 			break;
 		default:
-			prefs.terminal_string = SSHEVEN_DEFAULT_TERM_STRING;
+			prefs.terminal_string = DEFAULT_TERM_STRING;
 			break;
 	}
 }
@@ -247,8 +247,8 @@ int detect_color_screen(void)
 void init_prefs(void)
 {
 	// initialize everything to a safe default
-	prefs.major_version = SSHEVEN_VERSION_MAJOR;
-	prefs.minor_version = SSHEVEN_VERSION_MINOR;
+	prefs.major_version = APP_VERSION_MAJOR;
+	prefs.minor_version = APP_VERSION_MINOR;
 
 	memset(&(prefs.hostname), 0, 512);
 	memset(&(prefs.username), 0, 256);
@@ -262,7 +262,7 @@ void init_prefs(void)
 
 	prefs.pubkey_path = "";
 	prefs.privkey_path = "";
-	prefs.terminal_string = SSHEVEN_DEFAULT_TERM_STRING;
+	prefs.terminal_string = DEFAULT_TERM_STRING;
 	prefs.auth_type = USE_PASSWORD;
 	prefs.display_mode = detect_color_screen() ? COLOR : FASTEST;
 	prefs.fg_color = blackColor;
@@ -322,7 +322,7 @@ void load_prefs(void)
 	}
 
 	// only load a prefs file if the saved version number matches ours
-	if ((prefs.major_version == SSHEVEN_VERSION_MAJOR) && (prefs.minor_version == SSHEVEN_VERSION_MINOR))
+	if ((prefs.major_version == APP_VERSION_MAJOR) && (prefs.minor_version == APP_VERSION_MINOR))
 	{
 		prefs.loaded_from_file = 1;
 		items_got = sscanf(buffer, "%d\n%d\n%d\n%d\n%d\n%d\n%d\n%255[^\n]\n%255[^\n]\n%255[^\n]\n%[^\n]\n%[^\n]", &prefs.major_version, &prefs.minor_version, (int*)&prefs.auth_type, (int*)&prefs.display_mode, &prefs.fg_color, &prefs.bg_color, &prefs.font_size, prefs.hostname+1, prefs.username+1, prefs.port+1, prefs.privkey_path, prefs.pubkey_path);
@@ -879,7 +879,7 @@ int new_window(void)
 	initial_window_bounds.bottom = initial_window_bounds.top + con.cell_height * wc->size_y + 4;
 	initial_window_bounds.right = initial_window_bounds.left + con.cell_width * wc->size_x + 4;
 
-	ConstStr255Param title = "\pSevenTTY " SSHEVEN_VERSION;
+	ConstStr255Param title = "\pSevenTTY " APP_VERSION;
 
 	WindowPtr win = NewWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
 
@@ -1898,8 +1898,8 @@ int ssh_connect(int session_idx)
 
 	if (ok)
 	{
-		s->recv_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
-		s->send_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
+		s->recv_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+		s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
 
 		if (s->recv_buffer == NULL || s->send_buffer == NULL)
 		{
@@ -2030,7 +2030,7 @@ int main(int argc, char** argv)
 	InitWindows();
 	InitMenus();
 
-	void* menu = GetNewMBar(MBAR_SSHEVEN);
+	void* menu = GetNewMBar(MBAR_MAIN);
 	SetMenuBar(menu);
 	AppendResMenu(GetMenuHandle(MENU_APPLE), 'DRVR');
 
@@ -2073,7 +2073,7 @@ int main(int argc, char** argv)
 			" \\___ \\ / _ \\ \\ / / _ \\ '_ \\ | |   | |  \\ V /\r\n"
 			"  ___) |  __/\\ V /  __/ | | || |   | |   | |\r\n"
 			" |____/ \\___| \\_/ \\___|_| |_||_|   |_|   |_|\r\n"
-			"version " SSHEVEN_VERSION ", based on ssheven by cy384\r\n"
+			"version " APP_VERSION ", based on ssheven by cy384\r\n"
 #if defined(__ppc__)
 			"running in PPC mode.\r\n"
 #else

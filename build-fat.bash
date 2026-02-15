@@ -38,11 +38,11 @@ mkdir build-fat
 $RETRO68_PATH/toolchain/bin/Rez \
 $RETRO68_PATH/toolchain/m68k-apple-macos/RIncludes/RetroPPCAPPL.r \
 -I$RETRO68_PATH/toolchain/m68k-apple-macos/RIncludes \
--DCFRAG_NAME="\"ssheven\"" \
---copy build-m68k/ssheven.code.bin \
--o build-fat/ssheven-fat.bin \
---cc build-fat/ssheven-fat.dsk --cc build-fat/ssheven-fat.APPL --cc build-fat/%ssheven-fat.ad \
+-DCFRAG_NAME="\"SevenTTY\"" \
+--copy build-m68k/SevenTTY.code.bin \
+-o build-fat/SevenTTY-fat.bin \
+--cc build-fat/SevenTTY-fat.dsk --cc build-fat/SevenTTY-fat.APPL --cc build-fat/%SevenTTY-fat.ad \
 -t APPL -c SSH7 \
---data build-ppc/ssheven.pef build-ppc/ssheven.r.rsrc.bin
+--data build-ppc/SevenTTY.pef build-ppc/SevenTTY.r.rsrc.bin
 
 echo "done."

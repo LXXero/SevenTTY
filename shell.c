@@ -1,5 +1,5 @@
 /*
- * ssheven - local shell command interpreter
+ * SevenTTY - local shell command interpreter
  *
  * Maps Unix-like commands to classic Mac OS Toolbox equivalents.
  * Runs inside a vterm session tab with no network connection.
@@ -8,9 +8,9 @@
  * See LICENSE file for details
  */
 
-#include "ssheven.h"
-#include "ssheven-shell.h"
-#include "ssheven-console.h"
+#include "app.h"
+#include "shell.h"
+#include "console.h"
 
 #include <Files.h>
 #include <Folders.h>

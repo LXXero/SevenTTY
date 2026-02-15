@@ -1,5 +1,5 @@
 /*
- * ssheven
+ * SevenTTY (based on ssheven by cy384)
  *
  * Copyright (c) 2020 by cy384 <cy384@cy384.com>
  * See LICENSE file for details
@@ -18,7 +18,7 @@
 #include <vterm.h>
 #include <vterm_keycodes.h>
 
-#include "ssheven-constants.r"
+#include "constants.r"
 
 #define MAX_SESSIONS 8
 #define MAX_WINDOWS 8
@@ -121,13 +121,13 @@ extern int active_window;
 extern int exit_requested;
 
 // global font metrics (same across all windows)
-struct ssheven_console
+struct console_metrics
 {
 	int cell_height;
 	int cell_width;
 };
 
-extern struct ssheven_console con;
+extern struct console_metrics con;
 
 // convenience macros
 #define ACTIVE_WIN windows[active_window]
