@@ -6,7 +6,7 @@
 cmake_minimum_required(VERSION 3.9)
 
 project(ssheven)
-add_application(ssheven CREATOR "SSH7" ssheven.c ssheven-console.c ssheven.r ssheven-net.c ssheven-debug.c)
+add_application(ssheven CREATOR "SSH7" ssheven.c ssheven-console.c ssheven.r ssheven-net.c ssheven-debug.c ssheven-shell.c)
 
 # set up and build mbedtls
 set(ENABLE_PROGRAMS OFF CACHE BOOL "disable mbedtls programs" FORCE)

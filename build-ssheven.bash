@@ -2,9 +2,7 @@
 set -e
 
 # set this to the root of your Retro68 build folder, e.g. ~/src/Retro68-build/
-RETRO68_PATH=change_me_please
-
-echo "Set your Retro68 build path in this script and delete this line!" && exit
+RETRO68_PATH=/home/xero/git/Retro68-build
 
 # check for nproc to count processors to build parallel
 BUILD_PARALLEL=

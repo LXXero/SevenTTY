@@ -5,6 +5,7 @@
  * See LICENSE file for details
  */
 
+#include <Files.h>
 #include <OpenTransport.h>
 #include <OpenTptInternet.h>
 

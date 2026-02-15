@@ -4,15 +4,15 @@
 #define __SSHEVEN_CONSTANTS_R__
 
 /* so many versions */
-#define SSHEVEN_VERSION             "0.9.0"
-#define SSHEVEN_LONG_VERSION        "0.9.0 prerelease, by cy384"
-#define SSHEVEN_DESCRIPTION         "ssheven 0.9.0 by cy384"
-#define SSHEVEN_VERSION_MAJOR       0x00
-#define SSHEVEN_VERSION_MINOR       0x90
-#define SSHEVEN_VERSION_PRERELEASE  0x01
+#define SSHEVEN_VERSION             "1.0.0"
+#define SSHEVEN_LONG_VERSION        "1.0.0, SevenTTY fork by LXXero"
+#define SSHEVEN_DESCRIPTION         "SevenTTY 1.0.0 - SSH & shell for classic Mac OS"
+#define SSHEVEN_VERSION_MAJOR       0x01
+#define SSHEVEN_VERSION_MINOR       0x00
+#define SSHEVEN_VERSION_PRERELEASE  0x00
 
 /* options: development, alpha, beta, release */
-#define SSHEVEN_RELEASE_TYPE        development
+#define SSHEVEN_RELEASE_TYPE        release
 #define SSHEVEN_RELEASE_REGION      verUS
 
 /* requested number of bytes for RAM, used in SIZE resource */
@@ -27,7 +27,7 @@
 #define SSHEVEN_DEFAULT_TERM_STRING "xterm-16color"
 
 /* name for the preferences file (pascal string) */
-#define PREFERENCES_FILENAME "\pssheven Preferences"
+#define PREFERENCES_FILENAME "\pSevenTTY Preferences"
 
 /* application icon set */
 #define SSHEVEN_APPLICATION_ICON 128
@@ -107,5 +107,18 @@
 #define MENU_COLOR     131
 #define MENU_TERM_TYPE 132
 #define MENU_FONT_SIZE 133
+
+/* File menu item indices */
+#define FMENU_CONNECT     1
+#define FMENU_DISCONNECT  2
+/* separator = 3 */
+#define FMENU_NEW_WINDOW  4
+#define FMENU_NEW_LOCAL   5
+#define FMENU_NEW_SSH     6
+#define FMENU_CLOSE_TAB   7
+/* separator = 8 */
+#define FMENU_PREFS       9
+/* separator = 10 */
+#define FMENU_QUIT        11
 
 #endif

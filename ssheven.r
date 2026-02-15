@@ -26,13 +26,13 @@ resource 'DITL' (DITL_ABOUT, purgeable) {
 		Picture { enabled, PICT_ABOUT };
 
 		{ 34, 160, 54, 410},
-		StaticText { disabled, "ssheven" };
+		StaticText { disabled, "SevenTTY" };
 
 		{ 64, 160, 84, 410},
 		StaticText { disabled, SSHEVEN_LONG_VERSION };
 
 		{ 94, 160, 114, 410},
-		StaticText { disabled, "https://github.com/cy384/ssheven" };
+		StaticText { disabled, "https://github.com/LXXero/SevenTTY" };
 	}
 };
 
@@ -444,7 +444,7 @@ resource 'MENU' (MENU_APPLE) {
 	allEnabled, enabled;
 	apple;
 	{
-		"About ssheven...", noIcon, noKey, noMark, plain;
+		"About SevenTTY...", noIcon, noKey, noMark, plain;
 		"-", noIcon, noKey, noMark, plain;
 	}
 };
@@ -456,6 +456,11 @@ resource 'MENU' (MENU_FILE) {
 	{
 		"Connect...", noIcon, "K", noMark, plain;
 		"Disconnect", noIcon, "D", noMark, plain;
+		"-", noIcon, noKey, noMark, plain;
+		"New Window", noIcon, "N", noMark, plain;
+		"New Tab", noIcon, "T", noMark, plain;
+		"New SSH Tab", noIcon, "S", noMark, plain;
+		"Close Tab", noIcon, "W", noMark, plain;
 		"-", noIcon, noKey, noMark, plain;
 		"Preferences...", noIcon, noKey, noMark, plain;
 		"-", noIcon, noKey, noMark, plain;

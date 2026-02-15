@@ -1,12 +1,13 @@
-/* 
+/*
  * ssheven
- * 
+ *
  * Copyright (c) 2020 by cy384 <cy384@cy384.com>
  * See LICENSE file for details
  */
 
 #pragma once
 
+#include <Files.h>
 #include <OpenTransport.h>
 #include <OpenTptInternet.h>
 #include <StandardFile.h>
@@ -19,52 +20,109 @@
 
 #include "ssheven-constants.r"
 
-// sinful globals
-struct ssheven_console
+#define MAX_SESSIONS 8
+#define MAX_WINDOWS 8
+#define TAB_BAR_HEIGHT 20
+
+enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
+enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL };
+enum THREAD_COMMAND { WAIT, READ, EXIT };
+enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
+
+// per-session state (terminal + connection + thread)
+struct session
 {
-	WindowPtr win;
+	int in_use;
+	enum SESSION_TYPE type;
+	char tab_label[64]; // C string for tab display
 
-	int size_x;
-	int size_y;
+	// terminal state
+	VTerm* vterm;
+	VTermScreen* vts;
 
+	// cursor
 	int cursor_x;
 	int cursor_y;
-
-	int cell_height;
-	int cell_width;
-
 	int cursor_state;
 	long int last_cursor_blink;
 	int cursor_visible;
 
+	// selection
 	int select_start_x;
 	int select_start_y;
-
 	int select_end_x;
 	int select_end_y;
+	int mouse_state;
+	enum MOUSE_MODE mouse_mode;
 
-	int mouse_state; // 1 for down, 0 for up
+	// SSH connection (SESSION_SSH only)
+	LIBSSH2_CHANNEL* channel;
+	LIBSSH2_SESSION* ssh_session;
+	EndpointRef endpoint;
+	char* recv_buffer;
+	char* send_buffer;
 
-	enum { CLICK_SEND, CLICK_SELECT } mouse_mode;
+	// thread state
+	enum THREAD_COMMAND thread_command;
+	enum THREAD_STATE thread_state;
 
-	VTerm* vterm;
-	VTermScreen* vts;
+	// local shell state (SESSION_LOCAL only)
+	short shell_vRefNum;
+	long shell_dirID;
+	char shell_line[256]; // line buffer
+	int shell_line_len;
+	int shell_cursor_pos; // cursor position within line buffer
+
+	// command history
+	#define SHELL_HISTORY_SIZE 32
+	char shell_history[SHELL_HISTORY_SIZE][256];
+	int shell_history_count; // total entries stored
+	int shell_history_pos;   // current browse position (-1 = editing new line)
+	char shell_saved_line[256]; // saved line when browsing history
+	int shell_saved_len;
+
+	// which window owns this session
+	int window_id;
+};
+
+extern struct session sessions[MAX_SESSIONS];
+
+// per-window state
+struct window_context
+{
+	int in_use;
+	WindowPtr win;
+	int size_x;                    // terminal cols
+	int size_y;                    // terminal rows
+	int session_ids[MAX_SESSIONS]; // indices into sessions[]
+	int num_sessions;
+	int active_session_idx;        // index into session_ids[] array
+};
+
+extern struct window_context windows[MAX_WINDOWS];
+extern int num_windows;
+extern int active_window;
+extern int exit_requested;
+
+// global font metrics (same across all windows)
+struct ssheven_console
+{
+	int cell_height;
+	int cell_width;
 };
 
 extern struct ssheven_console con;
 
-struct ssheven_ssh_connection
-{
-	LIBSSH2_CHANNEL* channel;
-	LIBSSH2_SESSION* session;
+// convenience macros
+#define ACTIVE_WIN windows[active_window]
+#define ACTIVE_S sessions[ACTIVE_WIN.session_ids[ACTIVE_WIN.active_session_idx]]
 
-	EndpointRef endpoint;
-
-	char* recv_buffer;
-	char* send_buffer;
-};
-
-extern struct ssheven_ssh_connection ssh_con;
+// window helpers
+struct window_context* find_window_context(WindowPtr w);
+struct window_context* window_for_session(int session_idx);
+int active_session_global(void);  // returns sessions[] index of active session in active window
+void add_session_to_window(struct window_context* wc, int session_idx);
+void remove_session_from_window(struct window_context* wc, int session_idx);
 
 struct preferences
 {
@@ -98,18 +156,24 @@ extern struct preferences prefs;
 
 extern char key_to_vterm[256];
 
-enum THREAD_COMMAND { WAIT, READ, EXIT };
-enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
-
-extern enum THREAD_COMMAND read_thread_command;
-extern enum THREAD_STATE read_thread_state;
-
 int save_prefs(void);
 void set_window_title(WindowPtr w, const char* c_name, size_t length);
+void set_terminal_string(void);
 
 OSErr FSpPathFromLocation(FSSpec* spec, int* length, Handle* fullPath);
 
 pascal void ButtonFrameProc(DialogRef dlg, DialogItemIndex itemNo);
 
-int connect(void);
-void disconnect(void);
+// session management
+int new_session(struct window_context* wc, enum SESSION_TYPE type);
+void close_session(int idx);
+void switch_session(struct window_context* wc, int idx);
+void init_session(struct session* s);
+
+// window management
+int new_window(void);
+void close_window(int wid);
+
+// connection (operates on a session)
+int ssh_connect(int session_idx);
+void ssh_disconnect(int session_idx);

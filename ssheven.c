@@ -1,6 +1,6 @@
-/* 
+/*
  * ssheven
- * 
+ *
  * Copyright (c) 2020 by cy384 <cy384@cy384.com>
  * See LICENSE file for details
  */
@@ -8,6 +8,7 @@
 #include "ssheven.h"
 #include "ssheven-console.h"
 #include "ssheven-net.h"
+#include "ssheven-shell.h"
 #include "ssheven-debug.h"
 
 #include <Threads.h>
@@ -24,13 +25,18 @@
 
 #include <stdio.h>
 
-// sinful globals
-struct ssheven_console con = { NULL, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, CLICK_SELECT, NULL, NULL };
-struct ssheven_ssh_connection ssh_con = { NULL, NULL, kOTInvalidEndpointRef, NULL, NULL };
-struct preferences prefs;
+// forward declarations
+int qd_color_to_menu_item(int qd_color);
+int font_size_to_menu_item(int font_size);
 
-enum THREAD_COMMAND read_thread_command = WAIT;
-enum THREAD_STATE read_thread_state = UNINITIALIZED;
+// sinful globals
+struct ssheven_console con = { 0, 0 };
+struct session sessions[MAX_SESSIONS] = {0};
+struct window_context windows[MAX_WINDOWS] = {0};
+int num_windows = 0;
+int active_window = 0;
+int exit_requested = 0;
+struct preferences prefs;
 
 const uint8_t ascii_to_control_code[256] = {255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 27, 28, 29, 30, 31, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255};
 
@@ -52,6 +58,74 @@ void generate_key_mapping(void)
 		keycode_to_ascii[i] = KeyTranslate(kchr, i, 0) & 0xff;
 	}
 }
+
+/* ---- window helper functions ---- */
+
+struct window_context* find_window_context(WindowPtr w)
+{
+	int i;
+	for (i = 0; i < MAX_WINDOWS; i++)
+	{
+		if (windows[i].in_use && windows[i].win == w)
+			return &windows[i];
+	}
+	return NULL;
+}
+
+struct window_context* window_for_session(int session_idx)
+{
+	if (session_idx < 0 || session_idx >= MAX_SESSIONS) return NULL;
+	if (!sessions[session_idx].in_use) return NULL;
+	int wid = sessions[session_idx].window_id;
+	if (wid < 0 || wid >= MAX_WINDOWS) return NULL;
+	if (!windows[wid].in_use) return NULL;
+	return &windows[wid];
+}
+
+int active_session_global(void)
+{
+	return ACTIVE_WIN.session_ids[ACTIVE_WIN.active_session_idx];
+}
+
+void add_session_to_window(struct window_context* wc, int session_idx)
+{
+	if (wc->num_sessions >= MAX_SESSIONS) return;
+	wc->session_ids[wc->num_sessions] = session_idx;
+	sessions[session_idx].window_id = (int)(wc - windows);
+	wc->num_sessions++;
+}
+
+void remove_session_from_window(struct window_context* wc, int session_idx)
+{
+	int i, found = -1;
+	for (i = 0; i < wc->num_sessions; i++)
+	{
+		if (wc->session_ids[i] == session_idx)
+		{
+			found = i;
+			break;
+		}
+	}
+	if (found < 0) return;
+
+	// shift remaining entries left
+	for (i = found; i < wc->num_sessions - 1; i++)
+		wc->session_ids[i] = wc->session_ids[i + 1];
+	wc->num_sessions--;
+
+	// fix active_session_idx
+	if (wc->num_sessions == 0)
+	{
+		wc->active_session_idx = 0;
+	}
+	else
+	{
+		if (wc->active_session_idx >= wc->num_sessions)
+			wc->active_session_idx = wc->num_sessions - 1;
+	}
+}
+
+/* ---- end window helpers ---- */
 
 void set_window_title(WindowPtr w, const char* c_name, size_t length)
 {
@@ -133,14 +207,9 @@ int save_prefs(void)
 		long int i = snprintf(output_buffer, write_length, "%d\n%d\n", prefs.major_version, prefs.minor_version);
 		i += snprintf(output_buffer+i, write_length-i, "%d\n%d\n%d\n%d\n%d\n", (int)prefs.auth_type, (int)prefs.display_mode, (int)prefs.fg_color, (int)prefs.bg_color, (int)prefs.font_size);
 
-		snprintf(output_buffer+i, prefs.hostname[0]+1, "%s", prefs.hostname+1); i += prefs.hostname[0];
-		i += snprintf(output_buffer+i, write_length-i, "\n");
-
-		snprintf(output_buffer+i, prefs.username[0]+1, "%s", prefs.username+1); i += prefs.username[0];
-		i += snprintf(output_buffer+i, write_length-i, "\n");
-
-		snprintf(output_buffer+i, prefs.port[0]+1, "%s", prefs.port+1); i += prefs.port[0];
-		i += snprintf(output_buffer+i, write_length-i, "\n");
+		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.hostname+1);
+		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.username+1);
+		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.port+1);
 
 		if (prefs.privkey_path && prefs.privkey_path[0] != '\0')
 		{
@@ -217,7 +286,7 @@ void load_prefs(void)
 
 	// make an FSSpec for the preferences file location and check if it exists
 	// TODO: if I just put PREFERENCES_FILENAME it doesn't work, wtf
-	e = FSMakeFSSpec(foundVRefNum, foundDirID, "\pssheven Preferences", &pref_file);
+	e = FSMakeFSSpec(foundVRefNum, foundDirID, PREFERENCES_FILENAME, &pref_file);
 
 	if (e == fnfErr) // file not found, nothing to load
 	{
@@ -246,7 +315,11 @@ void load_prefs(void)
 
 	// check the version (first two numbers)
 	int items_got = sscanf(buffer, "%d\n%d", &prefs.major_version, &prefs.minor_version);
-	if (items_got != 2) return;
+	if (items_got != 2)
+	{
+		free(buffer);
+		return;
+	}
 
 	// only load a prefs file if the saved version number matches ours
 	if ((prefs.major_version == SSHEVEN_VERSION_MAJOR) && (prefs.minor_version == SSHEVEN_VERSION_MINOR))
@@ -254,8 +327,40 @@ void load_prefs(void)
 		prefs.loaded_from_file = 1;
 		items_got = sscanf(buffer, "%d\n%d\n%d\n%d\n%d\n%d\n%d\n%255[^\n]\n%255[^\n]\n%255[^\n]\n%[^\n]\n%[^\n]", &prefs.major_version, &prefs.minor_version, (int*)&prefs.auth_type, (int*)&prefs.display_mode, &prefs.fg_color, &prefs.bg_color, &prefs.font_size, prefs.hostname+1, prefs.username+1, prefs.port+1, prefs.privkey_path, prefs.pubkey_path);
 
+		// need at least the core fields (version, auth, display, colors, font, host, user, port)
+		if (items_got < 10)
+		{
+			prefs.loaded_from_file = 0;
+			init_prefs();
+			free(buffer);
+			return;
+		}
+
+		// bounds-check loaded values
+		if (prefs.auth_type != USE_KEY && prefs.auth_type != USE_PASSWORD)
+			prefs.auth_type = USE_PASSWORD;
+
+		if (prefs.display_mode != FASTEST && prefs.display_mode != COLOR)
+			prefs.display_mode = detect_color_screen() ? COLOR : FASTEST;
+
+		if (qd_color_to_menu_item(prefs.fg_color) == 1 && prefs.fg_color != blackColor)
+			prefs.fg_color = blackColor;
+
+		if (qd_color_to_menu_item(prefs.bg_color) == 1 && prefs.bg_color != blackColor)
+			prefs.bg_color = whiteColor;
+
+		if (font_size_to_menu_item(prefs.font_size) == 1 && prefs.font_size != 9)
+			prefs.font_size = 9;
+
 		// add the size for the pascal strings
-		prefs.hostname[0] = (unsigned char)strlen(prefs.hostname+1);
+		// hostname buffer contains "host:port" as C string; hostname[0] = host length only
+		{
+			char* colon = strchr(prefs.hostname + 1, ':');
+			if (colon)
+				prefs.hostname[0] = (unsigned char)(colon - (prefs.hostname + 1));
+			else
+				prefs.hostname[0] = (unsigned char)strlen(prefs.hostname + 1);
+		}
 		prefs.username[0] = (unsigned char)strlen(prefs.username+1);
 		prefs.port[0] = (unsigned char)strlen(prefs.port+1);
 
@@ -263,8 +368,13 @@ void load_prefs(void)
 	}
 	else
 	{
-		prefs.major_version = SSHEVEN_VERSION_MAJOR;
-		prefs.minor_version = SSHEVEN_VERSION_MINOR;
+		// version mismatch: free malloc'd paths before restoring defaults
+		// (init_prefs sets these to "" literals, leaking the buffers)
+		if (prefs.privkey_path) free(prefs.privkey_path);
+		if (prefs.pubkey_path) free(prefs.pubkey_path);
+		prefs.privkey_path = NULL;
+		prefs.pubkey_path = NULL;
+		init_prefs();
 	}
 
 	if (buffer) free(buffer);
@@ -299,6 +409,9 @@ void display_about_box(void)
 
 void ssh_paste(void)
 {
+	int sid = active_session_global();
+	if (sessions[sid].type != SESSION_SSH) return;
+
 	// GetScrap requires a handle, not a raw buffer
 	// it will increase the size of the handle if needed
 	Handle buf = NewHandle(256);
@@ -306,7 +419,7 @@ void ssh_paste(void)
 
 	if (r > 0)
 	{
-		ssh_write(*buf, r);
+		ssh_write_s(sid, *buf, r);
 	}
 
 	DisposeHandle(buf);
@@ -314,8 +427,9 @@ void ssh_paste(void)
 
 void ssh_copy(void)
 {
+	struct window_context* wc = &ACTIVE_WIN;
 	char* selection = NULL;
-	size_t len = get_selection(&selection);
+	size_t len = get_selection(wc, &selection);
 	if (selection == NULL || len == 0) return;
 
 	OSErr e = ZeroScrap();
@@ -389,14 +503,13 @@ int menu_item_to_font_size(int menu_item)
 
 void preferences_window(void)
 {
+	struct window_context* wc = &ACTIVE_WIN;
+
 	// modal dialog setup
 	TEInit();
 	InitDialogs(NULL);
 	DialogPtr dlg = GetNewDialog(DLOG_PREFERENCES, 0, (WindowPtr)-1);
 	InitCursor();
-
-	// select all text in dialog item 4 (the hostname one)
-	//SelectDialogItemText(dlg, 4, 0, 32767);
 
 	DialogItemType type;
 	Handle itemH;
@@ -440,10 +553,6 @@ void preferences_window(void)
 		// read menu values into prefs
 		prefs.display_mode = GetControlValue(term_type_menu) - 1;
 
-		// TODO: don't save colors, make it take effect immediately
-		int save_bg = prefs.bg_color;
-		int save_fg = prefs.fg_color;
-
 		prefs.bg_color = menu_item_to_qd_color(GetControlValue(bg_color_menu));
 		prefs.fg_color = menu_item_to_qd_color(GetControlValue(fg_color_menu));
 		int new_font_size = menu_item_to_font_size(GetControlValue(font_size_menu));
@@ -452,21 +561,405 @@ void preferences_window(void)
 		if (new_font_size != prefs.font_size)
 		{
 			prefs.font_size = new_font_size;
-			font_size_change();
+			font_size_change(wc);
 		}
 
+		set_terminal_string();
 		save_prefs();
-
-		prefs.bg_color = save_bg;
-		prefs.fg_color = save_fg;
-
-		// TODO: make this actually fix all colors in vterm
-		update_console_colors();
+		update_console_colors(wc);
 	}
 
 	// clean it up
 	DisposeDialog(dlg);
 	FlushEvents(everyEvent, -1);
+}
+
+// session management functions
+
+void init_session(struct session* s)
+{
+	s->in_use = 0;
+	s->type = SESSION_NONE;
+	s->tab_label[0] = '\0';
+	s->vterm = NULL;
+	s->vts = NULL;
+	s->cursor_x = 0;
+	s->cursor_y = 0;
+	s->cursor_state = 0;
+	s->last_cursor_blink = 0;
+	s->cursor_visible = 1;
+	s->select_start_x = 0;
+	s->select_start_y = 0;
+	s->select_end_x = 0;
+	s->select_end_y = 0;
+	s->mouse_state = 0;
+	s->mouse_mode = CLICK_SELECT;
+	s->channel = NULL;
+	s->ssh_session = NULL;
+	s->endpoint = kOTInvalidEndpointRef;
+	s->recv_buffer = NULL;
+	s->send_buffer = NULL;
+	s->thread_command = WAIT;
+	s->thread_state = UNINITIALIZED;
+	s->shell_vRefNum = 0;
+	s->shell_dirID = 0;
+	s->shell_line[0] = '\0';
+	s->shell_line_len = 0;
+	s->shell_cursor_pos = 0;
+	s->window_id = -1;
+}
+
+/* adjust window size when tab bar appears/disappears, keeping terminal rows the same */
+static void adjust_window_for_tabs(struct window_context* wc, int tabs_appeared)
+{
+	Rect pr = wc->win->portRect;
+	int cur_height = pr.bottom - pr.top;
+	int cur_width = pr.right - pr.left;
+	int delta = tabs_appeared ? TAB_BAR_HEIGHT : -TAB_BAR_HEIGHT;
+	int new_height = cur_height + delta;
+
+	/* check if we'd go off-screen; if so, shrink terminal instead */
+	{
+		GDHandle gd = GetMainDevice();
+		Rect screen = (**gd).gdRect;
+		Point win_top = {0, 0};
+		SetPort(wc->win);
+		LocalToGlobal(&win_top);
+		int max_height = screen.bottom - win_top.v - 2;
+
+		if (new_height > max_height)
+			new_height = max_height;
+	}
+
+	SizeWindow(wc->win, cur_width, new_height, true);
+	EraseRect(&(wc->win->portRect));
+	InvalRect(&(wc->win->portRect));
+
+	/* recalculate terminal size from new window dims */
+	{
+		Rect npr = wc->win->portRect;
+		int tab_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+		int usable_height = (npr.bottom - npr.top) - tab_offset;
+		int new_x = (npr.right - npr.left - 4) / con.cell_width;
+		int new_y = (usable_height - 2) / con.cell_height;
+		int i;
+
+		if (new_x < 1) new_x = 1;
+		if (new_y < 1) new_y = 1;
+
+		wc->size_x = new_x;
+		wc->size_y = new_y;
+
+		for (i = 0; i < wc->num_sessions; i++)
+		{
+			int sid = wc->session_ids[i];
+			if (sessions[sid].in_use && sessions[sid].vterm)
+			{
+				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
+				if (sessions[sid].type == SESSION_SSH && sessions[sid].channel)
+					libssh2_channel_request_pty_size(sessions[sid].channel,
+						wc->size_x, wc->size_y);
+			}
+		}
+	}
+}
+
+int new_session(struct window_context* wc, enum SESSION_TYPE type)
+{
+	if (wc->num_sessions >= MAX_SESSIONS) return -1;
+
+	// find a free slot in global sessions array
+	int idx = -1;
+	int i;
+	for (i = 0; i < MAX_SESSIONS; i++)
+	{
+		if (!sessions[i].in_use)
+		{
+			idx = i;
+			break;
+		}
+	}
+	if (idx < 0) return -1;
+
+	init_session(&sessions[idx]);
+	sessions[idx].in_use = 1;
+	sessions[idx].type = type;
+	add_session_to_window(wc, idx);
+
+	// grow window if tab bar just appeared (1 -> 2 sessions)
+	if (wc->num_sessions == 2)
+		adjust_window_for_tabs(wc, 1);
+
+	SetPort(wc->win);
+	setup_session_vterm(wc, idx);
+
+	if (type == SESSION_SSH)
+	{
+		snprintf(sessions[idx].tab_label, sizeof(sessions[idx].tab_label), "new connection");
+	}
+	else if (type == SESSION_LOCAL)
+	{
+		snprintf(sessions[idx].tab_label, sizeof(sessions[idx].tab_label), "local shell");
+	}
+
+	switch_session(wc, idx);
+
+	// enable Close Tab now that we have multiple sessions
+	if (wc->num_sessions > 1)
+	{
+		void* menu = GetMenuHandle(MENU_FILE);
+		EnableItem(menu, FMENU_CLOSE_TAB);
+	}
+
+	// if this is an SSH session, start connecting
+	if (type == SESSION_SSH)
+	{
+		if (ssh_connect(idx) == 0) ssh_disconnect(idx);
+	}
+	else if (type == SESSION_LOCAL)
+	{
+		shell_init(idx);
+	}
+
+	// redraw since tab bar may have appeared
+	InvalRect(&(wc->win->portRect));
+
+	return idx;
+}
+
+void close_session(int idx)
+{
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	if (!sessions[idx].in_use) return;
+
+	struct window_context* wc = window_for_session(idx);
+	if (wc == NULL) return;
+	if (wc->num_sessions <= 1) return; // don't close the last session in a window
+
+	// disconnect if SSH and still connected
+	if (sessions[idx].type == SESSION_SSH &&
+		sessions[idx].thread_state != DONE &&
+		sessions[idx].thread_state != UNINITIALIZED)
+	{
+		ssh_disconnect(idx);
+	}
+
+	// null out vterm callbacks before freeing to prevent damage
+	// callbacks from accessing the window during teardown
+	if (sessions[idx].vterm != NULL)
+	{
+		VTermScreen* vts = vterm_obtain_screen(sessions[idx].vterm);
+		vterm_screen_set_callbacks(vts, NULL, NULL);
+	}
+
+	// only free vterm if the thread is actually done (or was never started)
+	if (sessions[idx].vterm != NULL &&
+		(sessions[idx].thread_state == DONE ||
+		 sessions[idx].thread_state == UNINITIALIZED ||
+		 sessions[idx].type == SESSION_LOCAL))
+	{
+		vterm_free(sessions[idx].vterm);
+		sessions[idx].vterm = NULL;
+	}
+
+	sessions[idx].in_use = 0;
+	remove_session_from_window(wc, idx);
+
+	// shrink window if tab bar just disappeared (2 -> 1 sessions)
+	if (wc->num_sessions == 1)
+		adjust_window_for_tabs(wc, 0);
+
+	// update menu state
+	void* menu = GetMenuHandle(MENU_FILE);
+	int active_sid = wc->session_ids[wc->active_session_idx];
+	if (sessions[active_sid].type == SESSION_SSH)
+	{
+		if (sessions[active_sid].thread_state == OPEN)
+		{
+			DisableItem(menu, FMENU_CONNECT);
+			EnableItem(menu, FMENU_DISCONNECT);
+		}
+		else
+		{
+			EnableItem(menu, FMENU_CONNECT);
+			DisableItem(menu, FMENU_DISCONNECT);
+		}
+	}
+	else
+	{
+		DisableItem(menu, FMENU_CONNECT);
+		DisableItem(menu, FMENU_DISCONNECT);
+	}
+
+	// disable Close Tab if only 1 session left
+	if (wc->num_sessions <= 1)
+		DisableItem(menu, FMENU_CLOSE_TAB);
+
+	SetPort(wc->win);
+	InvalRect(&(wc->win->portRect));
+}
+
+void switch_session(struct window_context* wc, int idx)
+{
+	if (idx < 0 || idx >= MAX_SESSIONS) return;
+	if (!sessions[idx].in_use) return;
+
+	// find the index in the window's session_ids
+	int i, found = -1;
+	for (i = 0; i < wc->num_sessions; i++)
+	{
+		if (wc->session_ids[i] == idx)
+		{
+			found = i;
+			break;
+		}
+	}
+	if (found < 0) return;
+	if (found == wc->active_session_idx) return;
+
+	wc->active_session_idx = found;
+
+	// update menu enable/disable based on new active session
+	void* menu = GetMenuHandle(MENU_FILE);
+	if (sessions[idx].type == SESSION_SSH)
+	{
+		if (sessions[idx].thread_state == OPEN)
+		{
+			DisableItem(menu, FMENU_CONNECT);
+			EnableItem(menu, FMENU_DISCONNECT);
+		}
+		else
+		{
+			EnableItem(menu, FMENU_CONNECT);
+			DisableItem(menu, FMENU_DISCONNECT);
+		}
+	}
+	else
+	{
+		DisableItem(menu, FMENU_CONNECT);
+		DisableItem(menu, FMENU_DISCONNECT);
+	}
+
+	SetPort(wc->win);
+	InvalRect(&(wc->win->portRect));
+}
+
+/* ---- window lifecycle ---- */
+
+int new_window(void)
+{
+	// find a free slot
+	int wid = -1;
+	int i;
+	for (i = 0; i < MAX_WINDOWS; i++)
+	{
+		if (!windows[i].in_use)
+		{
+			wid = i;
+			break;
+		}
+	}
+	if (wid < 0) return -1;
+
+	struct window_context* wc = &windows[wid];
+	memset(wc, 0, sizeof(struct window_context));
+	wc->in_use = 1;
+	wc->size_x = 80;
+	wc->size_y = 24;
+
+	// stagger window position based on window count
+	Rect initial_window_bounds = qd.screenBits.bounds;
+	InsetRect(&initial_window_bounds, 20, 20);
+	initial_window_bounds.top += 40;
+
+	// offset by 20 pixels for each existing window
+	initial_window_bounds.top += num_windows * 20;
+	initial_window_bounds.left += num_windows * 20;
+
+	initial_window_bounds.bottom = initial_window_bounds.top + con.cell_height * wc->size_y + 4;
+	initial_window_bounds.right = initial_window_bounds.left + con.cell_width * wc->size_x + 4;
+
+	ConstStr255Param title = "\pSevenTTY " SSHEVEN_VERSION;
+
+	WindowPtr win = NewWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
+
+	SetPort(win);
+	EraseRect(&win->portRect);
+
+	wc->win = win;
+	num_windows++;
+	active_window = wid;
+
+	// create initial local shell session
+	new_session(wc, SESSION_LOCAL);
+
+	return wid;
+}
+
+void close_window(int wid)
+{
+	if (wid < 0 || wid >= MAX_WINDOWS) return;
+	struct window_context* wc = &windows[wid];
+	if (!wc->in_use) return;
+
+	// close all sessions in this window (disconnect SSH first)
+	while (wc->num_sessions > 0)
+	{
+		int sid = wc->session_ids[0];
+
+		// disconnect SSH if needed
+		if (sessions[sid].type == SESSION_SSH &&
+			sessions[sid].thread_state != DONE &&
+			sessions[sid].thread_state != UNINITIALIZED)
+		{
+			ssh_disconnect(sid);
+		}
+
+		// null out vterm callbacks
+		if (sessions[sid].vterm != NULL)
+		{
+			VTermScreen* vts = vterm_obtain_screen(sessions[sid].vterm);
+			vterm_screen_set_callbacks(vts, NULL, NULL);
+		}
+
+		// free vterm
+		if (sessions[sid].vterm != NULL &&
+			(sessions[sid].thread_state == DONE ||
+			 sessions[sid].thread_state == UNINITIALIZED ||
+			 sessions[sid].type == SESSION_LOCAL))
+		{
+			vterm_free(sessions[sid].vterm);
+			sessions[sid].vterm = NULL;
+		}
+
+		sessions[sid].in_use = 0;
+		remove_session_from_window(wc, sid);
+	}
+
+	if (wc->win != NULL)
+	{
+		DisposeWindow(wc->win);
+		wc->win = NULL;
+	}
+
+	wc->in_use = 0;
+	num_windows--;
+
+	// switch active_window to another open window
+	if (num_windows > 0)
+	{
+		int i;
+		for (i = 0; i < MAX_WINDOWS; i++)
+		{
+			if (windows[i].in_use)
+			{
+				active_window = i;
+				SetPort(windows[i].win);
+				SelectWindow(windows[i].win);
+				break;
+			}
+		}
+	}
 }
 
 // returns 1 if quit selected, else 0
@@ -476,6 +969,7 @@ int process_menu_select(int32_t result)
 	int16_t menu = (result & 0xFFFF0000) >> 16;
 	int16_t item = (result & 0x0000FFFF);
 	Str255 name;
+	struct window_context* wc = &ACTIVE_WIN;
 
 	switch (menu)
 	{
@@ -492,13 +986,18 @@ int process_menu_select(int32_t result)
 			break;
 
 		case MENU_FILE:
-			if (item == 1)
+			if (item == FMENU_CONNECT)
 			{
-				if (connect() == 0) disconnect();
+				int sid = active_session_global();
+				if (ssh_connect(sid) == 0) ssh_disconnect(sid);
 			}
-			if (item == 2) disconnect();
-			if (item == 4) preferences_window();
-			if (item == 6) exit = 1;
+			if (item == FMENU_DISCONNECT) ssh_disconnect(active_session_global());
+			if (item == FMENU_NEW_WINDOW) new_window();
+			if (item == FMENU_NEW_LOCAL) new_session(wc, SESSION_LOCAL);
+			if (item == FMENU_NEW_SSH) new_session(wc, SESSION_SSH);
+			if (item == FMENU_CLOSE_TAB) close_session(active_session_global());
+			if (item == FMENU_PREFS) preferences_window();
+			if (item == FMENU_QUIT) exit = 1;
 			break;
 
 		case MENU_EDIT:
@@ -514,47 +1013,57 @@ int process_menu_select(int32_t result)
 	return exit;
 }
 
-void resize_con_window(WindowPtr eventWin, EventRecord event)
+void resize_con_window(struct window_context* wc, EventRecord event)
 {
-	clear_selection();
+	clear_selection(wc);
 
-	// TODO: put this somewhere else
+	int tab_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+
 	// limits on window size
-	// top = min vertical
-	// bottom = max vertical
-	// left = min horizontal
-	// right = max horizontal
-	Rect window_limits = { .top = con.cell_height*2 + 2,
-		.bottom = con.cell_height*100 + 2,
+	Rect window_limits = { .top = con.cell_height*2 + 2 + tab_offset,
+		.bottom = con.cell_height*100 + 2 + tab_offset,
 		.left = con.cell_width*10 + 4,
 		.right = con.cell_width*200 + 4 };
 
-	long growResult = GrowWindow(eventWin, event.where, &window_limits);
+	long growResult = GrowWindow(wc->win, event.where, &window_limits);
 
 	if (growResult != 0)
 	{
 		int height = growResult >> 16;
 		int width = growResult & 0xFFFF;
+		int usable_height = height - tab_offset;
 
 		// 'snap' to a size that won't have extra pixels not in a cell
-		int next_height = height - ((height - 4) % con.cell_height);
+		int next_height = height - ((usable_height - 4) % con.cell_height);
 		int next_width = width - ((width - 4) % con.cell_width);
 
-		SizeWindow(eventWin, next_width, next_height, true);
-		EraseRect(&(con.win->portRect));
-		InvalRect(&(con.win->portRect));
+		SizeWindow(wc->win, next_width, next_height, true);
+		EraseRect(&(wc->win->portRect));
+		InvalRect(&(wc->win->portRect));
 
-		con.size_x = (next_width - 4)/con.cell_width;
-		con.size_y = (next_height - 2)/con.cell_height;
+		wc->size_x = (next_width - 4)/con.cell_width;
+		wc->size_y = (usable_height - 2)/con.cell_height;
 
-		vterm_set_size(con.vterm, con.size_y, con.size_x);
-		libssh2_channel_request_pty_size(ssh_con.channel, con.size_x, con.size_y);
+		// update vterm size for all sessions in this window
+		int i;
+		for (i = 0; i < wc->num_sessions; i++)
+		{
+			int sid = wc->session_ids[i];
+			if (sessions[sid].in_use && sessions[sid].vterm)
+			{
+				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
+				if (sessions[sid].type == SESSION_SSH && sessions[sid].channel)
+					libssh2_channel_request_pty_size(sessions[sid].channel, wc->size_x, wc->size_y);
+			}
+		}
 	}
 }
 
 int handle_keypress(EventRecord* event)
 {
 	unsigned char c = event->message & charCodeMask;
+	struct window_context* wc = &ACTIVE_WIN;
+	int sid = active_session_global();
 
 	// if we have a key and command, and it's not autorepeating
 	if (c && event->what != autoKey && event->modifiers & cmdKey)
@@ -562,13 +1071,29 @@ int handle_keypress(EventRecord* event)
 		switch (c)
 		{
 			case 'k':
-				if (read_thread_state == UNINITIALIZED || read_thread_state == DONE)
+				if (sessions[sid].type != SESSION_LOCAL &&
+					(sessions[sid].thread_state == UNINITIALIZED || sessions[sid].thread_state == DONE))
 				{
-					if (connect() == 0) disconnect();
+					if (ssh_connect(sid) == 0) ssh_disconnect(sid);
 				}
 				break;
 			case 'd':
-				if (read_thread_state == OPEN) disconnect();
+				if (sessions[sid].type == SESSION_SSH && sessions[sid].thread_state == OPEN)
+				{
+					ssh_disconnect(sid);
+					if (wc->num_sessions > 1)
+						close_session(sid);
+					else if (num_windows > 1)
+						close_window(active_window);
+					else
+						return 1; // last window, last tab -> quit
+				}
+				else if (wc->num_sessions > 1)
+					close_session(sid);
+				else if (num_windows > 1)
+					close_window(active_window);
+				else
+					return 1; // last window, last tab -> quit
 				break;
 			case 'q':
 				return 1;
@@ -579,47 +1104,85 @@ int handle_keypress(EventRecord* event)
 			case 'c':
 				ssh_copy();
 				break;
+			case 't':
+				new_session(wc, SESSION_LOCAL);
+				break;
+			case 's':
+				new_session(wc, SESSION_SSH);
+				break;
+			case 'n':
+				new_window();
+				break;
+			case 'w':
+				if (wc->num_sessions > 1)
+					close_session(sid);
+				else if (num_windows > 1)
+					close_window(active_window);
+				else
+					return 1; // last window, last tab -> quit
+				break;
+			case '1': case '2': case '3': case '4':
+			case '5': case '6': case '7': case '8':
+			{
+				int target = c - '1';
+				if (target < wc->num_sessions)
+				{
+					switch_session(wc, wc->session_ids[target]);
+				}
+				break;
+			}
 			default:
 				break;
 		}
 	}
 	else if (c)
 	{
+		// for local shell sessions, keypresses go to shell handler
+		if (sessions[sid].type == SESSION_LOCAL)
+		{
+			shell_input(sid, c, event->modifiers);
+			return 0;
+		}
+
+		// SSH session keypress handling
+		if (sessions[sid].type != SESSION_SSH || sessions[sid].thread_state != OPEN)
+			return 0;
+
 		// get the unmodified version of the keypress
 		uint8_t unmodified_key = keycode_to_ascii[(event->message & keyCodeMask)>>8];
 
 		// if we have a control code for this key
 		if (event->modifiers & controlKey && ascii_to_control_code[unmodified_key] != 255)
 		{
-			ssh_con.send_buffer[0] = ascii_to_control_code[unmodified_key];
-			ssh_write(ssh_con.send_buffer, 1);
+			sessions[sid].send_buffer[0] = ascii_to_control_code[unmodified_key];
+			ssh_write_s(sid, sessions[sid].send_buffer, 1);
 		}
 		else
 		{
 			// if we have alt and the character would be printable ascii, use it
 			if (event->modifiers & optionKey && c >= 32 && c <= 126)
 			{
-				ssh_con.send_buffer[0] = c;
-				ssh_write(ssh_con.send_buffer, 1);
+				sessions[sid].send_buffer[0] = c;
+				ssh_write_s(sid, sessions[sid].send_buffer, 1);
 			}
 			else
 			{
 				// otherwise manually send an escape if we have alt held
 				if (event->modifiers & optionKey)
 				{
-					ssh_con.send_buffer[0] = '\e';
-					ssh_write(ssh_con.send_buffer, 1);
+					sessions[sid].send_buffer[0] = '\e';
+					ssh_write_s(sid, sessions[sid].send_buffer, 1);
 				}
 
 				if (key_to_vterm[c] != VTERM_KEY_NONE)
 				{
 					// doesn't seem like vterm does modifiers properly, so don't bother
-					vterm_keyboard_key(con.vterm, key_to_vterm[c], VTERM_MOD_NONE);
+					vterm_keyboard_key(sessions[sid].vterm, key_to_vterm[c], VTERM_MOD_NONE);
 				}
 				else
 				{
-					ssh_con.send_buffer[0] = event->modifiers & optionKey ? unmodified_key : c;
-					ssh_write(ssh_con.send_buffer, 1);
+					sessions[sid].send_buffer[0] = event->modifiers & optionKey ? unmodified_key : c;
+					ssh_write_s(sid, sessions[sid].send_buffer, 1);
 				}
 			}
 		}
@@ -645,24 +1208,47 @@ void event_loop(void)
 		while (!WaitNextEvent(everyEvent, &event, sleep_time, NULL))
 		{
 			YieldToAnyThread();
-			check_cursor();
 
-			BeginUpdate(con.win);
-			draw_screen(&(con.win->portRect));
-			EndUpdate(con.win);
+			// iterate all windows for idle tasks
+			int i;
+			for (i = 0; i < MAX_WINDOWS; i++)
+			{
+				if (!windows[i].in_use) continue;
+				SetPort(windows[i].win);
+				check_cursor(&windows[i]);
+
+				BeginUpdate(windows[i].win);
+				draw_screen(&windows[i], &(windows[i].win->portRect));
+				EndUpdate(windows[i].win);
+			}
 		}
 
 		// might need to toggle our cursor even if we got an event
-		check_cursor();
+		{
+			int i;
+			for (i = 0; i < MAX_WINDOWS; i++)
+			{
+				if (!windows[i].in_use) continue;
+				SetPort(windows[i].win);
+				check_cursor(&windows[i]);
+			}
+		}
 
 		// handle any GUI events
 		switch (event.what)
 		{
 			case updateEvt:
 				eventWin = (WindowPtr)event.message;
-				BeginUpdate(eventWin);
-				draw_screen(&(eventWin->portRect));
-				EndUpdate(eventWin);
+				{
+					struct window_context* wc = find_window_context(eventWin);
+					if (wc != NULL)
+					{
+						SetPort(eventWin);
+						BeginUpdate(eventWin);
+						draw_screen(wc, &(eventWin->portRect));
+						EndUpdate(eventWin);
+					}
+				}
 				break;
 
 			case keyDown:
@@ -674,20 +1260,33 @@ void event_loop(void)
 				switch(FindWindow(event.where, &eventWin))
 				{
 					case inDrag:
-						// allow the window to be dragged anywhere on any monitor
-						// hmmm... which of these is better???
 						DragWindow(eventWin, event.where, &(*(GetGrayRgn()))->rgnBBox);
-						//	DragWindow(eventWin, event.where, &(*qd.thePort->visRgn)->rgnBBox);
 						break;
 
 					case inGrow:
-						resize_con_window(eventWin, event);
+						{
+							struct window_context* wc = find_window_context(eventWin);
+							if (wc != NULL)
+							{
+								SetPort(eventWin);
+								resize_con_window(wc, event);
+							}
+						}
 						break;
 
 					case inGoAway:
 						{
 							if (TrackGoAway(eventWin, event.where))
-								exit_event_loop = 1;
+							{
+								struct window_context* wc = find_window_context(eventWin);
+								if (wc != NULL)
+								{
+									int wid = (int)(wc - windows);
+									close_window(wid);
+									if (num_windows == 0)
+										exit_event_loop = 1;
+								}
+							}
 						}
 						break;
 
@@ -696,28 +1295,57 @@ void event_loop(void)
 						break;
 
 					case inSysWindow:
-						// is this system6 relevant only???
 						SystemClick(&event, eventWin);
 						break;
 
 					case inContent:
-						GetMouse(&local_mouse_position);
-						mouse_click(local_mouse_position, true);
+						{
+							struct window_context* wc = find_window_context(eventWin);
+							if (wc != NULL)
+							{
+								// activate this window if not already active
+								int wid = (int)(wc - windows);
+								if (wid != active_window)
+								{
+									active_window = wid;
+									SelectWindow(wc->win);
+								}
+								SetPort(eventWin);
+								GetMouse(&local_mouse_position);
+								mouse_click(wc, local_mouse_position, true);
+							}
+						}
 						break;
 				}
 				break;
 			case mouseUp:
 				// only tell the console to lift the mouse if we clicked through it
-				if (con.mouse_state)
 				{
-					GetMouse(&local_mouse_position);
-					mouse_click(local_mouse_position, false);
+					struct window_context* wc = &ACTIVE_WIN;
+					int sid = active_session_global();
+					if (sessions[sid].mouse_state)
+					{
+						SetPort(wc->win);
+						GetMouse(&local_mouse_position);
+						mouse_click(wc, local_mouse_position, false);
+					}
+				}
+				break;
+
+			case activateEvt:
+				eventWin = (WindowPtr)event.message;
+				{
+					struct window_context* wc = find_window_context(eventWin);
+					if (wc != NULL && (event.modifiers & activeFlag))
+					{
+						active_window = (int)(wc - windows);
+					}
 				}
 				break;
 		}
 
 		YieldToAnyThread();
-	} while (!exit_event_loop);
+	} while (!exit_event_loop && !exit_requested);
 }
 
 // from the ATS password sample code
@@ -836,7 +1464,7 @@ Handle *fullPath)		/* Handle to path. */
 
 	*fullPath = NULL;
 
-	/* 
+	/*
 	* Make a copy of the input FSSpec that can be modified.
 	*/
 	BlockMoveData(spec, &tempSpec, sizeof(FSSpec));
@@ -852,8 +1480,8 @@ Handle *fullPath)		/* Handle to path. */
 
 		err = PtrToHand(&tempSpec.name[1], fullPath, tempSpec.name[0]);
 	} else {
-		/* 
-		* The object isn't a volume.  Is the object a file or a directory? 
+		/*
+		* The object isn't a volume.  Is the object a file or a directory?
 		*/
 		pb.dirInfo.ioNamePtr = tempSpec.name;
 		pb.dirInfo.ioVRefNum = tempSpec.vRefNum;
@@ -875,14 +1503,14 @@ Handle *fullPath)		/* Handle to path. */
 			tempSpec.name[tempSpec.name[0]] = ':';
 			}
 
-			/* 
+			/*
 			* Create a new Handle for the object - make it a C string
 			*/
 			tempSpec.name[0] += 1;
 			tempSpec.name[tempSpec.name[0]] = '\0';
 			err = PtrToHand(&tempSpec.name[1], fullPath, tempSpec.name[0]);
 			if (err == noErr) {
-				/* 
+				/*
 				* Get the ancestor directory names - loop until we have an
 				* error or find the root directory.
 				*/
@@ -894,13 +1522,13 @@ Handle *fullPath)		/* Handle to path. */
 					pb.dirInfo.ioDrDirID = pb.dirInfo.ioDrParID;
 					err = PBGetCatInfoSync(&pb);
 					if (err == noErr) {
-						/* 
+						/*
 						* Append colon to directory name and add
 						* directory name to beginning of fullPath
 						*/
 						++tempSpec.name[0];
 						tempSpec.name[tempSpec.name[0]] = ':';
-							
+
 						(void) Munger(*fullPath, 0, NULL, 0, &tempSpec.name[1],
 						tempSpec.name[0]);
 						err = MemError();
@@ -992,7 +1620,15 @@ int intro_dialog(void)
 	ControlHandle address_text_box;
 	GetDialogItem(dlg, 4, &type, &itemH, &box);
 	address_text_box = (ControlHandle)itemH;
-	SetDialogItemText((Handle)address_text_box, (ConstStr255Param)prefs.hostname);
+	// only show hostname part (before the :port suffix) in the dialog
+	{
+		Str255 host_only;
+		int hlen = prefs.hostname[0];
+		if (hlen > 255) hlen = 255;
+		host_only[0] = hlen;
+		memcpy(host_only + 1, prefs.hostname + 1, hlen);
+		SetDialogItemText((Handle)address_text_box, host_only);
+	}
 
 	// select all text in hostname dialog item
 	SelectDialogItemText(dlg, 4, 0, 32767);
@@ -1048,12 +1684,49 @@ int intro_dialog(void)
 	GetDialogItemText((Handle)address_text_box, (unsigned char *)prefs.hostname);
 	GetDialogItemText((Handle)username_text_box, (unsigned char *)prefs.username);
 
-	GetDialogItemText((Handle)port_text_box, (unsigned char *)prefs.hostname+prefs.hostname[0]+1);
-	prefs.hostname[prefs.hostname[0]+1] = ':';
+	// sanitize hostname: only allow valid DNS chars (a-z, 0-9, '.', '-')
+	{
+		int src, dst;
+		int len = (unsigned char)prefs.hostname[0];
+		dst = 1;
+		for (src = 1; src <= len; src++)
+		{
+			char c = prefs.hostname[src];
+			if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			    (c >= '0' && c <= '9') || c == '.' || c == '-')
+				prefs.hostname[dst++] = c;
+		}
+		prefs.hostname[0] = dst - 1;
+	}
 
-	char* port_start = prefs.hostname+prefs.hostname[0] + 2;
-	prefs.port[0] = strlen(port_start);
-	strncpy(prefs.port+1, port_start, 255);
+	// read port into a temp pascal string, sanitize to digits only
+	{
+		Str255 raw_port;
+		GetDialogItemText((Handle)port_text_box, raw_port);
+		int src, dst;
+		int len = (unsigned char)raw_port[0];
+		dst = 1;
+		for (src = 1; src <= len; src++)
+		{
+			char c = raw_port[src];
+			if (c >= '0' && c <= '9')
+				raw_port[dst++] = c;
+		}
+		raw_port[0] = dst - 1;
+
+		// copy sanitized port into prefs.port
+		prefs.port[0] = raw_port[0];
+		memcpy(prefs.port + 1, raw_port + 1, raw_port[0]);
+	}
+
+	// build combined "hostname:port" C string in prefs.hostname buffer
+	{
+		int hlen = (unsigned char)prefs.hostname[0];
+		int plen = (unsigned char)prefs.port[0];
+		prefs.hostname[hlen + 1] = ':';
+		memcpy(prefs.hostname + hlen + 2, prefs.port + 1, plen);
+		prefs.hostname[hlen + 2 + plen] = '\0';
+	}
 
 	int use_password = GetControlValue(password_radio);
 
@@ -1127,13 +1800,6 @@ int safety_checks(void)
 		printf_i("  Attempting to continue anyway.\r\n");
 	}
 
-	/*NumVersion* ot_version = (NumVersion*) &open_transport_new_version;
-
-	printf_i("Detected Open Transport version: %d.%d.%d\r\n",
-		(int)ot_version->majorRev,
-		(int)((ot_version->minorAndBugRev & 0xF0) >> 4),
-		(int)(ot_version->minorAndBugRev & 0x0F));*/
-
 	// check for CPU type and display warning if it's going to be too slow
 	long int cpu_type = 0;
 	int cpu_slow = 0;
@@ -1178,118 +1844,154 @@ int safety_checks(void)
 	return 1;
 }
 
-int connect(void)
+int ssh_connect(int session_idx)
 {
+	struct session* s = &sessions[session_idx];
+	struct window_context* wc = window_for_session(session_idx);
 	OSStatus err = noErr;
 	int ok = 1;
 
 	ok = safety_checks();
 
 	// reset the console if we have any crap from earlier
-	if (read_thread_state == DONE) reset_console();
+	if (wc != NULL && s->thread_state == DONE) reset_console(wc, session_idx);
 
-	BeginUpdate(con.win);
-	draw_screen(&(con.win->portRect));
-	EndUpdate(con.win);
+	if (wc != NULL)
+	{
+		SetPort(wc->win);
+		BeginUpdate(wc->win);
+		draw_screen(wc, &(wc->win->portRect));
+		EndUpdate(wc->win);
+	}
 
 	ok = intro_dialog();
 
-	if (!ok) printf_i("Cancelled, not connecting.\r\n");
+	if (!ok) printf_s(session_idx, "Cancelled, not connecting.\r\n");
 
 	if (ok)
 	{
 		if (InitOpenTransport() != noErr)
 		{
-			printf_i("Failed to initialize Open Transport.\r\n");
+			printf_s(session_idx, "Failed to initialize Open Transport.\r\n");
 			ok = 0;
 		}
 	}
 
 	if (ok)
 	{
-		ssh_con.recv_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
-		ssh_con.send_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
+		s->recv_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
+		s->send_buffer = OTAllocMem(SSHEVEN_BUFFER_SIZE);
 
-		if (ssh_con.recv_buffer == NULL || ssh_con.send_buffer == NULL)
+		if (s->recv_buffer == NULL || s->send_buffer == NULL)
 		{
-			printf_i("Failed to allocate network data buffers.\r\n");
+			printf_s(session_idx, "Failed to allocate network data buffers.\r\n");
 			ok = 0;
 		}
 	}
 
 	// create the network read/print thread
-	read_thread_command = WAIT;
+	s->thread_command = WAIT;
 	ThreadID read_thread_id = 0;
 
 	if (ok)
 	{
-		err = NewThread(kCooperativeThread, read_thread, NULL, 100000, kCreateIfNeeded, NULL, &read_thread_id);
+		err = NewThread(kCooperativeThread, read_thread, (void*)(intptr_t)session_idx, 100000, kCreateIfNeeded, NULL, &read_thread_id);
 
 		if (err < 0)
 		{
-			printf_i("Failed to create network read thread.\r\n");
+			printf_s(session_idx, "Failed to create network read thread.\r\n");
 			ok = 0;
 		}
 	}
 
 	// if we got the thread, tell it to begin operation
-	if (ok) read_thread_command = READ;
+	if (ok)
+	{
+		s->thread_command = READ;
+		s->type = SESSION_SSH;
+		snprintf(s->tab_label, sizeof(s->tab_label), "%s", prefs.hostname+1);
+		if (wc != NULL && wc->num_sessions > 1)
+		{
+			SetPort(wc->win);
+			draw_tab_bar(wc);
+		}
+	}
 
 	// allow disconnecting if we're ok
 	if (ok)
 	{
 		void* menu = GetMenuHandle(MENU_FILE);
-		DisableItem(menu, 1);
-		EnableItem(menu, 2);
+		DisableItem(menu, FMENU_CONNECT);
+		EnableItem(menu, FMENU_DISCONNECT);
 	}
 
 	return ok;
 }
 
-void disconnect(void)
+void ssh_disconnect(int session_idx)
 {
-	// tell the read thread to finish, then let it run to actually do so
-	read_thread_command = EXIT;
+	struct session* s = &sessions[session_idx];
+	struct window_context* wc = window_for_session(session_idx);
 
-	if (read_thread_state != UNINITIALIZED)
+	// tell the read thread to finish, then let it run to actually do so
+	s->thread_command = EXIT;
+
+	if (s->thread_state != UNINITIALIZED && s->thread_state != DONE)
 	{
-		while (read_thread_state != DONE)
+		// force-break any stuck OT calls
+		if (s->endpoint != kOTInvalidEndpointRef)
 		{
-			BeginUpdate(con.win);
-			draw_screen(&(con.win->portRect));
-			EndUpdate(con.win);
-			YieldToAnyThread();
+			OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
+		}
+
+		// wait for the thread to finish, with a timeout (5 seconds)
+		{
+			long timeout = TickCount() + 300;
+			while (s->thread_state != DONE && TickCount() < timeout)
+			{
+				if (wc != NULL)
+				{
+					SetPort(wc->win);
+					BeginUpdate(wc->win);
+					draw_screen(wc, &(wc->win->portRect));
+					EndUpdate(wc->win);
+				}
+				YieldToAnyThread();
+			}
 		}
 	}
 
-	if (ssh_con.recv_buffer != NULL)
+	if (s->recv_buffer != NULL)
 	{
-		OTFreeMem(ssh_con.recv_buffer);
-		ssh_con.recv_buffer = NULL;
+		OTFreeMem(s->recv_buffer);
+		s->recv_buffer = NULL;
 	}
-	if (ssh_con.send_buffer != NULL)
+	if (s->send_buffer != NULL)
 	{
-		OTFreeMem(ssh_con.send_buffer);
-		ssh_con.send_buffer = NULL;
-	}
-
-	if (ssh_con.endpoint != kOTInvalidEndpointRef)
-	{
-		OTCancelSynchronousCalls(ssh_con.endpoint, kOTCanceledErr);
-		CloseOpenTransport();
-		ssh_con.endpoint = kOTInvalidEndpointRef;
+		OTFreeMem(s->send_buffer);
+		s->send_buffer = NULL;
 	}
 
-	// allow connecting if we're disconnected
-	void* menu = GetMenuHandle(MENU_FILE);
-	EnableItem(menu, 1);
-	DisableItem(menu, 2);
+	// update tab label
+	snprintf(s->tab_label, sizeof(s->tab_label), "disconnected");
+
+	// allow connecting if this is the active session
+	if (wc != NULL && session_idx == wc->session_ids[wc->active_session_idx])
+	{
+		void* menu = GetMenuHandle(MENU_FILE);
+		EnableItem(menu, FMENU_CONNECT);
+		DisableItem(menu, FMENU_DISCONNECT);
+	}
+
+	if (wc != NULL && wc->num_sessions > 1)
+	{
+		SetPort(wc->win);
+		draw_tab_bar(wc);
+	}
 }
 
 int main(int argc, char** argv)
 {
-	// OSStatus err = noErr;
-
 	// expands the application heap to its maximum requested size
 	// supposedly good for performance
 	// also required before creating threads!
@@ -1323,46 +2025,63 @@ int main(int argc, char** argv)
 	DisableItem(menu, 7);
 	DisableItem(menu, 9);
 
-	// disable connect and disconnect
+	// set up file menu
 	menu = GetMenuHandle(MENU_FILE);
-	DisableItem(menu, 1);
-	DisableItem(menu, 2);
+	EnableItem(menu, FMENU_CONNECT);
+	DisableItem(menu, FMENU_DISCONNECT);
+	EnableItem(menu, FMENU_NEW_WINDOW);
+	EnableItem(menu, FMENU_NEW_LOCAL);
+	EnableItem(menu, FMENU_NEW_SSH);
+	DisableItem(menu, FMENU_CLOSE_TAB); // can't close with only 1 session
 
 	DrawMenuBar();
 
 	generate_key_mapping();
 
-	console_setup();
+	// initialize font metrics (shared across all windows)
+	init_font_metrics();
 
-	char* logo = "   _____ _____ _    _\r\n"
-		"  / ____/ ____| |  | |\r\n"
-		" | (___| (___ | |__| | _____   _____ _ __\r\n"
-		"  \\___ \\\\___ \\|  __  |/ _ \\ \\ / / _ \\ '_ \\\r\n"
-		"  ____) |___) | |  | |  __/\\ V /  __/ | | |\r\n"
-		" |_____/_____/|_|  |_|\\___| \\_/ \\___|_| |_|\r\n";
+	// create the first window (which creates initial local shell session)
+	new_window();
 
-	printf_i(logo);
-	printf_i("by cy384, version " SSHEVEN_VERSION ", running in ");
+	// show startup logo in the first session (only at launch, not every new tab)
+	{
+		int sid = active_session_global();
+		char* logo =
+			"\033[2J\033[H"
+			"  ____                      _____ _______   __\r\n"
+			" / ___|  _____   _____ _ __|_   _|_   _\\ \\ / /\r\n"
+			" \\___ \\ / _ \\ \\ / / _ \\ '_ \\ | |   | |  \\ V /\r\n"
+			"  ___) |  __/\\ V /  __/ | | || |   | |   | |\r\n"
+			" |____/ \\___| \\_/ \\___|_| |_||_|   |_|   |_|\r\n"
+			"version " SSHEVEN_VERSION ", based on ssheven by cy384\r\n"
+#if defined(__ppc__)
+			"running in PPC mode.\r\n"
+#else
+			"running in 68k mode.\r\n"
+#endif
+			"type 'help' for commands\r\n\r\n";
+		vterm_input_write(sessions[sid].vterm, logo, strlen(logo));
+		shell_prompt(sid);
+	}
 
-	#if defined(__ppc__)
-	printf_i("PPC mode.\r\n");
-	#else
-	printf_i("68k mode.\r\n");
-	#endif
-
-	BeginUpdate(con.win);
-	draw_screen(&(con.win->portRect));
-	EndUpdate(con.win);
-
-	int ok = connect();
-
-	if (!ok) disconnect();
+	struct window_context* wc = &ACTIVE_WIN;
+	SetPort(wc->win);
+	BeginUpdate(wc->win);
+	draw_screen(wc, &(wc->win->portRect));
+	EndUpdate(wc->win);
 
 	event_loop();
 
-	if (read_thread_command != EXIT) disconnect();
-
-	if (con.vterm != NULL) vterm_free(con.vterm);
+	// cleanup all windows and sessions
+	{
+		int i;
+		for (i = 0; i < MAX_WINDOWS; i++)
+		{
+			if (windows[i].in_use)
+				close_window(i);
+		}
+	}
 
 	if (prefs.pubkey_path != NULL && prefs.pubkey_path[0] != '\0') free(prefs.pubkey_path);
 	if (prefs.privkey_path != NULL && prefs.privkey_path[0] != '\0') free(prefs.privkey_path);
