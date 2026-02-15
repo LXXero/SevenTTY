@@ -493,6 +493,52 @@ void draw_tab_bar(struct window_context* wc)
 	qd.thePort->bkColor = save_font_bg;
 }
 
+/* Get a cell accounting for scroll offset.
+ * display_row is the row on screen (0..size_y-1).
+ * If scrolled back, top rows come from the scrollback buffer,
+ * remaining rows from the live vterm screen. */
+static int get_cell_scrolled(struct window_context* wc, int display_row, int col, VTermScreenCell* cell)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+
+	if (s->scroll_offset > 0 && display_row < s->scroll_offset)
+	{
+		/* this row comes from scrollback */
+		int sb_idx = s->sb_head - s->scroll_offset + display_row;
+		if (sb_idx < 0) sb_idx += SCROLLBACK_LINES;
+
+		memset(cell, 0, sizeof(VTermScreenCell));
+
+		if (col < SCROLLBACK_COLS)
+		{
+			struct sb_cell* sc = &s->scrollback[sb_idx][col];
+			cell->chars[0] = sc->ch;
+			cell->width = 1;
+			cell->fg.indexed.idx = sc->fg;
+			cell->bg.indexed.idx = sc->bg;
+			cell->attrs.bold = (sc->attrs & 1) ? 1 : 0;
+			cell->attrs.reverse = (sc->attrs & 2) ? 1 : 0;
+			cell->attrs.underline = (sc->attrs & 4) ? 1 : 0;
+			cell->attrs.italic = (sc->attrs & 8) ? 1 : 0;
+		}
+		else
+		{
+			cell->chars[0] = ' ';
+			cell->width = 1;
+		}
+		return 1;
+	}
+	else
+	{
+		/* live screen row */
+		VTermPos pos;
+		pos.row = display_row - s->scroll_offset;
+		pos.col = col;
+		return vterm_screen_get_cell(s->vts, pos, cell);
+	}
+}
+
 void draw_screen_color(struct window_context* wc, Rect* r)
 {
 	// don't clobber font settings
@@ -553,7 +599,7 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 	for (pos.row = 0; pos.row < wc->size_y; pos.row++)
 	{
 		pos.col = 0;
-		ok = vterm_screen_get_cell(WC_S(wc).vts, pos, &run_start);
+		ok = get_cell_scrolled(wc, pos.row, 0, &run_start);
 		run_length = 0;
 		run_start_col = 0;
 
@@ -571,7 +617,7 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 
 		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
 		{
-			ok = vterm_screen_get_cell(WC_S(wc).vts, pos, &vtsc);
+			ok = get_cell_scrolled(wc, pos.row, pos.col, &vtsc);
 
 			uint32_t glyph = vtsc.chars[0];
 
@@ -746,7 +792,7 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 
 		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
 		{
-			int ret = vterm_screen_get_cell(WC_S(wc).vts, pos, &here);
+			int ret = get_cell_scrolled(wc, pos.row, pos.col, &here);
 
 			uint32_t glyph = here.chars[0];
 
@@ -1012,6 +1058,84 @@ void local_output_callback(const char *s, size_t len, void *user)
 	// no-op: local shell handles I/O directly
 }
 
+static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
+{
+	int idx = (int)(intptr_t)user;
+	struct session* s = &sessions[idx];
+	int store_cols = cols < SCROLLBACK_COLS ? cols : SCROLLBACK_COLS;
+	int i;
+
+	/* convert VTermScreenCell to compact sb_cell */
+	for (i = 0; i < store_cols; i++)
+	{
+		uint32_t ch = cells[i].chars[0];
+		if (ch == 0) ch = ' ';
+		if (ch > 127) ch = '?';
+		s->scrollback[s->sb_head][i].ch = (unsigned char)ch;
+		s->scrollback[s->sb_head][i].fg = cells[i].fg.indexed.idx;
+		s->scrollback[s->sb_head][i].bg = cells[i].bg.indexed.idx;
+		s->scrollback[s->sb_head][i].attrs =
+			(cells[i].attrs.bold ? 1 : 0) |
+			(cells[i].attrs.reverse ? 2 : 0) |
+			(cells[i].attrs.underline ? 4 : 0) |
+			(cells[i].attrs.italic ? 8 : 0);
+	}
+	for (i = store_cols; i < SCROLLBACK_COLS; i++)
+	{
+		s->scrollback[s->sb_head][i].ch = ' ';
+		s->scrollback[s->sb_head][i].fg = 0;
+		s->scrollback[s->sb_head][i].bg = 0;
+		s->scrollback[s->sb_head][i].attrs = 0;
+	}
+
+	s->sb_head = (s->sb_head + 1) % SCROLLBACK_LINES;
+	if (s->sb_count < SCROLLBACK_LINES) s->sb_count++;
+
+	/* if user is scrolled back, keep their position stable */
+	if (s->scroll_offset > 0 && s->scroll_offset < s->sb_count)
+		s->scroll_offset++;
+
+	return 1;
+}
+
+static int sb_popline(int cols, VTermScreenCell *cells, void *user)
+{
+	int idx = (int)(intptr_t)user;
+	struct session* s = &sessions[idx];
+	int i;
+
+	if (s->sb_count == 0) return 0;
+
+	s->sb_count--;
+	s->sb_head = (s->sb_head + SCROLLBACK_LINES - 1) % SCROLLBACK_LINES;
+
+	int copy_cols = cols < SCROLLBACK_COLS ? cols : SCROLLBACK_COLS;
+
+	/* convert compact sb_cell back to VTermScreenCell */
+	for (i = 0; i < copy_cols; i++)
+	{
+		memset(&cells[i], 0, sizeof(VTermScreenCell));
+		cells[i].chars[0] = s->scrollback[s->sb_head][i].ch;
+		cells[i].width = 1;
+		cells[i].fg.indexed.idx = s->scrollback[s->sb_head][i].fg;
+		cells[i].bg.indexed.idx = s->scrollback[s->sb_head][i].bg;
+		cells[i].attrs.bold = (s->scrollback[s->sb_head][i].attrs & 1) ? 1 : 0;
+		cells[i].attrs.reverse = (s->scrollback[s->sb_head][i].attrs & 2) ? 1 : 0;
+		cells[i].attrs.underline = (s->scrollback[s->sb_head][i].attrs & 4) ? 1 : 0;
+		cells[i].attrs.italic = (s->scrollback[s->sb_head][i].attrs & 8) ? 1 : 0;
+	}
+	for (i = copy_cols; i < cols; i++)
+	{
+		memset(&cells[i], 0, sizeof(VTermScreenCell));
+		cells[i].chars[0] = ' ';
+		cells[i].width = 1;
+	}
+
+	if (s->scroll_offset > 0) s->scroll_offset--;
+
+	return 1;
+}
+
 const VTermScreenCallbacks vtscrcb =
 {
 	.damage = damage,
@@ -1020,9 +1144,48 @@ const VTermScreenCallbacks vtscrcb =
 	.settermprop = settermprop,
 	.bell = bell,
 	.resize = NULL,
-	.sb_pushline = NULL,
-	.sb_popline = NULL
+	.sb_pushline = sb_pushline,
+	.sb_popline = sb_popline
 };
+
+void scroll_up(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+	int page = wc->size_y / 2;
+
+	if (s->scroll_offset + page > s->sb_count)
+		s->scroll_offset = s->sb_count;
+	else
+		s->scroll_offset += page;
+
+	SetPort(wc->win);
+	InvalRect(&wc->win->portRect);
+}
+
+void scroll_down(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+	int page = wc->size_y / 2;
+
+	if (s->scroll_offset < page)
+		s->scroll_offset = 0;
+	else
+		s->scroll_offset -= page;
+
+	SetPort(wc->win);
+	InvalRect(&wc->win->portRect);
+}
+
+void scroll_reset(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	sessions[sid].scroll_offset = 0;
+
+	SetPort(wc->win);
+	InvalRect(&wc->win->portRect);
+}
 
 void font_size_change(struct window_context* wc)
 {

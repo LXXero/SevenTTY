@@ -23,6 +23,16 @@
 #define MAX_SESSIONS 8
 #define MAX_WINDOWS 8
 #define TAB_BAR_HEIGHT 20
+#define SCROLLBACK_LINES 100
+#define SCROLLBACK_COLS 80
+
+/* compact scrollback cell: 4 bytes instead of ~36 for VTermScreenCell */
+struct sb_cell {
+	unsigned char ch;    /* character (Mac Roman) */
+	unsigned char fg;    /* foreground color index */
+	unsigned char bg;    /* background color index */
+	unsigned char attrs; /* bit0=bold, bit1=reverse, bit2=underline, bit3=italic */
+};
 
 enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL };
@@ -80,6 +90,12 @@ struct session
 	int shell_history_pos;   // current browse position (-1 = editing new line)
 	char shell_saved_line[256]; // saved line when browsing history
 	int shell_saved_len;
+
+	// scrollback buffer (ring buffer of compact rows)
+	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];
+	int sb_head;    // next write position in ring
+	int sb_count;   // total lines stored (max SCROLLBACK_LINES)
+	int scroll_offset; // how many lines scrolled back (0 = live)
 
 	// which window owns this session
 	int window_id;

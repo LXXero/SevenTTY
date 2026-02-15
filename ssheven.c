@@ -1137,6 +1137,25 @@ int handle_keypress(EventRecord* event)
 	}
 	else if (c)
 	{
+		// shift+page up/down: scroll through scrollback buffer
+		if (event->modifiers & (shiftKey | rightShiftKey))
+		{
+			if (c == kPageUpCharCode)
+			{
+				scroll_up(wc);
+				return 0;
+			}
+			else if (c == kPageDownCharCode)
+			{
+				scroll_down(wc);
+				return 0;
+			}
+		}
+
+		// any other key snaps back to live view
+		if (sessions[sid].scroll_offset > 0)
+			scroll_reset(wc);
+
 		// for local shell sessions, keypresses go to shell handler
 		if (sessions[sid].type == SESSION_LOCAL)
 		{

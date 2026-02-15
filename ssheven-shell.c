@@ -2525,6 +2525,11 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 {
 	struct session* s = &sessions[session_idx];
 
+	/* ignore page up/down, home, end in local shell (handled by scrollback) */
+	if (c == kPageUpCharCode || c == kPageDownCharCode ||
+		c == kHomeCharCode || c == kEndCharCode)
+		return;
+
 	/* Ctrl+D: close tab if line is empty */
 	if (c == 4)
 	{
