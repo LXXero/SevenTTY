@@ -1097,6 +1097,13 @@ void close_session(int idx)
 	sessions[idx].in_use = 0;
 	remove_session_from_window(wc, idx);
 
+	// update window title to reflect the now-active session
+	{
+		int new_sid = wc->session_ids[wc->active_session_idx];
+		set_window_title(wc->win, sessions[new_sid].tab_label,
+			strlen(sessions[new_sid].tab_label));
+	}
+
 	// shrink window if tab bar just disappeared (2 -> 1 sessions)
 	if (wc->num_sessions == 1)
 		adjust_window_for_tabs(wc, 0);
@@ -1171,6 +1178,9 @@ void switch_session(struct window_context* wc, int idx)
 		DisableItem(menu, FMENU_CONNECT);
 		DisableItem(menu, FMENU_DISCONNECT);
 	}
+
+	/* update window title to match new active session */
+	set_window_title(wc->win, sessions[idx].tab_label, strlen(sessions[idx].tab_label));
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));

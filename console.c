@@ -430,8 +430,12 @@ void draw_tab_bar(struct window_context* wc)
 	GetForeColor(&save_rgb_fg);
 	GetBackColor(&save_rgb_bg);
 
-	RGBColor rgb_white = {0xFFFF, 0xFFFF, 0xFFFF};
-	RGBColor rgb_black = {0, 0, 0};
+	RGBColor rgb_white   = {0xFFFF, 0xFFFF, 0xFFFF};
+	RGBColor rgb_black   = {0, 0, 0};
+	RGBColor rgb_gray    = {0x9999, 0x9999, 0x9999};
+	RGBColor rgb_dimtext = {0x5555, 0x5555, 0x5555};
+	RGBColor rgb_shadow  = {0x5555, 0x5555, 0x5555};
+	RGBColor rgb_hilite  = {0xDDDD, 0xDDDD, 0xDDDD};
 
 	TextFont(kFontIDGeneva);
 	TextSize(9);
@@ -468,31 +472,33 @@ void draw_tab_bar(struct window_context* wc)
 		}
 		else
 		{
-			/* inactive tab: gray background */
-			RGBBackColor(&rgb_white);
-			RGBForeColor(&rgb_black);
+			/* inactive tab: darker gray with sunken inset border */
+			RGBBackColor(&rgb_gray);
 			EraseRect(&tab_rect);
 
-			PenPat(&qd.gray);
-			PenMode(patOr);
-			PaintRect(&tab_rect);
-			PenPat(&qd.black);
-			PenMode(patCopy);
+			/* sunken border: dark on top-left, light on bottom-right */
+			RGBForeColor(&rgb_shadow);
+			MoveTo(tab_rect.left, tab_rect.bottom - 1);
+			LineTo(tab_rect.left, tab_rect.top);
+			LineTo(tab_rect.right - 1, tab_rect.top);
 
-			RGBForeColor(&rgb_black);
-			FrameRect(&tab_rect);
+			RGBForeColor(&rgb_hilite);
+			MoveTo(tab_rect.right - 1, tab_rect.top + 1);
+			LineTo(tab_rect.right - 1, tab_rect.bottom - 1);
+			LineTo(tab_rect.left + 1, tab_rect.bottom - 1);
 		}
 
 		/* draw tab label */
-		RGBForeColor(&rgb_black);
-		char* label = sessions[sid].tab_label;
-		int label_len = strlen(label);
+		RGBForeColor(sid == active_sid ? &rgb_black : &rgb_dimtext);
+		{
+			char* label = sessions[sid].tab_label;
+			int label_len = strlen(label);
+			int max_chars = (tab_width - 20) / CharWidth('M');
+			if (label_len > max_chars) label_len = max_chars;
 
-		int max_chars = (tab_width - 20) / CharWidth('M');
-		if (label_len > max_chars) label_len = max_chars;
-
-		MoveTo(tab_rect.left + 4, tab_rect.top + 14);
-		DrawText(label, 0, label_len);
+			MoveTo(tab_rect.left + 4, tab_rect.top + 14);
+			DrawText(label, 0, label_len);
+		}
 
 		/* draw close button (X) */
 		if (wc->num_sessions > 1)
@@ -502,7 +508,7 @@ void draw_tab_bar(struct window_context* wc)
 			short cx2 = cx1 + 11;
 			short cy2 = cy1 + 11;
 
-			RGBForeColor(&rgb_black);
+			RGBForeColor(sid == active_sid ? &rgb_black : &rgb_dimtext);
 			MoveTo(cx1, cy1);
 			LineTo(cx2, cy2);
 			MoveTo(cx2, cy1);
