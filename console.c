@@ -22,6 +22,54 @@
 /* active session for a given window context */
 #define WC_S(wc) sessions[(wc)->session_ids[(wc)->active_session_idx]]
 
+/* sentinel values for default colors stored in scrollback sb_cell */
+#define COLOR_DEFAULT_FG 0xFE
+#define COLOR_DEFAULT_BG 0xFF
+
+/* extract abstract color ID from a VTermScreenCell color field.
+   returns sentinel for default colors, or the palette index otherwise.
+   vterm stores defaults as RGB (not indexed), so non-indexed = default.
+   indexed 7 (fg) / 0 (bg) also treated as default (standard behavior). */
+static int extract_fg(VTermScreenCell* cell)
+{
+	if (VTERM_COLOR_IS_DEFAULT_FG(&cell->fg)) return COLOR_DEFAULT_FG;
+	if (VTERM_COLOR_IS_INDEXED(&cell->fg))
+		return cell->fg.indexed.idx & 0x0F;
+	/* non-indexed (RGB from vterm reset) = treat as default */
+	return COLOR_DEFAULT_FG;
+}
+
+static int extract_bg(VTermScreenCell* cell)
+{
+	if (VTERM_COLOR_IS_DEFAULT_BG(&cell->bg)) return COLOR_DEFAULT_BG;
+	if (VTERM_COLOR_IS_INDEXED(&cell->bg))
+		return cell->bg.indexed.idx & 0x0F;
+	/* non-indexed (RGB from vterm reset) = treat as default */
+	return COLOR_DEFAULT_BG;
+}
+
+/* resolve abstract color ID to an RGBColor pointer.
+   sentinels map to theme_fg/theme_bg, all others to the palette. */
+static void set_draw_fg(int idx)
+{
+	if (idx == COLOR_DEFAULT_FG)
+		RGBForeColor(&prefs.theme_fg);
+	else if (idx == COLOR_DEFAULT_BG)
+		RGBForeColor(&prefs.theme_bg);
+	else
+		RGBForeColor(&prefs.palette[idx & 0x0F]);
+}
+
+static void set_draw_bg(int idx)
+{
+	if (idx == COLOR_DEFAULT_BG)
+		RGBBackColor(&prefs.theme_bg);
+	else if (idx == COLOR_DEFAULT_FG)
+		RGBBackColor(&prefs.theme_fg);
+	else
+		RGBBackColor(&prefs.palette[idx & 0x0F]);
+}
+
 
 char key_to_vterm[256] = { VTERM_KEY_NONE };
 
@@ -88,25 +136,6 @@ void check_cursor(struct window_context* wc)
 	}
 }
 
-// convert Quickdraw colors into vterm's ANSI color indexes
-int qd2idx(int qdc)
-{
-	switch (qdc)
-	{
-		case blackColor: return 0;
-		case redColor: return 1;
-		case greenColor: return 2;
-		case yellowColor: return 3;
-		case blueColor: return 4;
-		case magentaColor: return 5;
-		case cyanColor: return 6;
-		case whiteColor: return 7;
-		default: return 0;
-	}
-}
-
-// convert vterm's ANSI color indexes into Quickdraw colors
-int idx2qd[16] = { blackColor, redColor, greenColor, yellowColor, blueColor, magentaColor, cyanColor, whiteColor, blackColor, redColor, greenColor, yellowColor, blueColor, magentaColor, cyanColor, whiteColor };
 
 void point_to_cell(struct window_context* wc, Point p, int* x, int* y)
 {
@@ -397,8 +426,12 @@ void draw_tab_bar(struct window_context* wc)
 	short save_font      = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
-	short save_font_fg   = qd.thePort->fgColor;
-	short save_font_bg   = qd.thePort->bkColor;
+	RGBColor save_rgb_fg, save_rgb_bg;
+	GetForeColor(&save_rgb_fg);
+	GetBackColor(&save_rgb_bg);
+
+	RGBColor rgb_white = {0xFFFF, 0xFFFF, 0xFFFF};
+	RGBColor rgb_black = {0, 0, 0};
 
 	TextFont(kFontIDGeneva);
 	TextSize(9);
@@ -423,12 +456,11 @@ void draw_tab_bar(struct window_context* wc)
 
 		if (sid == active_sid)
 		{
-			// active tab: lighter, raised
-			BackColor(whiteColor);
-			ForeColor(blackColor);
+			/* active tab: white background */
+			RGBBackColor(&rgb_white);
+			RGBForeColor(&rgb_black);
 			EraseRect(&tab_rect);
 
-			// draw bottom line only on inactive tabs
 			MoveTo(tab_rect.left, tab_rect.top);
 			LineTo(tab_rect.left, tab_rect.bottom - 1);
 			LineTo(tab_rect.right - 1, tab_rect.bottom - 1);
@@ -436,36 +468,33 @@ void draw_tab_bar(struct window_context* wc)
 		}
 		else
 		{
-			// inactive tab: darker, recessed
-			BackColor(whiteColor);
-			ForeColor(blackColor);
+			/* inactive tab: gray background */
+			RGBBackColor(&rgb_white);
+			RGBForeColor(&rgb_black);
 			EraseRect(&tab_rect);
 
-			// darken with a gray pattern
 			PenPat(&qd.gray);
 			PenMode(patOr);
 			PaintRect(&tab_rect);
 			PenPat(&qd.black);
 			PenMode(patCopy);
 
-			// border
-			ForeColor(blackColor);
+			RGBForeColor(&rgb_black);
 			FrameRect(&tab_rect);
 		}
 
-		// draw tab label
-		ForeColor(blackColor);
+		/* draw tab label */
+		RGBForeColor(&rgb_black);
 		char* label = sessions[sid].tab_label;
 		int label_len = strlen(label);
 
-		// truncate label to fit (leave room for close button)
 		int max_chars = (tab_width - 20) / CharWidth('M');
 		if (label_len > max_chars) label_len = max_chars;
 
 		MoveTo(tab_rect.left + 4, tab_rect.top + 14);
 		DrawText(label, 0, label_len);
 
-		// draw close button (X) if more than one tab
+		/* draw close button (X) */
 		if (wc->num_sessions > 1)
 		{
 			short cx1 = tab_rect.right - 15;
@@ -473,7 +502,7 @@ void draw_tab_bar(struct window_context* wc)
 			short cx2 = cx1 + 11;
 			short cy2 = cy1 + 11;
 
-			ForeColor(blackColor);
+			RGBForeColor(&rgb_black);
 			MoveTo(cx1, cy1);
 			LineTo(cx2, cy2);
 			MoveTo(cx2, cy1);
@@ -481,16 +510,16 @@ void draw_tab_bar(struct window_context* wc)
 		}
 	}
 
-	// draw separator line between tab bar and terminal area
-	ForeColor(blackColor);
+	/* separator line between tab bar and terminal area */
+	RGBForeColor(&rgb_black);
 	MoveTo(portRect.left, portRect.top + TAB_BAR_HEIGHT);
 	LineTo(portRect.right, portRect.top + TAB_BAR_HEIGHT);
 
 	TextFont(save_font);
 	TextSize(save_font_size);
 	TextFace(save_font_face);
-	qd.thePort->fgColor = save_font_fg;
-	qd.thePort->bkColor = save_font_bg;
+	RGBForeColor(&save_rgb_fg);
+	RGBBackColor(&save_rgb_bg);
 }
 
 /* Get a cell accounting for scroll offset.
@@ -515,8 +544,20 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 			struct sb_cell* sc = &s->scrollback[sb_idx][col];
 			cell->chars[0] = sc->ch;
 			cell->width = 1;
-			cell->fg.indexed.idx = sc->fg;
-			cell->bg.indexed.idx = sc->bg;
+			if (sc->fg == COLOR_DEFAULT_FG)
+				cell->fg.type = VTERM_COLOR_DEFAULT_FG;
+			else
+			{
+				cell->fg.type = VTERM_COLOR_INDEXED;
+				cell->fg.indexed.idx = sc->fg;
+			}
+			if (sc->bg == COLOR_DEFAULT_BG)
+				cell->bg.type = VTERM_COLOR_DEFAULT_BG;
+			else
+			{
+				cell->bg.type = VTERM_COLOR_INDEXED;
+				cell->bg.indexed.idx = sc->bg;
+			}
 			cell->attrs.bold = (sc->attrs & 1) ? 1 : 0;
 			cell->attrs.reverse = (sc->attrs & 2) ? 1 : 0;
 			cell->attrs.underline = (sc->attrs & 4) ? 1 : 0;
@@ -541,19 +582,20 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 
 void draw_screen_color(struct window_context* wc, Rect* r)
 {
-	// don't clobber font settings
+	/* save/restore font and color state */
 	short save_font      = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
-	short save_font_fg   = qd.thePort->fgColor;
-	short save_font_bg   = qd.thePort->bkColor;
+	RGBColor save_fg, save_bg;
+	GetForeColor(&save_fg);
+	GetBackColor(&save_bg);
 
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
 	TextFace(normal);
-	BackColor(prefs.bg_color);
-	ForeColor(prefs.fg_color);
-	TextMode(srcOr); // or mode is faster for some common cases
+	RGBBackColor(&prefs.theme_bg);
+	RGBForeColor(&prefs.theme_fg);
+	TextMode(srcOr);
 
 	int select_start = -1;
 	int select_end = -1;
@@ -607,8 +649,8 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 
 		run_inverted = run_start.attrs.reverse ^ (i < select_end && i >= select_start);
 
-		run_fg = run_start.fg.indexed.idx;
-		run_bg = run_start.bg.indexed.idx;
+		run_fg = extract_fg(&run_start);
+		run_bg = extract_bg(&run_start);
 
 		run_face = normal;
 		if (run_start.attrs.bold) run_face |= (condense|bold);
@@ -617,6 +659,7 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 
 		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
 		{
+			int cell_fg, cell_bg;
 			ok = get_cell_scrolled(wc, pos.row, pos.col, &vtsc);
 
 			uint32_t glyph = vtsc.chars[0];
@@ -643,19 +686,22 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 			if (vtsc.attrs.italic) next_face |= (condense|italic);
 			if (vtsc.attrs.underline) next_face |= underline;
 
-			// if we cannot add this cell to the run
-			if (vtsc.fg.indexed.idx != run_fg || vtsc.bg.indexed.idx != run_bg || next_face != run_face || (vtsc.attrs.reverse ^ (i < select_end && i >= select_start)) != run_inverted)
+			cell_fg = extract_fg(&vtsc);
+			cell_bg = extract_bg(&vtsc);
+
+			/* if we cannot add this cell to the run */
+			if (cell_fg != run_fg || cell_bg != run_bg || next_face != run_face || (vtsc.attrs.reverse ^ (i < select_end && i >= select_start)) != run_inverted)
 			{
-				// draw what we've got so far
+				/* draw what we've got so far */
 				if (run_inverted)
 				{
-					BackColor(idx2qd[run_fg]);
-					ForeColor(idx2qd[run_bg]);
+					set_draw_bg(run_fg);
+					set_draw_fg(run_bg);
 				}
 				else
 				{
-					BackColor(idx2qd[run_bg]);
-					ForeColor(idx2qd[run_fg]);
+					set_draw_bg(run_bg);
+					set_draw_fg(run_fg);
 				}
 
 				EraseRect(&run_rect);
@@ -663,10 +709,10 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 				TextFace(run_face);
 				DrawText(row_text, run_start_col, run_length);
 
-				// then reset everything to start a new run
+				/* then reset everything to start a new run */
 				run_inverted = vtsc.attrs.reverse ^ (i < select_end && i >= select_start);
-				run_fg = vtsc.fg.indexed.idx;
-				run_bg = vtsc.bg.indexed.idx;
+				run_fg = cell_fg;
+				run_bg = cell_bg;
 				run_face = next_face;
 				run_start_col = pos.col;
 				run_rect = cell_rect(wc, pos.col, pos.row, wc->win->portRect);
@@ -677,18 +723,18 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 				run_length++;
 			}
 
-			// if we're at the last cell in the row, draw the run
+			/* if we're at the last cell in the row, draw the run */
 			if (pos.col == wc->size_x - 1)
 			{
 				if (run_inverted)
 				{
-					BackColor(idx2qd[run_fg]);
-					ForeColor(idx2qd[run_bg]);
+					set_draw_bg(run_fg);
+					set_draw_fg(run_bg);
 				}
 				else
 				{
-					BackColor(idx2qd[run_bg]);
-					ForeColor(idx2qd[run_fg]);
+					set_draw_bg(run_bg);
+					set_draw_fg(run_fg);
 				}
 
 				EraseRect(&run_rect);
@@ -707,7 +753,7 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 		vertical_offset += con.cell_height;
 	}
 
-	// do the cursor if needed
+	/* do the cursor if needed */
 	if (WC_S(wc).cursor_state && WC_S(wc).cursor_visible)
 	{
 		Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
@@ -717,8 +763,8 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 	TextFont(save_font);
 	TextSize(save_font_size);
 	TextFace(save_font_face);
-	qd.thePort->fgColor = save_font_fg;
-	qd.thePort->bkColor = save_font_bg;
+	RGBForeColor(&save_fg);
+	RGBBackColor(&save_bg);
 
 	draw_resize_corner(wc);
 }
@@ -1072,8 +1118,8 @@ static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
 		if (ch == 0) ch = ' ';
 		if (ch > 127) ch = '?';
 		s->scrollback[s->sb_head][i].ch = (unsigned char)ch;
-		s->scrollback[s->sb_head][i].fg = cells[i].fg.indexed.idx;
-		s->scrollback[s->sb_head][i].bg = cells[i].bg.indexed.idx;
+		s->scrollback[s->sb_head][i].fg = VTERM_COLOR_IS_DEFAULT_FG(&cells[i].fg) ? COLOR_DEFAULT_FG : cells[i].fg.indexed.idx;
+		s->scrollback[s->sb_head][i].bg = VTERM_COLOR_IS_DEFAULT_BG(&cells[i].bg) ? COLOR_DEFAULT_BG : cells[i].bg.indexed.idx;
 		s->scrollback[s->sb_head][i].attrs =
 			(cells[i].attrs.bold ? 1 : 0) |
 			(cells[i].attrs.reverse ? 2 : 0) |
@@ -1083,8 +1129,8 @@ static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
 	for (i = store_cols; i < SCROLLBACK_COLS; i++)
 	{
 		s->scrollback[s->sb_head][i].ch = ' ';
-		s->scrollback[s->sb_head][i].fg = 0;
-		s->scrollback[s->sb_head][i].bg = 0;
+		s->scrollback[s->sb_head][i].fg = COLOR_DEFAULT_FG;
+		s->scrollback[s->sb_head][i].bg = COLOR_DEFAULT_BG;
 		s->scrollback[s->sb_head][i].attrs = 0;
 	}
 
@@ -1114,11 +1160,19 @@ static int sb_popline(int cols, VTermScreenCell *cells, void *user)
 	/* convert compact sb_cell back to VTermScreenCell */
 	for (i = 0; i < copy_cols; i++)
 	{
+		unsigned char sfg = s->scrollback[s->sb_head][i].fg;
+		unsigned char sbg = s->scrollback[s->sb_head][i].bg;
 		memset(&cells[i], 0, sizeof(VTermScreenCell));
 		cells[i].chars[0] = s->scrollback[s->sb_head][i].ch;
 		cells[i].width = 1;
-		cells[i].fg.indexed.idx = s->scrollback[s->sb_head][i].fg;
-		cells[i].bg.indexed.idx = s->scrollback[s->sb_head][i].bg;
+		if (sfg == COLOR_DEFAULT_FG)
+			cells[i].fg.type = VTERM_COLOR_DEFAULT_FG;
+		else
+			vterm_color_indexed(&cells[i].fg, sfg);
+		if (sbg == COLOR_DEFAULT_BG)
+			cells[i].bg.type = VTERM_COLOR_DEFAULT_BG;
+		else
+			vterm_color_indexed(&cells[i].bg, sbg);
 		cells[i].attrs.bold = (s->scrollback[s->sb_head][i].attrs & 1) ? 1 : 0;
 		cells[i].attrs.reverse = (s->scrollback[s->sb_head][i].attrs & 2) ? 1 : 0;
 		cells[i].attrs.underline = (s->scrollback[s->sb_head][i].attrs & 4) ? 1 : 0;
@@ -1191,15 +1245,15 @@ void font_size_change(struct window_context* wc)
 {
 	clear_selection(wc);
 
-	// don't clobber font settings
 	short save_font = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
-	short save_font_fg   = qd.thePort->fgColor;
-	short save_font_bg   = qd.thePort->bkColor;
+	RGBColor save_fg, save_bg;
+	GetForeColor(&save_fg);
+	GetBackColor(&save_bg);
 
-	BackColor(prefs.bg_color);
-	ForeColor(prefs.fg_color);
+	RGBBackColor(&prefs.theme_bg);
+	RGBForeColor(&prefs.theme_fg);
 
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
@@ -1222,8 +1276,8 @@ void font_size_change(struct window_context* wc)
 	EraseRect(&(wc->win->portRect));
 	InvalRect(&(wc->win->portRect));
 
-	BackColor(save_font_bg);
-	ForeColor(save_font_fg);
+	RGBForeColor(&save_fg);
+	RGBBackColor(&save_bg);
 }
 
 void reset_console(struct window_context* wc, int session_idx)
@@ -1232,32 +1286,22 @@ void reset_console(struct window_context* wc, int session_idx)
 
 	if (session_idx == wc->session_ids[wc->active_session_idx])
 	{
-		short save_fg = qd.thePort->fgColor;
-		short save_bg = qd.thePort->bkColor;
+		RGBColor save_fg, save_bg;
+		GetForeColor(&save_fg);
+		GetBackColor(&save_bg);
 
-		ForeColor(prefs.fg_color);
-		BackColor(prefs.bg_color);
+		RGBForeColor(&prefs.theme_fg);
+		RGBBackColor(&prefs.theme_bg);
 
 		SetPort(wc->win);
 		EraseRect(&wc->win->portRect);
 
-		ForeColor(save_fg);
-		BackColor(save_bg);
+		RGBForeColor(&save_fg);
+		RGBBackColor(&save_bg);
 	}
 
 	s->cursor_x = 0;
 	s->cursor_y = 0;
-
-	VTermState* vtermstate = vterm_obtain_state(s->vterm);
-	vterm_state_reset(vtermstate, 1);
-
-	VTermColor fg = { .type = VTERM_COLOR_INDEXED };
-	fg.indexed.idx = qd2idx(prefs.fg_color);
-
-	VTermColor bg  = { .type = VTERM_COLOR_INDEXED };
-	bg.indexed.idx = qd2idx(prefs.bg_color);
-
-	vterm_state_set_default_colors(vtermstate, &fg, &bg);
 
 	if (s->type == SESSION_SSH)
 		vterm_output_set_callback(s->vterm, output_callback, (void*)(intptr_t)session_idx);
@@ -1265,8 +1309,28 @@ void reset_console(struct window_context* wc, int session_idx)
 		vterm_output_set_callback(s->vterm, local_output_callback, (void*)(intptr_t)session_idx);
 
 	s->vts = vterm_obtain_screen(s->vterm);
-	vterm_screen_reset(s->vts, 1);
 	vterm_screen_set_callbacks(s->vts, &vtscrcb, (void*)(intptr_t)session_idx);
+	vterm_screen_reset(s->vts, 1);
+
+	/* set default colors and sync palette AFTER screen reset */
+	{
+		VTermState* vtermstate = vterm_obtain_state(s->vterm);
+		VTermColor fg, bg;
+		int ci;
+		vterm_color_indexed(&fg, 7);
+		vterm_color_indexed(&bg, 0);
+		vterm_screen_set_default_colors(s->vts, &fg, &bg);
+
+		for (ci = 0; ci < 16; ci++)
+		{
+			VTermColor pc;
+			vterm_color_rgb(&pc,
+				prefs.palette[ci].red >> 8,
+				prefs.palette[ci].green >> 8,
+				prefs.palette[ci].blue >> 8);
+			vterm_state_set_palette_color(vtermstate, ci, &pc);
+		}
+	}
 }
 
 void setup_session_vterm(struct window_context* wc, int session_idx)
@@ -1275,16 +1339,6 @@ void setup_session_vterm(struct window_context* wc, int session_idx)
 
 	s->vterm = vterm_new(wc->size_y, wc->size_x);
 	vterm_set_utf8(s->vterm, 1);
-	VTermState* vtermstate = vterm_obtain_state(s->vterm);
-	vterm_state_reset(vtermstate, 1);
-
-	VTermColor fg = { .type = VTERM_COLOR_INDEXED };
-	fg.indexed.idx = qd2idx(prefs.fg_color);
-
-	VTermColor bg  = { .type = VTERM_COLOR_INDEXED };
-	bg.indexed.idx = qd2idx(prefs.bg_color);
-
-	vterm_state_set_default_colors(vtermstate, &fg, &bg);
 
 	if (s->type == SESSION_SSH)
 		vterm_output_set_callback(s->vterm, output_callback, (void*)(intptr_t)session_idx);
@@ -1292,21 +1346,41 @@ void setup_session_vterm(struct window_context* wc, int session_idx)
 		vterm_output_set_callback(s->vterm, local_output_callback, (void*)(intptr_t)session_idx);
 
 	s->vts = vterm_obtain_screen(s->vterm);
-	vterm_screen_reset(s->vts, 1);
 	vterm_screen_set_callbacks(s->vts, &vtscrcb, (void*)(intptr_t)session_idx);
+	vterm_screen_reset(s->vts, 1);
+
+	/* set default colors and sync palette AFTER screen reset */
+	{
+		VTermState* vtermstate = vterm_obtain_state(s->vterm);
+		VTermColor fg, bg;
+		int ci;
+		vterm_color_indexed(&fg, 7);
+		vterm_color_indexed(&bg, 0);
+		vterm_screen_set_default_colors(s->vts, &fg, &bg);
+
+		for (ci = 0; ci < 16; ci++)
+		{
+			VTermColor pc;
+			vterm_color_rgb(&pc,
+				prefs.palette[ci].red >> 8,
+				prefs.palette[ci].green >> 8,
+				prefs.palette[ci].blue >> 8);
+			vterm_state_set_palette_color(vtermstate, ci, &pc);
+		}
+	}
 }
 
 void init_font_metrics(void)
 {
-	// don't clobber font settings
 	short save_font = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
-	short save_font_fg   = qd.thePort->fgColor;
-	short save_font_bg   = qd.thePort->bkColor;
+	RGBColor save_fg, save_bg;
+	GetForeColor(&save_fg);
+	GetBackColor(&save_bg);
 
-	BackColor(prefs.bg_color);
-	ForeColor(prefs.fg_color);
+	RGBBackColor(&prefs.theme_bg);
+	RGBForeColor(&prefs.theme_fg);
 
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
@@ -1323,8 +1397,8 @@ void init_font_metrics(void)
 	TextSize(save_font_size);
 	TextFace(save_font_face);
 
-	BackColor(save_font_bg);
-	ForeColor(save_font_fg);
+	RGBForeColor(&save_fg);
+	RGBBackColor(&save_bg);
 
 	setup_key_translation();
 }
@@ -1333,13 +1407,24 @@ void update_console_colors(struct window_context* wc)
 {
 	VTermState* vtermstate = vterm_obtain_state(WC_S(wc).vterm);
 
-	VTermColor fg = { .type = VTERM_COLOR_INDEXED };
-	fg.indexed.idx = qd2idx(prefs.fg_color);
+	{
+		VTermColor fg, bg;
+		int ci;
+		vterm_color_indexed(&fg, 7);
+		vterm_color_indexed(&bg, 0);
+		vterm_screen_set_default_colors(WC_S(wc).vts, &fg, &bg);
 
-	VTermColor bg  = { .type = VTERM_COLOR_INDEXED };
-	bg.indexed.idx = qd2idx(prefs.bg_color);
-
-	vterm_state_set_default_colors(vtermstate, &fg, &bg);
+		/* sync palette */
+		for (ci = 0; ci < 16; ci++)
+		{
+			VTermColor pc;
+			vterm_color_rgb(&pc,
+				prefs.palette[ci].red >> 8,
+				prefs.palette[ci].green >> 8,
+				prefs.palette[ci].blue >> 8);
+			vterm_state_set_palette_color(vtermstate, ci, &pc);
+		}
+	}
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));

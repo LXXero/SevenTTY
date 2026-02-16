@@ -1937,6 +1937,73 @@ static void cmd_ssh(int idx, int argc, char* argv[])
 	}
 }
 
+static void cmd_colors(int idx, int argc, char* argv[])
+{
+	int i;
+	char buf[64];
+
+	/* palette hex dump */
+	vt_write(idx, "  Palette (hex RGB):\r\n");
+	for (i = 0; i < 16; i++)
+	{
+		snprintf(buf, sizeof(buf), "    %2d: %02X%02X%02X\r\n",
+			i,
+			prefs.palette[i].red >> 8,
+			prefs.palette[i].green >> 8,
+			prefs.palette[i].blue >> 8);
+		vt_write(idx, buf);
+	}
+	snprintf(buf, sizeof(buf), "    fg: %04X%04X%04X  bg: %04X%04X%04X\r\n",
+		prefs.theme_fg.red, prefs.theme_fg.green, prefs.theme_fg.blue,
+		prefs.theme_bg.red, prefs.theme_bg.green, prefs.theme_bg.blue);
+	vt_write(idx, buf);
+	snprintf(buf, sizeof(buf), "  orig_fg: %04X%04X%04X  orig_bg: %04X%04X%04X\r\n",
+		prefs.orig_theme_fg.red, prefs.orig_theme_fg.green, prefs.orig_theme_fg.blue,
+		prefs.orig_theme_bg.red, prefs.orig_theme_bg.green, prefs.orig_theme_bg.blue);
+	vt_write(idx, buf);
+	snprintf(buf, sizeof(buf), "  fg_ovr: %d  bg_ovr: %d  loaded: %d\r\n",
+		prefs.fg_color, prefs.bg_color, prefs.theme_loaded);
+	vt_write(idx, buf);
+	snprintf(buf, sizeof(buf), "  theme: %s\r\n", prefs.theme_name);
+	vt_write(idx, buf);
+	vt_write(idx, "\r\n");
+
+	/* normal colors 0-7: SGR 40-47 background blocks */
+	vt_write(idx, "  Normal colors:\r\n  ");
+	for (i = 0; i < 8; i++)
+	{
+		char esc[32];
+		snprintf(esc, sizeof(esc), "\033[%dm  %d  \033[0m", 40 + i, i);
+		vt_write(idx, esc);
+	}
+	vt_write(idx, "\r\n");
+	/* bright colors 8-15: SGR 100-107 */
+	vt_write(idx, "  Bright colors:\r\n  ");
+	for (i = 0; i < 8; i++)
+	{
+		char esc[32];
+		snprintf(esc, sizeof(esc), "\033[%dm  %d  \033[0m", 100 + i, 8 + i);
+		vt_write(idx, esc);
+	}
+	vt_write(idx, "\r\n\r\n");
+	/* foreground text samples */
+	vt_write(idx, "  Foreground text:\r\n  ");
+	for (i = 0; i < 8; i++)
+	{
+		char esc[32];
+		snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 30 + i, i);
+		vt_write(idx, esc);
+	}
+	vt_write(idx, "\r\n  ");
+	for (i = 0; i < 8; i++)
+	{
+		char esc[32];
+		snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 90 + i, 8 + i);
+		vt_write(idx, esc);
+	}
+	vt_write(idx, "\r\n");
+}
+
 static void cmd_help(int idx, int argc, char* argv[])
 {
 	vt_write(idx, "SevenTTY local shell - commands:\r\n");
@@ -1971,6 +2038,7 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    free               show memory usage\r\n");
 	vt_write(idx, "    ps                 list running processes\r\n");
 	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
+	vt_write(idx, "    colors             display color test\r\n");
 	vt_write(idx, "    help               this message\r\n");
 	vt_write(idx, "    exit               close this tab\r\n");
 	vt_write(idx, "\r\n");
@@ -2399,6 +2467,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "free") == 0)       cmd_free(idx, argc, argv);
 	else if (strcmp(cmd, "ps") == 0)         cmd_ps(idx, argc, argv);
 	else if (strcmp(cmd, "ssh") == 0)        cmd_ssh(idx, argc, argv);
+	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
@@ -2547,8 +2616,8 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 		return;
 	}
 
-	/* Ctrl+C: cancel line */
-	if (c == 3 || (modifiers & controlKey && c == 'c'))
+	/* Ctrl+C: cancel line (numpad Enter is also charCode 0x03 but without controlKey) */
+	if (modifiers & controlKey && (c == 3 || c == 'c'))
 	{
 		vt_write(session_idx, "^C\r\n");
 		s->shell_line_len = 0;

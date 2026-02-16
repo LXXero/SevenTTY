@@ -160,6 +160,62 @@ All constants live in `constants.r` (shared by C code and Rez resources):
 - `DLOG_*` / `DITL_*` / `ALRT_*` — dialog/alert resource IDs
 - `CNTL_PREF_*` — preferences dialog control IDs
 
+## Color Theme System
+
+### Architecture
+- 16-color ANSI palette stored in `prefs.palette[16]` as `RGBColor` (16-bit per channel)
+- Theme bg/fg/cursor stored in `prefs.theme_fg`, `prefs.theme_bg`, `prefs.theme_cursor`
+- Original theme colors (before overrides) stored in `prefs.orig_theme_bg`, `prefs.orig_theme_fg`
+- Color overrides: `prefs.fg_color`/`prefs.bg_color` = `COLOR_FROM_THEME` (-1) means use theme colors, otherwise a QD color constant
+- Built-in palettes: `init_dark_palette()` (black bg, VGA ANSI), `init_light_palette()` (white bg, VGA ANSI)
+
+### Theme File Format (`.sttheme`)
+20 lines of text, parsed by `load_theme_file()`:
+```
+STTY1           <- magic
+000000          <- background (6-char hex, 8-bit per channel)
+F2F2F2          <- foreground
+4D4D4D          <- cursor
+2A2A2A          <- ANSI 0 through ANSI 15 (16 lines)
+...
+```
+Converter: `tools/itermcolors2sttheme.py`
+
+### Prefs Persistence (Resource Fork)
+- Prefs stored as `'PREF'` resource 128 in `System Folder:Preferences:SevenTTY Preferences`
+- Binary `struct disk_prefs` — no text parsing, no field desync bugs
+- `save_prefs()`: `FSpCreateResFile` / `FSpOpenResFile` / `AddResource` / `WriteResource`
+- `load_prefs()`: `FSpOpenResFile` / `Get1Resource` / size+version check / `ReleaseResource`
+- Handles old text-based prefs file: if `FSpOpenResFile` fails, deletes and recreates as resource file
+- Version field allows future migration; mismatched version silently uses defaults
+- Flow: `init_prefs()` → `load_prefs()` → `apply_color_overrides()` at startup
+
+### Rendering (console.c)
+- Sentinel values: `COLOR_DEFAULT_FG=0xFE`, `COLOR_DEFAULT_BG=0xFF` in scrollback `sb_cell`
+- `extract_fg()`/`extract_bg()`: Convert VTermScreenCell color to abstract ID (sentinel or palette index)
+- `set_draw_fg()`/`set_draw_bg()`: Map sentinel to `prefs.theme_fg`/`theme_bg`, index to `prefs.palette[]`. **Must handle BOTH sentinels** — reverse video swaps fg↔bg, so `set_draw_bg` can receive `COLOR_DEFAULT_FG` and vice versa
+- Uses `RGBForeColor()`/`RGBBackColor()` exclusively (Color QuickDraw). **Never use indexed `BackColor()`/`ForeColor()`** — on a CGrafPort, once RGB colors are set, indexed calls don't reliably override the RGB fields, causing stale color bleed
+- `draw_screen_fast()` (monochrome mode) unchanged, ignores theme colors
+
+### VTerm Color Internals
+- `VTermColor` is a tagged union: `uint8_t type` at offset 0, `indexed.idx`/`rgb.red` at offset 1 (overlap!)
+- Type flags: `VTERM_COLOR_RGB=0x00`, `VTERM_COLOR_INDEXED=0x01`, `VTERM_COLOR_DEFAULT_FG=0x02`, `VTERM_COLOR_DEFAULT_BG=0x04`
+- After `vterm_state_reset` → `vterm_state_newpen`: defaults are **RGB** not indexed: `default_fg={type=0x02, rgb=(240,240,240)}`, `default_bg={type=0x04, rgb=(0,0,0)}`
+- `vterm_screen_set_default_colors()` updates screen pen AND existing buffer cells (use this, not state-level)
+- `vterm_state_set_default_colors()` only updates state internals (insufficient alone)
+- In `setup_session_vterm()`: MUST call `vterm_screen_reset()` BEFORE setting default colors, otherwise reset undoes them
+
+### Bugs Fixed
+- **sscanf prefs parsing catastrophe**: The original `load_prefs` used one giant `sscanf` with `\n` in the format. In C, `\n` in scanf matches ANY whitespace, so empty fields (hostname, username) caused all subsequent fields to desync — "THEME" ended up as username, hex data in other fields. Fix: per-line `read_line()` parsing.
+- **read_line multi-newline skip**: `read_line()` originally skipped ALL consecutive `\n`/`\r`, merging empty lines. Empty privkey+pubkey fields got collapsed. Fix: skip exactly one line ending (`\r`, `\n`, or `\r\n`).
+- **Scrollback color type fields**: `get_cell_scrolled()` and `sb_popline()` set `cell->fg.indexed.idx` but not the `type` field — type stayed 0 from memset, so `VTERM_COLOR_IS_INDEXED` returned false and all scrollback colors were lost. Fix: set `VTERM_COLOR_INDEXED` or `VTERM_COLOR_DEFAULT_FG/BG` type flags.
+- **extract_fg/bg false defaults**: `extract_fg` treated indexed color 7 as default, `extract_bg` treated indexed color 0 as default. This incorrectly converted explicit `\033[37m`/`\033[40m` ANSI colors to theme fg/bg. Fix: only use `VTERM_COLOR_IS_DEFAULT_FG/BG` flag check.
+- **Paul Millr bg = 000000**: Same as default dark palette, making theme load failures invisible. Use Adventure Time (bg=1E1C44) or Atelier Sulphurpool (bg=202746) to verify theme bg rendering.
+- **Corrupt prefs file**: If a buggy version saved garbled data, all subsequent loads are broken. Delete `System Folder:Preferences:SevenTTY Preferences` to reset.
+- **Reverse video sentinel leak**: `set_draw_bg()` only checked for `COLOR_DEFAULT_BG`, so when reverse video passed `COLOR_DEFAULT_FG` (0xFE), it fell through to `palette[0xFE & 0x0F]` = palette[14] = bright cyan. Fix: both `set_draw_fg` and `set_draw_bg` must handle both `COLOR_DEFAULT_FG` and `COLOR_DEFAULT_BG`.
+- **Indexed QuickDraw color bleed**: `draw_tab_bar()` used `BackColor(whiteColor)` which doesn't override the RGB fields on a CGrafPort after `RGBBackColor()` was used. Fix: use `RGBBackColor()`/`RGBForeColor()` everywhere, never indexed calls.
+- **Numpad Enter = Ctrl+C**: `kEnterCharCode` = 0x03 = ETX, same value as Ctrl+C. Shell's `if (c == 3)` caught numpad Enter. Fix: only treat 0x03 as Ctrl+C when `controlKey` modifier is set.
+
 ## Gotchas and Lessons Learned
 
 - **Memory is precious**: 2MB partition. Scrollback uses compact 4-byte cells, not full VTermScreenCells (would be ~950KB/session)
@@ -171,3 +227,6 @@ All constants live in `constants.r` (shared by C code and Rez resources):
 - **Rez resource compiler**: `.r` files are processed by Rez, not the C compiler. They share `constants.r` via `#include` but use Rez syntax for resource definitions
 - **Thread Manager**: Required for SSH (cooperative multitasking). System 7.5+ has it built in; 7.1-7.4 need the extension
 - **Open Transport**: Required for networking. Not available on very old System 7 installs. Local shell works without it
+- **kEnterCharCode = 0x03**: Numpad Enter char code is ETX (same as Ctrl+C). Always check `controlKey` modifier to distinguish them
+- **Never use indexed `BackColor()`/`ForeColor()`**: On CGrafPort (color windows), use `RGBBackColor()`/`RGBForeColor()` exclusively. Indexed calls don't reliably override RGB state
+- **`#include <Resources.h>`**: Required for Resource Manager calls (`FSpCreateResFile`, `FSpOpenResFile`, `Get1Resource`, `AddResource`, etc.)

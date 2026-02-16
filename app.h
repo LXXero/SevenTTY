@@ -12,6 +12,7 @@
 #include <OpenTptInternet.h>
 #include <StandardFile.h>
 #include <Folders.h>
+#include <Quickdraw.h>
 
 #include <libssh2.h>
 
@@ -166,6 +167,15 @@ struct preferences
 	int bg_color;
 
 	int font_size;
+
+	RGBColor palette[16];
+	RGBColor theme_fg;
+	RGBColor theme_bg;
+	RGBColor theme_cursor;
+	RGBColor orig_theme_bg;
+	RGBColor orig_theme_fg;
+	int theme_loaded;
+	char theme_name[64];
 };
 
 extern struct preferences prefs;
@@ -173,6 +183,7 @@ extern struct preferences prefs;
 extern char key_to_vterm[256];
 
 int save_prefs(void);
+int load_theme_file(FSSpec* spec);
 void set_window_title(WindowPtr w, const char* c_name, size_t length);
 void set_terminal_string(void);
 

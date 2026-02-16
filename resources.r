@@ -490,6 +490,7 @@ resource 'MENU' (MENU_COLOR) {
 	allEnabled, enabled;
 	"Color";
 	{
+		"(Theme)", noIcon, noKey, noMark, plain;
 		"Black", noIcon, noKey, noMark, plain;
 		"Red", noIcon, noKey, noMark, plain;
 		"Green", noIcon, noKey, noMark, plain;
@@ -527,7 +528,7 @@ resource 'MENU' (MENU_FONT_SIZE) {
 };
 
 resource 'DLOG' (DLOG_PREFERENCES) {
-	{ 50, 100, 205, 420 },
+	{ 50, 100, 235, 420 },
 	dBoxProc,
 	visible,
 	noGoAway,
@@ -539,10 +540,10 @@ resource 'DLOG' (DLOG_PREFERENCES) {
 
 resource 'DITL' (DITL_PREFERENCES) {
 	{
-		{ 125, 230, 145, 310 },
+		{ 155, 230, 175, 310 },
 		Button { enabled, "OK" };
 
-		{ 190-10-20-5, 320-10-80-5, 190-10+5, 320-10+5 }, /* box for border */
+		{ 220-10-20-5, 320-10-80-5, 220-10+5, 320-10+5 }, /* box for border */
 		UserItem { enabled };
 
 		{ 10, 35, 28, 130 },
@@ -569,13 +570,20 @@ resource 'DITL' (DITL_PREFERENCES) {
 		{ 100, 150, 119, 300 },
 		Control { enabled, CNTL_PREF_FONT_SIZE };
 
-		{ 125, 10, 145, 90 },
+		{ 155, 10, 175, 90 },
 		Button { enabled, "Cancel" };
 
-		/*
-		{ 115, 105, 135, 170 },
-		Button { enabled, "Reset" };
-		*/
+		{ 128, 10, 148, 90 },
+		Button { enabled, "Theme..." };
+
+		{ 128, 100, 148, 230 },
+		StaticText { enabled, "Default Dark" };
+
+		{ 155, 100, 175, 155 },
+		Button { enabled, "Dark" };
+
+		{ 155, 160, 175, 220 },
+		Button { enabled, "Light" };
 	}
 };
 

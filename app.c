@@ -22,8 +22,12 @@
 #include <Scrap.h>
 #include <Controls.h>
 #include <ControlDefinitions.h>
+#include <Resources.h>
 
 #include <stdio.h>
+
+/* menu item 1 = "(Theme)", 2-9 = colors */
+#define COLOR_FROM_THEME -1
 
 // forward declarations
 int qd_color_to_menu_item(int qd_color);
@@ -160,82 +164,143 @@ void set_terminal_string(void)
 	}
 }
 
+/* ---- Resource-based preferences ---- */
+
+/* disk layout for 'PREF' resource — bump DISK_PREFS_VERSION if you change this struct */
+#define DISK_PREFS_VERSION 1
+
+struct disk_prefs
+{
+	short version;
+	short auth_type;
+	short display_mode;
+	short fg_color;
+	short bg_color;
+	short font_size;
+	short theme_loaded;
+	short _reserved;
+	RGBColor palette[16];
+	RGBColor theme_fg;
+	RGBColor theme_bg;
+	RGBColor theme_cursor;
+	RGBColor orig_theme_fg;
+	RGBColor orig_theme_bg;
+	char theme_name[64];
+	char hostname[512];     /* pascal string: byte 0 = length */
+	char username[256];     /* pascal string */
+	char port[256];         /* pascal string */
+	char privkey_path[1024];
+	char pubkey_path[1024];
+};
+
+static OSErr get_prefs_spec(FSSpec* spec)
+{
+	short vRefNum;
+	long dirID;
+	OSErr e = FindFolder(kOnSystemDisk, kPreferencesFolderType, kCreateFolder, &vRefNum, &dirID);
+	if (e != noErr) return e;
+	return FSMakeFSSpec(vRefNum, dirID, PREFERENCES_FILENAME, spec);
+}
+
 int save_prefs(void)
 {
-	int ok = 1;
-	short foundVRefNum = 0;
-	long foundDirID = 0;
-	FSSpec pref_file;
-	short prefRefNum = 0;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	Handle h;
+	struct disk_prefs* dp;
 
-	OSType pref_type = 'SH7p';
-	OSType creator_type = 'SSH7';
+	e = get_prefs_spec(&spec);
+	if (e != noErr && e != fnfErr) return 0;
 
-	// find the preferences folder on the system disk, create folder if needed
-	OSErr e = FindFolder(kOnSystemDisk, kPreferencesFolderType, kCreateFolder, &foundVRefNum, &foundDirID);
-	if (e != noErr) ok = 0;
-
-	// make an FSSpec for the new file we want to make
-	if (ok)
+	if (e == fnfErr)
 	{
-		e = FSMakeFSSpec(foundVRefNum, foundDirID, PREFERENCES_FILENAME, &pref_file);
-
-		// if the file exists, delete it
-		if (e == noErr) FSpDelete(&pref_file);
-
-		// and then make it
-		e = FSpCreate(&pref_file, creator_type, pref_type, smSystemScript);
-		if (e != noErr) ok = 0;
+		/* no file yet — create new resource file */
+		FSpCreateResFile(&spec, 'SSH7', 'SH7p', smSystemScript);
+		if (ResError() != noErr) return 0;
 	}
-
-	// open the file
-	if (ok)
+	else
 	{
-		e = FSpOpenDF(&pref_file, fsRdWrPerm, &prefRefNum);
-		if (e != noErr) ok = 0;
-	}
-
-	// write prefs to the file
-	if (ok)
-	{
-		// TODO: choose buffer size more effectively
-		size_t write_length = 8192;
-
-		char* output_buffer = malloc(write_length);
-		memset(output_buffer, 0, write_length);
-
-		long int i = snprintf(output_buffer, write_length, "%d\n%d\n", prefs.major_version, prefs.minor_version);
-		i += snprintf(output_buffer+i, write_length-i, "%d\n%d\n%d\n%d\n%d\n", (int)prefs.auth_type, (int)prefs.display_mode, (int)prefs.fg_color, (int)prefs.bg_color, (int)prefs.font_size);
-
-		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.hostname+1);
-		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.username+1);
-		i += snprintf(output_buffer+i, write_length-i, "%s\n", prefs.port+1);
-
-		if (prefs.privkey_path && prefs.privkey_path[0] != '\0')
+		/* file exists — try opening as resource file */
+		refNum = FSpOpenResFile(&spec, fsRdWrPerm);
+		if (refNum == -1)
 		{
-			i += snprintf(output_buffer+i, write_length-i, "%s\n%s\n", prefs.privkey_path, prefs.pubkey_path);
+			/* old text-based prefs file, replace with resource file */
+			FSpDelete(&spec);
+			FSpCreateResFile(&spec, 'SSH7', 'SH7p', smSystemScript);
+			if (ResError() != noErr) return 0;
 		}
 		else
 		{
-			i += snprintf(output_buffer+i, write_length-i, "\n\n");
+			/* already a valid resource file, use it */
+			UseResFile(refNum);
+			goto have_file;
 		}
-
-		// tell it to write all bytes
-		long int bytes = i;
-		e = FSWrite(prefRefNum, &bytes, output_buffer);
-		// FSWrite sets bytes to the actual number of bytes written
-
-		if (e != noErr || (bytes != i)) ok = 0;
 	}
 
-	// close the file
-	if (prefRefNum != 0)
+	refNum = FSpOpenResFile(&spec, fsRdWrPerm);
+	if (refNum == -1) return 0;
+	UseResFile(refNum);
+
+have_file:
+	/* remove old resource if it exists */
+	h = Get1Resource('PREF', 128);
+	if (h)
 	{
-		e = FSClose(prefRefNum);
-		if (e != noErr) ok = 0;
+		RemoveResource(h);
+		DisposeHandle(h);
 	}
 
-	return ok;
+	/* build disk_prefs */
+	h = NewHandleClear(sizeof(struct disk_prefs));
+	if (h == NULL) { CloseResFile(refNum); return 0; }
+
+	HLock(h);
+	dp = (struct disk_prefs*)*h;
+
+	dp->version = DISK_PREFS_VERSION;
+	dp->auth_type = (short)prefs.auth_type;
+	dp->display_mode = (short)prefs.display_mode;
+	dp->fg_color = (short)prefs.fg_color;
+	dp->bg_color = (short)prefs.bg_color;
+	dp->font_size = (short)prefs.font_size;
+	dp->theme_loaded = (short)prefs.theme_loaded;
+
+	memcpy(dp->palette, prefs.palette, sizeof(prefs.palette));
+	dp->theme_fg = prefs.theme_fg;
+	dp->theme_bg = prefs.theme_bg;
+	dp->theme_cursor = prefs.theme_cursor;
+	dp->orig_theme_fg = prefs.orig_theme_fg;
+	dp->orig_theme_bg = prefs.orig_theme_bg;
+
+	strncpy(dp->theme_name, prefs.theme_name, 63);
+	dp->theme_name[63] = '\0';
+
+	memcpy(dp->hostname, prefs.hostname, 512);
+	memcpy(dp->username, prefs.username, 256);
+	memcpy(dp->port, prefs.port, 256);
+
+	if (prefs.privkey_path)
+		strncpy(dp->privkey_path, prefs.privkey_path, 1023);
+	dp->privkey_path[1023] = '\0';
+
+	if (prefs.pubkey_path)
+		strncpy(dp->pubkey_path, prefs.pubkey_path, 1023);
+	dp->pubkey_path[1023] = '\0';
+
+	HUnlock(h);
+
+	AddResource(h, 'PREF', 128, "\pPreferences");
+	if (ResError() != noErr)
+	{
+		DisposeHandle(h);
+		CloseResFile(refNum);
+		return 0;
+	}
+
+	WriteResource(h);
+	CloseResFile(refNum);
+	return 1;
 }
 
 // check if the main device is black and white
@@ -244,9 +309,66 @@ int detect_color_screen(void)
 	return TestDeviceAttribute(GetMainDevice(), gdDevType);
 }
 
+static void make_rgb(RGBColor* c, unsigned short r, unsigned short g, unsigned short b)
+{
+	c->red   = (r << 8) | r;
+	c->green = (g << 8) | g;
+	c->blue  = (b << 8) | b;
+}
+
+static void init_vga_palette(void)
+{
+	/* Standard VGA ANSI colors (shared by dark and light) */
+	make_rgb(&prefs.palette[0],  0x00, 0x00, 0x00); /* black */
+	make_rgb(&prefs.palette[1],  0xAA, 0x00, 0x00); /* red */
+	make_rgb(&prefs.palette[2],  0x00, 0xAA, 0x00); /* green */
+	make_rgb(&prefs.palette[3],  0xAA, 0x55, 0x00); /* yellow/brown */
+	make_rgb(&prefs.palette[4],  0x00, 0x00, 0xAA); /* blue */
+	make_rgb(&prefs.palette[5],  0xAA, 0x00, 0xAA); /* magenta */
+	make_rgb(&prefs.palette[6],  0x00, 0xAA, 0xAA); /* cyan */
+	make_rgb(&prefs.palette[7],  0xAA, 0xAA, 0xAA); /* white */
+	/* bright variants */
+	make_rgb(&prefs.palette[8],  0x55, 0x55, 0x55); /* bright black */
+	make_rgb(&prefs.palette[9],  0xFF, 0x55, 0x55); /* bright red */
+	make_rgb(&prefs.palette[10], 0x55, 0xFF, 0x55); /* bright green */
+	make_rgb(&prefs.palette[11], 0xFF, 0xFF, 0x55); /* bright yellow */
+	make_rgb(&prefs.palette[12], 0x55, 0x55, 0xFF); /* bright blue */
+	make_rgb(&prefs.palette[13], 0xFF, 0x55, 0xFF); /* bright magenta */
+	make_rgb(&prefs.palette[14], 0x55, 0xFF, 0xFF); /* bright cyan */
+	make_rgb(&prefs.palette[15], 0xFF, 0xFF, 0xFF); /* bright white */
+}
+
+static void save_theme_originals(void)
+{
+	prefs.orig_theme_bg = prefs.theme_bg;
+	prefs.orig_theme_fg = prefs.theme_fg;
+}
+
+static void init_dark_palette(void)
+{
+	init_vga_palette();
+	make_rgb(&prefs.theme_bg, 0x00, 0x00, 0x00);
+	make_rgb(&prefs.theme_fg, 0xAA, 0xAA, 0xAA);
+	make_rgb(&prefs.theme_cursor, 0xAA, 0xAA, 0xAA);
+	save_theme_originals();
+	prefs.theme_loaded = 1;
+	strcpy(prefs.theme_name, "Default Dark");
+}
+
+static void init_light_palette(void)
+{
+	init_vga_palette();
+	make_rgb(&prefs.theme_bg, 0xFF, 0xFF, 0xFF);
+	make_rgb(&prefs.theme_fg, 0x00, 0x00, 0x00);
+	make_rgb(&prefs.theme_cursor, 0x00, 0x00, 0x00);
+	save_theme_originals();
+	prefs.theme_loaded = 1;
+	strcpy(prefs.theme_name, "Default Light");
+}
+
 void init_prefs(void)
 {
-	// initialize everything to a safe default
+	/* initialize everything to a safe default */
 	prefs.major_version = APP_VERSION_MAJOR;
 	prefs.minor_version = APP_VERSION_MINOR;
 
@@ -255,7 +377,7 @@ void init_prefs(void)
 	memset(&(prefs.password), 0, 256);
 	memset(&(prefs.port), 0, 256);
 
-	// default port: 22
+	/* default port: 22 */
 	prefs.port[0] = 2;
 	prefs.port[1] = '2';
 	prefs.port[2] = '2';
@@ -265,119 +387,225 @@ void init_prefs(void)
 	prefs.terminal_string = DEFAULT_TERM_STRING;
 	prefs.auth_type = USE_PASSWORD;
 	prefs.display_mode = detect_color_screen() ? COLOR : FASTEST;
-	prefs.fg_color = blackColor;
-	prefs.bg_color = whiteColor;
+	prefs.fg_color = COLOR_FROM_THEME;
+	prefs.bg_color = COLOR_FROM_THEME;
 	prefs.font_size = 9;
+
+	init_dark_palette();
 
 	prefs.loaded_from_file = 0;
 }
 
+static int hex_digit(char c)
+{
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+	if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+	return 0;
+}
+
+static int parse_hex_rgb(const char* s, RGBColor* c)
+{
+	int i;
+	unsigned char r, g, b;
+	/* must be exactly 6 hex chars */
+	for (i = 0; i < 6; i++)
+	{
+		char ch = s[i];
+		if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'F') || (ch >= 'a' && ch <= 'f')))
+			return 0;
+	}
+	r = (hex_digit(s[0]) << 4) | hex_digit(s[1]);
+	g = (hex_digit(s[2]) << 4) | hex_digit(s[3]);
+	b = (hex_digit(s[4]) << 4) | hex_digit(s[5]);
+	make_rgb(c, r, g, b);
+	return 1;
+}
+
+/* read one line from buffer, returns pointer past the newline or NULL.
+   skips exactly one line ending (\n, \r, or \r\n) so empty lines are preserved. */
+static const char* read_line(const char* buf, const char* end, char* out, int max)
+{
+	int i = 0;
+	while (buf < end && *buf != '\n' && *buf != '\r' && i < max - 1)
+	{
+		out[i++] = *buf++;
+	}
+	out[i] = '\0';
+	/* skip exactly one line ending */
+	if (buf < end && *buf == '\r') buf++;
+	if (buf < end && *buf == '\n') buf++;
+	return buf < end ? buf : NULL;
+}
+
+int load_theme_file(FSSpec* spec)
+{
+	short refNum = 0;
+	OSErr e;
+	long buf_size = 2048;
+	char* buf = NULL;
+	char line[128];
+	const char* p;
+	const char* end;
+	RGBColor new_bg, new_fg, new_cursor;
+	RGBColor new_palette[16];
+	int i;
+
+	e = FSpOpenDF(spec, fsCurPerm, &refNum);
+	if (e != noErr) return 0;
+
+	buf = malloc(buf_size);
+	if (buf == NULL) { FSClose(refNum); return 0; }
+
+	e = FSRead(refNum, &buf_size, buf);
+	FSClose(refNum);
+
+	if (e != noErr && e != eofErr) { free(buf); return 0; }
+
+	end = buf + buf_size;
+	p = buf;
+
+	/* line 1: magic */
+	p = read_line(p, end, line, sizeof(line));
+	if (p == NULL && line[0] == '\0') { free(buf); return 0; }
+	if (strncmp(line, "STTY1", 5) != 0) { free(buf); return 0; }
+
+	/* line 2: background */
+	p = read_line(p ? p : end, end, line, sizeof(line));
+	if (!parse_hex_rgb(line, &new_bg)) { free(buf); return 0; }
+
+	/* line 3: foreground */
+	p = read_line(p ? p : end, end, line, sizeof(line));
+	if (!parse_hex_rgb(line, &new_fg)) { free(buf); return 0; }
+
+	/* line 4: cursor */
+	p = read_line(p ? p : end, end, line, sizeof(line));
+	if (!parse_hex_rgb(line, &new_cursor)) { free(buf); return 0; }
+
+	/* lines 5-20: ANSI 0-15 */
+	for (i = 0; i < 16; i++)
+	{
+		p = read_line(p ? p : end, end, line, sizeof(line));
+		if (!parse_hex_rgb(line, &new_palette[i])) { free(buf); return 0; }
+	}
+
+	/* all parsed OK, commit */
+	prefs.theme_bg = new_bg;
+	prefs.theme_fg = new_fg;
+	prefs.theme_cursor = new_cursor;
+	for (i = 0; i < 16; i++)
+		prefs.palette[i] = new_palette[i];
+	save_theme_originals();
+	prefs.theme_loaded = 1;
+
+	/* extract theme name from FSSpec */
+	{
+		int len = spec->name[0];
+		if (len > 63) len = 63;
+		memcpy(prefs.theme_name, spec->name + 1, len);
+		prefs.theme_name[len] = '\0';
+	}
+
+	free(buf);
+	return 1;
+}
+
 void load_prefs(void)
 {
-	// now try to load preferences from the file
-	short foundVRefNum = 0;
-	long foundDirID = 0;
-	FSSpec pref_file;
-	short prefRefNum = 0;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	Handle h;
+	struct disk_prefs* dp;
 
-	// find the preferences folder on the system disk
-	OSErr e = FindFolder(kOnSystemDisk, kPreferencesFolderType, kDontCreateFolder, &foundVRefNum, &foundDirID);
+	e = get_prefs_spec(&spec);
 	if (e != noErr) return;
 
-	// make an FSSpec for the preferences file location and check if it exists
-	// TODO: if I just put PREFERENCES_FILENAME it doesn't work, wtf
-	e = FSMakeFSSpec(foundVRefNum, foundDirID, PREFERENCES_FILENAME, &pref_file);
+	refNum = FSpOpenResFile(&spec, fsCurPerm);
+	if (refNum == -1) return;
 
-	if (e == fnfErr) // file not found, nothing to load
+	UseResFile(refNum);
+	h = Get1Resource('PREF', 128);
+	if (h == NULL)
 	{
-		return;
-	}
-	else if (e != noErr) return;
-
-	e = FSpOpenDF(&pref_file, fsCurPerm, &prefRefNum);
-	if (e != noErr) return;
-
-	// actually read and parse the file
-	long int buffer_size = 8192;
-	char* buffer = NULL;
-	buffer = malloc(buffer_size);
-	prefs.privkey_path = malloc(2048);
-	prefs.pubkey_path = malloc(2048);
-	prefs.pubkey_path[0] = '\0';
-	prefs.privkey_path[0] = '\0';
-
-	prefs.hostname[0] = 0;
-	prefs.username[0] = 0;
-	prefs.port[0] = 0;
-
-	e = FSRead(prefRefNum, &buffer_size, buffer);
-	e = FSClose(prefRefNum);
-
-	// check the version (first two numbers)
-	int items_got = sscanf(buffer, "%d\n%d", &prefs.major_version, &prefs.minor_version);
-	if (items_got != 2)
-	{
-		free(buffer);
+		CloseResFile(refNum);
 		return;
 	}
 
-	// only load a prefs file if the saved version number matches ours
-	if ((prefs.major_version == APP_VERSION_MAJOR) && (prefs.minor_version == APP_VERSION_MINOR))
+	if (GetHandleSize(h) < (long)sizeof(struct disk_prefs))
 	{
-		prefs.loaded_from_file = 1;
-		items_got = sscanf(buffer, "%d\n%d\n%d\n%d\n%d\n%d\n%d\n%255[^\n]\n%255[^\n]\n%255[^\n]\n%[^\n]\n%[^\n]", &prefs.major_version, &prefs.minor_version, (int*)&prefs.auth_type, (int*)&prefs.display_mode, &prefs.fg_color, &prefs.bg_color, &prefs.font_size, prefs.hostname+1, prefs.username+1, prefs.port+1, prefs.privkey_path, prefs.pubkey_path);
-
-		// need at least the core fields (version, auth, display, colors, font, host, user, port)
-		if (items_got < 10)
-		{
-			prefs.loaded_from_file = 0;
-			init_prefs();
-			free(buffer);
-			return;
-		}
-
-		// bounds-check loaded values
-		if (prefs.auth_type != USE_KEY && prefs.auth_type != USE_PASSWORD)
-			prefs.auth_type = USE_PASSWORD;
-
-		if (prefs.display_mode != FASTEST && prefs.display_mode != COLOR)
-			prefs.display_mode = detect_color_screen() ? COLOR : FASTEST;
-
-		if (qd_color_to_menu_item(prefs.fg_color) == 1 && prefs.fg_color != blackColor)
-			prefs.fg_color = blackColor;
-
-		if (qd_color_to_menu_item(prefs.bg_color) == 1 && prefs.bg_color != blackColor)
-			prefs.bg_color = whiteColor;
-
-		if (font_size_to_menu_item(prefs.font_size) == 1 && prefs.font_size != 9)
-			prefs.font_size = 9;
-
-		// add the size for the pascal strings
-		// hostname buffer contains "host:port" as C string; hostname[0] = host length only
-		{
-			char* colon = strchr(prefs.hostname + 1, ':');
-			if (colon)
-				prefs.hostname[0] = (unsigned char)(colon - (prefs.hostname + 1));
-			else
-				prefs.hostname[0] = (unsigned char)strlen(prefs.hostname + 1);
-		}
-		prefs.username[0] = (unsigned char)strlen(prefs.username+1);
-		prefs.port[0] = (unsigned char)strlen(prefs.port+1);
-
-		set_terminal_string();
-	}
-	else
-	{
-		// version mismatch: free malloc'd paths before restoring defaults
-		// (init_prefs sets these to "" literals, leaking the buffers)
-		if (prefs.privkey_path) free(prefs.privkey_path);
-		if (prefs.pubkey_path) free(prefs.pubkey_path);
-		prefs.privkey_path = NULL;
-		prefs.pubkey_path = NULL;
-		init_prefs();
+		ReleaseResource(h);
+		CloseResFile(refNum);
+		return;
 	}
 
-	if (buffer) free(buffer);
+	HLock(h);
+	dp = (struct disk_prefs*)*h;
+
+	if (dp->version != DISK_PREFS_VERSION)
+	{
+		HUnlock(h);
+		ReleaseResource(h);
+		CloseResFile(refNum);
+		return;
+	}
+
+	prefs.loaded_from_file = 1;
+	prefs.auth_type = dp->auth_type;
+	prefs.display_mode = dp->display_mode;
+	prefs.fg_color = dp->fg_color;
+	prefs.bg_color = dp->bg_color;
+	prefs.font_size = dp->font_size;
+	prefs.theme_loaded = dp->theme_loaded;
+
+	memcpy(prefs.palette, dp->palette, sizeof(prefs.palette));
+	prefs.theme_fg = dp->theme_fg;
+	prefs.theme_bg = dp->theme_bg;
+	prefs.theme_cursor = dp->theme_cursor;
+	prefs.orig_theme_fg = dp->orig_theme_fg;
+	prefs.orig_theme_bg = dp->orig_theme_bg;
+
+	strncpy(prefs.theme_name, dp->theme_name, 63);
+	prefs.theme_name[63] = '\0';
+
+	memcpy(prefs.hostname, dp->hostname, 512);
+	memcpy(prefs.username, dp->username, 256);
+	memcpy(prefs.port, dp->port, 256);
+
+	/* alloc and copy key paths */
+	prefs.privkey_path = malloc(1024);
+	prefs.pubkey_path = malloc(1024);
+	if (prefs.privkey_path)
+	{
+		strncpy(prefs.privkey_path, dp->privkey_path, 1023);
+		prefs.privkey_path[1023] = '\0';
+	}
+	if (prefs.pubkey_path)
+	{
+		strncpy(prefs.pubkey_path, dp->pubkey_path, 1023);
+		prefs.pubkey_path[1023] = '\0';
+	}
+
+	HUnlock(h);
+	ReleaseResource(h);
+	CloseResFile(refNum);
+
+	/* bounds-check */
+	if (prefs.auth_type != USE_KEY && prefs.auth_type != USE_PASSWORD)
+		prefs.auth_type = USE_PASSWORD;
+	if (prefs.display_mode != FASTEST && prefs.display_mode != COLOR)
+		prefs.display_mode = detect_color_screen() ? COLOR : FASTEST;
+	if (qd_color_to_menu_item(prefs.fg_color) == 1 && prefs.fg_color != COLOR_FROM_THEME)
+		prefs.fg_color = COLOR_FROM_THEME;
+	if (qd_color_to_menu_item(prefs.bg_color) == 1 && prefs.bg_color != COLOR_FROM_THEME)
+		prefs.bg_color = COLOR_FROM_THEME;
+	if (font_size_to_menu_item(prefs.font_size) == 1 && prefs.font_size != 9)
+		prefs.font_size = 9;
+
+	if (prefs.theme_loaded)
+		save_theme_originals();
+
+	set_terminal_string();
 }
 
 // borrowed from Retro68 sample code
@@ -443,14 +671,15 @@ int qd_color_to_menu_item(int qd_color)
 {
 	switch (qd_color)
 	{
-		case blackColor: return 1;
-		case redColor: return 2;
-		case greenColor: return 3;
-		case yellowColor: return 4;
-		case blueColor: return 5;
-		case magentaColor: return 6;
-		case cyanColor: return 7;
-		case whiteColor: return 8;
+		case COLOR_FROM_THEME: return 1;
+		case blackColor: return 2;
+		case redColor: return 3;
+		case greenColor: return 4;
+		case yellowColor: return 5;
+		case blueColor: return 6;
+		case magentaColor: return 7;
+		case cyanColor: return 8;
+		case whiteColor: return 9;
 		default: return 1;
 	}
 }
@@ -459,16 +688,47 @@ int menu_item_to_qd_color(int menu_item)
 {
 	switch (menu_item)
 	{
-		case 1: return blackColor;
-		case 2: return redColor;
-		case 3: return greenColor;
-		case 4: return yellowColor;
-		case 5: return blueColor;
-		case 6: return magentaColor;
-		case 7: return cyanColor;
-		case 8: return whiteColor;
-		default: return 1;
+		case 1: return COLOR_FROM_THEME;
+		case 2: return blackColor;
+		case 3: return redColor;
+		case 4: return greenColor;
+		case 5: return yellowColor;
+		case 6: return blueColor;
+		case 7: return magentaColor;
+		case 8: return cyanColor;
+		case 9: return whiteColor;
+		default: return COLOR_FROM_THEME;
 	}
+}
+
+static void qd_color_to_rgb_val(int qd_color, RGBColor* out)
+{
+	switch (qd_color)
+	{
+		case blackColor:   make_rgb(out, 0x00, 0x00, 0x00); break;
+		case redColor:     make_rgb(out, 0xFF, 0x00, 0x00); break;
+		case greenColor:   make_rgb(out, 0x00, 0xFF, 0x00); break;
+		case yellowColor:  make_rgb(out, 0xFF, 0xFF, 0x00); break;
+		case blueColor:    make_rgb(out, 0x00, 0x00, 0xFF); break;
+		case magentaColor: make_rgb(out, 0xFF, 0x00, 0xFF); break;
+		case cyanColor:    make_rgb(out, 0x00, 0xFF, 0xFF); break;
+		case whiteColor:   make_rgb(out, 0xFF, 0xFF, 0xFF); break;
+		default:           make_rgb(out, 0x00, 0x00, 0x00); break;
+	}
+}
+
+/* apply bg/fg overrides: call after theme load or prefs load */
+static void apply_color_overrides(void)
+{
+	if (prefs.bg_color != COLOR_FROM_THEME)
+		qd_color_to_rgb_val(prefs.bg_color, &prefs.theme_bg);
+	else
+		prefs.theme_bg = prefs.orig_theme_bg;
+
+	if (prefs.fg_color != COLOR_FROM_THEME)
+		qd_color_to_rgb_val(prefs.fg_color, &prefs.theme_fg);
+	else
+		prefs.theme_fg = prefs.orig_theme_fg;
 }
 
 int font_size_to_menu_item(int font_size)
@@ -540,24 +800,94 @@ void preferences_window(void)
 	font_size_menu = (ControlHandle)itemH;
 	SetControlValue(font_size_menu, font_size_to_menu_item(prefs.font_size));
 
-	// let the modalmanager do everything
-	// stop on ok or cancel
+	/* set up theme name display (item 13) */
+	{
+		Handle themeH;
+		Rect themeBox;
+		GetDialogItem(dlg, 13, &type, &themeH, &themeBox);
+		if (prefs.theme_loaded && prefs.theme_name[0] != '\0')
+		{
+			Str255 tname;
+			int tlen = strlen(prefs.theme_name);
+			if (tlen > 255) tlen = 255;
+			tname[0] = tlen;
+			memcpy(tname + 1, prefs.theme_name, tlen);
+			SetDialogItemText(themeH, tname);
+		}
+		else
+		{
+			SetDialogItemText(themeH, "\pDefault Dark");
+		}
+	}
+
+	/* let the modalmanager do everything */
+	/* stop on ok or cancel; handle Theme button (item 12) inline */
 	short item;
 	do {
 		ModalDialog(NULL, &item);
+		if (item == 12)
+		{
+			/* Theme... button pressed */
+			StandardFileReply reply;
+			StandardGetFile(NULL, -1, NULL, &reply);
+			if (reply.sfGood)
+			{
+				if (load_theme_file(&reply.sfFile))
+				{
+					/* update theme name display */
+					Handle themeH;
+					Rect themeBox;
+					GetDialogItem(dlg, 13, &type, &themeH, &themeBox);
+					{
+						Str255 tname;
+						int tlen = strlen(prefs.theme_name);
+						if (tlen > 255) tlen = 255;
+						tname[0] = tlen;
+						memcpy(tname + 1, prefs.theme_name, tlen);
+						SetDialogItemText(themeH, tname);
+					}
+					/* reset bg/fg to "(Theme)" for new theme */
+					SetControlValue(bg_color_menu, 1);
+					SetControlValue(fg_color_menu, 1);
+				}
+			}
+		}
+		else if (item == 14)
+		{
+			/* Dark button pressed */
+			Handle themeH;
+			Rect themeBox;
+			init_dark_palette();
+			GetDialogItem(dlg, 13, &type, &themeH, &themeBox);
+			SetDialogItemText(themeH, "\pDefault Dark");
+			SetControlValue(bg_color_menu, 1);
+			SetControlValue(fg_color_menu, 1);
+		}
+		else if (item == 15)
+		{
+			/* Light button pressed */
+			Handle themeH;
+			Rect themeBox;
+			init_light_palette();
+			GetDialogItem(dlg, 13, &type, &themeH, &themeBox);
+			SetDialogItemText(themeH, "\pDefault Light");
+			SetControlValue(bg_color_menu, 1);
+			SetControlValue(fg_color_menu, 1);
+		}
 	} while(item != 1 && item != 11);
 
-	// save if OK'd
+	/* save if OK'd */
 	if (item == 1)
 	{
-		// read menu values into prefs
+		/* read menu values into prefs */
 		prefs.display_mode = GetControlValue(term_type_menu) - 1;
 
 		prefs.bg_color = menu_item_to_qd_color(GetControlValue(bg_color_menu));
 		prefs.fg_color = menu_item_to_qd_color(GetControlValue(fg_color_menu));
+		apply_color_overrides();
 		int new_font_size = menu_item_to_font_size(GetControlValue(font_size_menu));
 
-		// resize window if font size changed
+		/* resize window if font size changed */
 		if (new_font_size != prefs.font_size)
 		{
 			prefs.font_size = new_font_size;
@@ -569,7 +899,7 @@ void preferences_window(void)
 		update_console_colors(wc);
 	}
 
-	// clean it up
+	/* clean it up */
 	DisposeDialog(dlg);
 	FlushEvents(everyEvent, -1);
 }
@@ -881,7 +1211,7 @@ int new_window(void)
 
 	ConstStr255Param title = "\pSevenTTY " APP_VERSION;
 
-	WindowPtr win = NewWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
+	WindowPtr win = NewCWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
 
 	SetPort(win);
 	EraseRect(&win->portRect);
@@ -2023,6 +2353,7 @@ int main(int argc, char** argv)
 	// set default preferences, then load from preferences file if possible
 	init_prefs();
 	load_prefs();
+	apply_color_overrides();
 
 	// general gui setup
 	InitGraf(&qd.thePort);
