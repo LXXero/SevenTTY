@@ -12,14 +12,15 @@ features
 * **Tabbed sessions**: Cmd+T for local shell tabs, Cmd+S for SSH tabs, Cmd+1-8 to switch
 * **Local shell**: built-in command interpreter with 30+ commands
   * File operations: `ls`, `cd`, `cat`, `cp`, `mv`, `rm`, `mkdir`, `touch`, and more
-  * System info: `ps`, `free`, `df`, `uname`, `date`
+  * System info: `ps`, `free [-h]`, `df [-m|-h]`, `uname`, `date`
   * Mac-specific: `getinfo`, `chown`, `settype`, `setcreator`, `chmod`, `label`
   * Tab completion, command history (up/down arrows), colorized `ls` output
 * **SSH client**: password and public key authentication, known hosts verification
 * **Scrollback**: Shift+Page Up/Down to scroll through history (100 lines per session)
 * **Copy/paste**: mouse text selection with Cmd+C/V
 * **16-color terminal**: xterm-compatible with bold, italic, underline, reverse video
-* **Configurable**: font size, foreground/background colors, terminal type string
+* **Color themes**: load iTerm2-compatible `.sttheme` files, or use built-in Dark (Tango) and Light palettes
+* **Configurable**: font size, display mode (color/monochrome), foreground/background colors, prompt color, terminal type string
 
 system requirements
 -------------------
@@ -42,6 +43,20 @@ keyboard shortcuts
 | Cmd+1-8 | Switch tabs |
 | Cmd+C/V | Copy/paste |
 | Shift+PgUp/PgDn | Scroll through history |
+
+color themes
+------------
+SevenTTY supports custom 16-color palettes via `.sttheme` files. Use the **Preferences → Theme...** button to load a theme, or select the built-in **Dark** (Tango palette) or **Light** modes.
+
+To convert an iTerm2 color scheme:
+
+```bash
+python3 tools/itermcolors2sttheme.py MyTheme.itermcolors > MyTheme.sttheme
+```
+
+Copy the `.sttheme` file to your Mac and load it from the preferences dialog. The theme persists across launches.
+
+Hundreds of iTerm2 themes are available at [iterm2colorschemes.com](https://iterm2colorschemes.com/).
 
 build
 -----
