@@ -26,9 +26,6 @@
 
 #include <stdio.h>
 
-/* menu item 1 = "(Theme)", 2-9 = colors */
-#define COLOR_FROM_THEME -1
-
 // forward declarations
 int qd_color_to_menu_item(int qd_color);
 int font_size_to_menu_item(int font_size);
@@ -178,7 +175,7 @@ struct disk_prefs
 	short bg_color;
 	short font_size;
 	short theme_loaded;
-	short _reserved;
+	short prompt_color;
 	RGBColor palette[16];
 	RGBColor theme_fg;
 	RGBColor theme_bg;
@@ -265,6 +262,7 @@ have_file:
 	dp->bg_color = (short)prefs.bg_color;
 	dp->font_size = (short)prefs.font_size;
 	dp->theme_loaded = (short)prefs.theme_loaded;
+	dp->prompt_color = (short)prefs.prompt_color;
 
 	memcpy(dp->palette, prefs.palette, sizeof(prefs.palette));
 	dp->theme_fg = prefs.theme_fg;
@@ -316,26 +314,26 @@ static void make_rgb(RGBColor* c, unsigned short r, unsigned short g, unsigned s
 	c->blue  = (b << 8) | b;
 }
 
-static void init_vga_palette(void)
+static void init_tango_palette(void)
 {
-	/* Standard VGA ANSI colors (shared by dark and light) */
+	/* Tango Desktop Project ANSI colors */
 	make_rgb(&prefs.palette[0],  0x00, 0x00, 0x00); /* black */
-	make_rgb(&prefs.palette[1],  0xAA, 0x00, 0x00); /* red */
-	make_rgb(&prefs.palette[2],  0x00, 0xAA, 0x00); /* green */
-	make_rgb(&prefs.palette[3],  0xAA, 0x55, 0x00); /* yellow/brown */
-	make_rgb(&prefs.palette[4],  0x00, 0x00, 0xAA); /* blue */
-	make_rgb(&prefs.palette[5],  0xAA, 0x00, 0xAA); /* magenta */
-	make_rgb(&prefs.palette[6],  0x00, 0xAA, 0xAA); /* cyan */
-	make_rgb(&prefs.palette[7],  0xAA, 0xAA, 0xAA); /* white */
+	make_rgb(&prefs.palette[1],  0xCC, 0x00, 0x00); /* red */
+	make_rgb(&prefs.palette[2],  0x4E, 0x9A, 0x06); /* green */
+	make_rgb(&prefs.palette[3],  0xC4, 0xA0, 0x00); /* yellow */
+	make_rgb(&prefs.palette[4],  0x34, 0x65, 0xA4); /* blue */
+	make_rgb(&prefs.palette[5],  0x75, 0x50, 0x7B); /* magenta */
+	make_rgb(&prefs.palette[6],  0x06, 0x98, 0x9A); /* cyan */
+	make_rgb(&prefs.palette[7],  0xD3, 0xD7, 0xCF); /* white */
 	/* bright variants */
-	make_rgb(&prefs.palette[8],  0x55, 0x55, 0x55); /* bright black */
-	make_rgb(&prefs.palette[9],  0xFF, 0x55, 0x55); /* bright red */
-	make_rgb(&prefs.palette[10], 0x55, 0xFF, 0x55); /* bright green */
-	make_rgb(&prefs.palette[11], 0xFF, 0xFF, 0x55); /* bright yellow */
-	make_rgb(&prefs.palette[12], 0x55, 0x55, 0xFF); /* bright blue */
-	make_rgb(&prefs.palette[13], 0xFF, 0x55, 0xFF); /* bright magenta */
-	make_rgb(&prefs.palette[14], 0x55, 0xFF, 0xFF); /* bright cyan */
-	make_rgb(&prefs.palette[15], 0xFF, 0xFF, 0xFF); /* bright white */
+	make_rgb(&prefs.palette[8],  0x55, 0x57, 0x53); /* bright black */
+	make_rgb(&prefs.palette[9],  0xEF, 0x29, 0x29); /* bright red */
+	make_rgb(&prefs.palette[10], 0x8A, 0xE2, 0x34); /* bright green */
+	make_rgb(&prefs.palette[11], 0xFC, 0xE9, 0x4F); /* bright yellow */
+	make_rgb(&prefs.palette[12], 0x73, 0x9F, 0xCF); /* bright blue */
+	make_rgb(&prefs.palette[13], 0xAD, 0x7F, 0xA8); /* bright magenta */
+	make_rgb(&prefs.palette[14], 0x34, 0xE2, 0xE2); /* bright cyan */
+	make_rgb(&prefs.palette[15], 0xEE, 0xEE, 0xEC); /* bright white */
 }
 
 static void save_theme_originals(void)
@@ -346,10 +344,10 @@ static void save_theme_originals(void)
 
 static void init_dark_palette(void)
 {
-	init_vga_palette();
+	init_tango_palette();
 	make_rgb(&prefs.theme_bg, 0x00, 0x00, 0x00);
-	make_rgb(&prefs.theme_fg, 0xAA, 0xAA, 0xAA);
-	make_rgb(&prefs.theme_cursor, 0xAA, 0xAA, 0xAA);
+	make_rgb(&prefs.theme_fg, 0xEE, 0xEE, 0xEC);
+	make_rgb(&prefs.theme_cursor, 0xEE, 0xEE, 0xEC);
 	save_theme_originals();
 	prefs.theme_loaded = 1;
 	strcpy(prefs.theme_name, "Default Dark");
@@ -357,7 +355,7 @@ static void init_dark_palette(void)
 
 static void init_light_palette(void)
 {
-	init_vga_palette();
+	init_tango_palette();
 	make_rgb(&prefs.theme_bg, 0xFF, 0xFF, 0xFF);
 	make_rgb(&prefs.theme_fg, 0x00, 0x00, 0x00);
 	make_rgb(&prefs.theme_cursor, 0x00, 0x00, 0x00);
@@ -390,6 +388,7 @@ void init_prefs(void)
 	prefs.fg_color = COLOR_FROM_THEME;
 	prefs.bg_color = COLOR_FROM_THEME;
 	prefs.font_size = 9;
+	prefs.prompt_color = 4; /* blue */
 
 	init_dark_palette();
 
@@ -557,6 +556,9 @@ void load_prefs(void)
 	prefs.bg_color = dp->bg_color;
 	prefs.font_size = dp->font_size;
 	prefs.theme_loaded = dp->theme_loaded;
+	prefs.prompt_color = dp->prompt_color;
+	if (prefs.prompt_color < 1 || prefs.prompt_color > 15)
+		prefs.prompt_color = 4; /* default blue; 0 = unset from old prefs */
 
 	memcpy(prefs.palette, dp->palette, sizeof(prefs.palette));
 	prefs.theme_fg = dp->theme_fg;

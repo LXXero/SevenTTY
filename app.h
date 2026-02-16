@@ -14,6 +14,8 @@
 #include <Folders.h>
 #include <Quickdraw.h>
 
+#define COLOR_FROM_THEME -1
+
 #include <libssh2.h>
 
 #include <vterm.h>
@@ -175,6 +177,7 @@ struct preferences
 	RGBColor orig_theme_bg;
 	RGBColor orig_theme_fg;
 	int theme_loaded;
+	int prompt_color; /* ANSI color index 0-15, default 4 (blue) */
 	char theme_name[64];
 };
 

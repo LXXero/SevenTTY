@@ -785,15 +785,45 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 	short save_font      = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
-	short save_font_fg   = qd.thePort->fgColor;
-	short save_font_bg   = qd.thePort->bkColor;
+	RGBColor save_font_fg, save_font_bg;
+	GetForeColor(&save_font_fg);
+	GetBackColor(&save_font_bg);
 
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
 	TextFace(normal);
-	qd.thePort->bkColor = prefs.bg_color;
-	qd.thePort->fgColor = prefs.fg_color;
-	TextMode(srcOr); // or mode is faster for drawing black on white
+
+	{
+		RGBColor fast_bg, fast_fg;
+		int is_dark;
+
+		if (prefs.bg_color == COLOR_FROM_THEME)
+		{
+			int bright = (prefs.theme_bg.red + prefs.theme_bg.green + prefs.theme_bg.blue) / 3;
+			is_dark = (bright <= 0x7FFF);
+		}
+		else
+			is_dark = (prefs.bg_color == blackColor);
+
+		if (is_dark)
+		{
+			fast_bg.red = fast_bg.green = fast_bg.blue = 0x0000;
+			fast_fg.red = fast_fg.green = fast_fg.blue = 0xFFFF;
+		}
+		else
+		{
+			fast_bg.red = fast_bg.green = fast_bg.blue = 0xFFFF;
+			fast_fg.red = fast_fg.green = fast_fg.blue = 0x0000;
+		}
+
+		RGBBackColor(&fast_bg);
+		RGBForeColor(&fast_fg);
+
+		if (!is_dark)
+			TextMode(srcOr);
+		else
+			TextMode(srcCopy);
+	}
 
 	int select_start = -1;
 	int select_end = -1;
@@ -889,8 +919,8 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 	TextFont(save_font);
 	TextSize(save_font_size);
 	TextFace(save_font_face);
-	qd.thePort->fgColor = save_font_fg;
-	qd.thePort->bkColor = save_font_bg;
+	RGBForeColor(&save_font_fg);
+	RGBBackColor(&save_font_bg);
 
 	//draw_resize_corner(wc);
 }

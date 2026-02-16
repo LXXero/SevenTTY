@@ -1154,8 +1154,6 @@ static void cmd_rmdir(int idx, int argc, char* argv[])
 
 static void cmd_touch(int idx, int argc, char* argv[])
 {
-	struct session* s = &sessions[idx];
-
 	if (argc < 2)
 	{
 		vt_write(idx, "usage: touch <file>\r\n");
@@ -1638,11 +1636,30 @@ static void cmd_label(int idx, int argc, char* argv[])
 	FSpSetFInfo(&spec, &finfo);
 }
 
+/* format bytes as human-readable string: "1.5 MB", "320 KB", etc. */
+static void fmt_human(char* buf, int bufsz, long bytes)
+{
+	if (bytes >= 1024L * 1024L * 1024L)
+		snprintf(buf, bufsz, "%ld.%ld GB",
+			bytes / (1024L * 1024L * 1024L),
+			(bytes / (1024L * 1024L * 100L)) % 10);
+	else if (bytes >= 1024L * 1024L)
+		snprintf(buf, bufsz, "%ld.%ld MB",
+			bytes / (1024L * 1024L),
+			(bytes / (1024L * 100L)) % 10);
+	else
+		snprintf(buf, bufsz, "%ld KB", bytes / 1024L);
+}
+
 static void cmd_df(int idx, int argc, char* argv[])
 {
 	struct session* s = &sessions[idx];
 	HParamBlockRec pb;
 	Str255 name;
+	int mode = 0; /* 0=KB, 1=MB, 2=human */
+
+	if (argc > 1 && strcmp(argv[1], "-m") == 0) mode = 1;
+	if (argc > 1 && strcmp(argv[1], "-h") == 0) mode = 2;
 
 	memset(&pb, 0, sizeof(pb));
 	name[0] = 0;
@@ -1675,18 +1692,44 @@ static void cmd_df(int idx, int argc, char* argv[])
 		long free_bytes  = (long)pb.volumeParam.ioVFrBlk *
 		                   (long)pb.volumeParam.ioVAlBlkSiz;
 		long used_bytes  = total_bytes - free_bytes;
+		char buf[32];
 
-		vt_write(idx, "Total:     ");
-		vt_print_long(idx, total_bytes / 1024);
-		vt_write(idx, " KB\r\n");
+		if (mode == 2)
+		{
+			vt_write(idx, "Total:     ");
+			fmt_human(buf, sizeof(buf), total_bytes);
+			vt_write(idx, buf);
+			vt_write(idx, "\r\nUsed:      ");
+			fmt_human(buf, sizeof(buf), used_bytes);
+			vt_write(idx, buf);
+			vt_write(idx, "\r\nAvailable: ");
+			fmt_human(buf, sizeof(buf), free_bytes);
+			vt_write(idx, buf);
+			vt_write(idx, "\r\n");
+		}
+		else
+		{
+			long divisor = mode ? (1024L * 1024L) : 1024L;
+			const char* unit = mode ? "MB" : "KB";
 
-		vt_write(idx, "Used:      ");
-		vt_print_long(idx, used_bytes / 1024);
-		vt_write(idx, " KB\r\n");
+			vt_write(idx, "Total:     ");
+			vt_print_long(idx, total_bytes / divisor);
+			vt_write(idx, " ");
+			vt_write(idx, unit);
+			vt_write(idx, "\r\n");
 
-		vt_write(idx, "Available: ");
-		vt_print_long(idx, free_bytes / 1024);
-		vt_write(idx, " KB\r\n");
+			vt_write(idx, "Used:      ");
+			vt_print_long(idx, used_bytes / divisor);
+			vt_write(idx, " ");
+			vt_write(idx, unit);
+			vt_write(idx, "\r\n");
+
+			vt_write(idx, "Available: ");
+			vt_print_long(idx, free_bytes / divisor);
+			vt_write(idx, " ");
+			vt_write(idx, unit);
+			vt_write(idx, "\r\n");
+		}
 	}
 }
 
@@ -1761,19 +1804,18 @@ static void cmd_free(int idx, int argc, char* argv[])
 	long app_total, app_free, app_largest;
 	long sys_total, sys_free;
 	long temp_free;
-	Size grow;
-	char buf[80];
-	int use_mb = 0;
+	char buf[128];
+	int mode = 0; /* 0=KB, 1=MB, 2=human */
 	long divisor;
 	const char* unit;
+	THz appZone;
+	THz sysZone;
 
-	if (argc > 1 && strcmp(argv[1], "-m") == 0) use_mb = 1;
+	if (argc > 1 && strcmp(argv[1], "-m") == 0) mode = 1;
+	if (argc > 1 && strcmp(argv[1], "-h") == 0) mode = 2;
 
-	divisor = use_mb ? (1024 * 1024) : 1024;
-	unit = use_mb ? "MB" : "KB";
-
-	THz appZone = ApplicationZone();
-	THz sysZone = SystemZone();
+	appZone = ApplicationZone();
+	sysZone = SystemZone();
 
 	app_total = (long)appZone->bkLim - (long)(Ptr)appZone;
 	app_free = FreeMem();
@@ -1784,19 +1826,46 @@ static void cmd_free(int idx, int argc, char* argv[])
 
 	temp_free = TempFreeMem();
 
-	vt_write(idx, "              Total      Free   Largest\r\n");
+	if (mode == 2)
+	{
+		char h1[32], h2[32], h3[32];
 
-	snprintf(buf, sizeof(buf), "App heap:  %7ld %s %7ld %s %7ld %s\r\n",
-		app_total / divisor, unit, app_free / divisor, unit, app_largest / divisor, unit);
-	vt_write(idx, buf);
+		vt_write(idx, "              Total      Free   Largest\r\n");
 
-	snprintf(buf, sizeof(buf), "Sys heap:  %7ld %s %7ld %s\r\n",
-		sys_total / divisor, unit, sys_free / divisor, unit);
-	vt_write(idx, buf);
+		fmt_human(h1, sizeof(h1), app_total);
+		fmt_human(h2, sizeof(h2), app_free);
+		fmt_human(h3, sizeof(h3), app_largest);
+		snprintf(buf, sizeof(buf), "App heap:  %9s %9s %9s\r\n", h1, h2, h3);
+		vt_write(idx, buf);
 
-	snprintf(buf, sizeof(buf), "Temp mem:            %7ld %s\r\n",
-		temp_free / divisor, unit);
-	vt_write(idx, buf);
+		fmt_human(h1, sizeof(h1), sys_total);
+		fmt_human(h2, sizeof(h2), sys_free);
+		snprintf(buf, sizeof(buf), "Sys heap:  %9s %9s\r\n", h1, h2);
+		vt_write(idx, buf);
+
+		fmt_human(h1, sizeof(h1), temp_free);
+		snprintf(buf, sizeof(buf), "Temp mem:            %9s\r\n", h1);
+		vt_write(idx, buf);
+	}
+	else
+	{
+		divisor = mode ? (1024L * 1024L) : 1024L;
+		unit = mode ? "MB" : "KB";
+
+		vt_write(idx, "              Total      Free   Largest\r\n");
+
+		snprintf(buf, sizeof(buf), "App heap:  %7ld %s %7ld %s %7ld %s\r\n",
+			app_total / divisor, unit, app_free / divisor, unit, app_largest / divisor, unit);
+		vt_write(idx, buf);
+
+		snprintf(buf, sizeof(buf), "Sys heap:  %7ld %s %7ld %s\r\n",
+			sys_total / divisor, unit, sys_free / divisor, unit);
+		vt_write(idx, buf);
+
+		snprintf(buf, sizeof(buf), "Temp mem:            %7ld %s\r\n",
+			temp_free / divisor, unit);
+		vt_write(idx, buf);
+	}
 }
 
 static void cmd_ps(int idx, int argc, char* argv[])
@@ -1806,7 +1875,7 @@ static void cmd_ps(int idx, int argc, char* argv[])
 	ProcessInfoRec info;
 	Str255 name;
 	char cname[256];
-	char buf[128];
+	char buf[320];
 	int pid = 0;
 	char type_str[5];
 	char crea_str[5];
@@ -1940,7 +2009,7 @@ static void cmd_ssh(int idx, int argc, char* argv[])
 static void cmd_colors(int idx, int argc, char* argv[])
 {
 	int i;
-	char buf[64];
+	char buf[80];
 
 	/* palette hex dump */
 	vt_write(idx, "  Palette (hex RGB):\r\n");
@@ -1973,7 +2042,7 @@ static void cmd_colors(int idx, int argc, char* argv[])
 	for (i = 0; i < 8; i++)
 	{
 		char esc[32];
-		snprintf(esc, sizeof(esc), "\033[%dm  %d  \033[0m", 40 + i, i);
+		snprintf(esc, sizeof(esc), "\033[%dm %2d  \033[0m", 40 + i, i);
 		vt_write(idx, esc);
 	}
 	vt_write(idx, "\r\n");
@@ -1982,7 +2051,7 @@ static void cmd_colors(int idx, int argc, char* argv[])
 	for (i = 0; i < 8; i++)
 	{
 		char esc[32];
-		snprintf(esc, sizeof(esc), "\033[%dm  %d  \033[0m", 100 + i, 8 + i);
+		snprintf(esc, sizeof(esc), "\033[%dm %2d  \033[0m", 100 + i, 8 + i);
 		vt_write(idx, esc);
 	}
 	vt_write(idx, "\r\n\r\n");
@@ -1991,14 +2060,20 @@ static void cmd_colors(int idx, int argc, char* argv[])
 	for (i = 0; i < 8; i++)
 	{
 		char esc[32];
-		snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 30 + i, i);
+		if (i >= 2)
+			snprintf(esc, sizeof(esc), "\033[%dmColor%-2d \033[0m", 30 + i, i);
+		else
+			snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 30 + i, i);
 		vt_write(idx, esc);
 	}
 	vt_write(idx, "\r\n  ");
 	for (i = 0; i < 8; i++)
 	{
 		char esc[32];
-		snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 90 + i, 8 + i);
+		if (i >= 2)
+			snprintf(esc, sizeof(esc), "\033[%dmColor%-2d \033[0m", 90 + i, 8 + i);
+		else
+			snprintf(esc, sizeof(esc), "\033[%dmColor%d \033[0m", 90 + i, 8 + i);
 		vt_write(idx, esc);
 	}
 	vt_write(idx, "\r\n");
@@ -2032,10 +2107,10 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "  \033[1mSystem:\033[0m\r\n");
 	vt_write(idx, "    echo [text...]     print text\r\n");
 	vt_write(idx, "    clear              clear screen\r\n");
-	vt_write(idx, "    df                 show disk usage\r\n");
+	vt_write(idx, "    df [-m|-h]         show disk usage\r\n");
 	vt_write(idx, "    date               show date/time\r\n");
 	vt_write(idx, "    uname              show system info\r\n");
-	vt_write(idx, "    free               show memory usage\r\n");
+	vt_write(idx, "    free [-m|-h]       show memory usage\r\n");
 	vt_write(idx, "    ps                 list running processes\r\n");
 	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
 	vt_write(idx, "    colors             display color test\r\n");
@@ -2043,7 +2118,7 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    exit               close this tab\r\n");
 	vt_write(idx, "\r\n");
 	vt_write(idx, "  Paths: use / or : as separator, .. for parent\r\n");
-	vt_write(idx, "  Tab completion works for file names.\r\n");
+	vt_write(idx, "  Tab completion works for commands and file names.\r\n");
 }
 
 /* ------------------------------------------------------------------ */
@@ -2093,6 +2168,16 @@ static int escape_and_append(char* line, int pos, int max, const char* src, int 
 	}
 	return added;
 }
+
+static const char* shell_commands[] = {
+	"cat", "cd", "chattr", "chmod", "chown", "clear", "cls", "colors",
+	"copy", "cp", "date", "del", "delete", "df", "dir", "echo", "exit",
+	"file", "free", "getinfo", "help", "info", "label", "less", "ls",
+	"md", "mkdir", "more", "mv", "ps", "pwd", "quit", "rd", "ren",
+	"rename", "rm", "rmdir", "setcreator", "settype", "ssh", "touch",
+	"type", "uname"
+};
+#define NUM_SHELL_COMMANDS (sizeof(shell_commands) / sizeof(shell_commands[0]))
 
 static void shell_complete(int idx)
 {
@@ -2164,6 +2249,159 @@ static void shell_complete(int idx)
 	/* unescape the word for path resolution */
 	char word[256];
 	int word_len = path_unescape(word_raw, word_raw_len, word, sizeof(word));
+
+	/* check if we're completing the first word (command name) */
+	{
+		int is_first_word = 1;
+		int fi;
+		for (fi = 0; fi < word_start; fi++)
+		{
+			if (line[fi] != ' ' && line[fi] != '\t')
+			{
+				is_first_word = 0;
+				break;
+			}
+		}
+
+		if (is_first_word && word_raw_len > 0)
+		{
+			char cmd_match[64];
+			int cmd_match_count = 0;
+			int cmd_match_len = 0;
+			int ci;
+
+			for (ci = 0; ci < (int)NUM_SHELL_COMMANDS; ci++)
+			{
+				const char* cmd = shell_commands[ci];
+				int pi;
+				int matches = 1;
+				for (pi = 0; pi < word_len && cmd[pi]; pi++)
+				{
+					if (tolower((unsigned char)word[pi]) != tolower((unsigned char)cmd[pi]))
+					{
+						matches = 0;
+						break;
+					}
+				}
+				if (!matches || pi < word_len) continue;
+
+				cmd_match_count++;
+				if (cmd_match_count == 1)
+				{
+					strncpy(cmd_match, cmd, sizeof(cmd_match) - 1);
+					cmd_match[sizeof(cmd_match) - 1] = '\0';
+					cmd_match_len = strlen(cmd_match);
+				}
+				else
+				{
+					/* find common prefix */
+					int mi;
+					for (mi = 0; mi < cmd_match_len && cmd[mi]; mi++)
+					{
+						if (tolower((unsigned char)cmd_match[mi]) != tolower((unsigned char)cmd[mi]))
+						{
+							cmd_match_len = mi;
+							cmd_match[mi] = '\0';
+							break;
+						}
+					}
+					if (mi < cmd_match_len)
+					{
+						cmd_match_len = mi;
+						cmd_match[mi] = '\0';
+					}
+				}
+			}
+
+			if (cmd_match_count == 0) return;
+
+			/* insert completion suffix */
+			if (cmd_match_len > word_len)
+			{
+				char* suffix = cmd_match + word_len;
+				int suf_len = cmd_match_len - word_len;
+				int tail_len = len - cpos;
+
+				if (len + suf_len >= (int)sizeof(s->shell_line)) return;
+
+				if (tail_len > 0)
+					memmove(line + cpos + suf_len, line + cpos, tail_len);
+				memcpy(line + cpos, suffix, suf_len);
+				s->shell_line_len += suf_len;
+				s->shell_cursor_pos = cpos + suf_len;
+				line[s->shell_line_len] = '\0';
+
+				vt_write_n(idx, line + cpos, suf_len + tail_len);
+				if (tail_len > 0)
+				{
+					char esc[16];
+					snprintf(esc, sizeof(esc), "\033[%dD", tail_len);
+					vt_write(idx, esc);
+				}
+			}
+
+			/* single match: append a space */
+			if (cmd_match_count == 1)
+			{
+				int cur = s->shell_cursor_pos;
+				int tail2 = s->shell_line_len - cur;
+				if (s->shell_line_len < (int)sizeof(s->shell_line) - 1)
+				{
+					if (tail2 > 0)
+						memmove(line + cur + 1, line + cur, tail2);
+					line[cur] = ' ';
+					s->shell_line_len++;
+					s->shell_cursor_pos++;
+					line[s->shell_line_len] = '\0';
+
+					vt_write_n(idx, line + cur, 1 + tail2);
+					if (tail2 > 0)
+					{
+						char esc[16];
+						snprintf(esc, sizeof(esc), "\033[%dD", tail2);
+						vt_write(idx, esc);
+					}
+				}
+			}
+
+			/* multiple matches, no more common prefix: show all */
+			if (cmd_match_count > 1 && cmd_match_len <= word_len)
+			{
+				vt_write(idx, "\r\n");
+				for (ci = 0; ci < (int)NUM_SHELL_COMMANDS; ci++)
+				{
+					const char* cmd = shell_commands[ci];
+					int pi;
+					int matches = 1;
+					for (pi = 0; pi < word_len && cmd[pi]; pi++)
+					{
+						if (tolower((unsigned char)word[pi]) != tolower((unsigned char)cmd[pi]))
+						{
+							matches = 0;
+							break;
+						}
+					}
+					if (!matches || pi < word_len) continue;
+
+					vt_write(idx, "  ");
+					vt_write(idx, cmd);
+					vt_write(idx, "\r\n");
+				}
+
+				shell_prompt(idx);
+				vt_write(idx, line);
+				if (s->shell_cursor_pos < s->shell_line_len)
+				{
+					char esc[16];
+					snprintf(esc, sizeof(esc), "\033[%dD",
+						s->shell_line_len - s->shell_cursor_pos);
+					vt_write(idx, esc);
+				}
+			}
+
+			return; /* command completion done, skip filesystem completion */
+		}
+	}
 
 	/* split word into directory part and filename prefix at last : or / */
 	short comp_vRef = s->shell_vRefNum;
@@ -2498,12 +2736,19 @@ void shell_prompt(int idx)
 {
 	struct session* s = &sessions[idx];
 	char dirname[64];
+	char esc[20];
+	int c = prefs.prompt_color;
 
 	get_dir_name(s->shell_vRefNum, s->shell_dirID, dirname, sizeof(dirname));
 
-	vt_write(idx, "\033[1m");
+	/* color: 0-7 = SGR 30-37, 8-15 = SGR 90-97 */
+	if (c >= 8)
+		snprintf(esc, sizeof(esc), "\033[1;%dm", 90 + (c - 8));
+	else
+		snprintf(esc, sizeof(esc), "\033[1;%dm", 30 + c);
+	vt_write(idx, esc);
 	vt_write(idx, dirname);
-	vt_write(idx, "\033[0m$ ");
+	vt_write(idx, "\033[0m \033[1m$\033[0m ");
 }
 
 /* ------------------------------------------------------------------ */
