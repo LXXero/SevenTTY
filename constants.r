@@ -4,9 +4,9 @@
 #define __CONSTANTS_R__
 
 /* so many versions */
-#define APP_VERSION             "1.0.2"
-#define APP_LONG_VERSION        "1.0.2, SevenTTY fork by LXXero"
-#define APP_DESCRIPTION         "SevenTTY 1.0.2 - SSH & shell for classic Mac OS"
+#define APP_VERSION             "1.0.3"
+#define APP_LONG_VERSION        "1.0.3, SevenTTY fork by LXXero"
+#define APP_DESCRIPTION         "SevenTTY 1.0.3 - SSH & shell for classic Mac OS"
 #define APP_VERSION_MAJOR       0x01
 #define APP_VERSION_MINOR       0x00
 #define APP_VERSION_PRERELEASE  0x00
