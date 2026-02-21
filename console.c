@@ -124,6 +124,7 @@ void toggle_cursor(struct window_context* wc)
 	WC_S(wc).cursor_state = !WC_S(wc).cursor_state;
 	Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
 	InvalRect(&cursor);
+	wc->needs_redraw = 1;
 }
 
 void check_cursor(struct window_context* wc)
@@ -164,6 +165,7 @@ void damage_selection(struct window_context* wc)
 
 	UnionRect(&topleft, &bottomright, &topleft);
 	InvalRect(&topleft);
+	wc->needs_redraw = 1;
 }
 
 void update_selection_end(struct window_context* wc)
@@ -1057,13 +1059,17 @@ int movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
 	struct session* s = &sessions[idx];
 	struct window_context* wc = window_for_session(idx);
 
-	// if active and cursor is dark, invalidate old location
 	if (wc != NULL && idx == wc->session_ids[wc->active_session_idx]
-		&& wc->win != NULL && s->cursor_state == 1)
+		&& wc->win != NULL)
 	{
-		SetPort(wc->win);
-		Rect inval = cell_rect(wc, s->cursor_x, s->cursor_y, (wc->win->portRect));
-		InvalRect(&inval);
+		wc->needs_redraw = 1;
+		/* if cursor is dark, invalidate old location */
+		if (s->cursor_state == 1)
+		{
+			SetPort(wc->win);
+			Rect inval = cell_rect(wc, s->cursor_x, s->cursor_y, (wc->win->portRect));
+			InvalRect(&inval);
+		}
 	}
 
 	s->cursor_x = pos.col;
@@ -1079,10 +1085,10 @@ int damage(VTermRect rect, void *user)
 
 	if (wc == NULL || idx != wc->session_ids[wc->active_session_idx] || wc->win == NULL) return 1;
 
-	// always invalidate the full terminal area
-	// partial invalidation causes display corruption during scrolling
+	// invalidate so BeginUpdate/EndUpdate has a valid update region
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 
 	return 1;
 }
@@ -1251,6 +1257,7 @@ void scroll_up(struct window_context* wc)
 
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
+	wc->needs_redraw = 1;
 }
 
 void scroll_down(struct window_context* wc)
@@ -1266,6 +1273,7 @@ void scroll_down(struct window_context* wc)
 
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
+	wc->needs_redraw = 1;
 }
 
 void scroll_reset(struct window_context* wc)
@@ -1275,6 +1283,7 @@ void scroll_reset(struct window_context* wc)
 
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
+	wc->needs_redraw = 1;
 }
 
 void font_size_change(struct window_context* wc)
@@ -1311,6 +1320,7 @@ void font_size_change(struct window_context* wc)
 	SizeWindow(wc->win, con.cell_width * wc->size_x + 4, con.cell_height * wc->size_y + 4 + top_extra, true);
 	EraseRect(&(wc->win->portRect));
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 
 	RGBForeColor(&save_fg);
 	RGBBackColor(&save_bg);
@@ -1464,4 +1474,5 @@ void update_console_colors(struct window_context* wc)
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 }

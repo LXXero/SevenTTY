@@ -116,6 +116,7 @@ struct window_context
 	int session_ids[MAX_SESSIONS]; // indices into sessions[]
 	int num_sessions;
 	int active_session_idx;        // index into session_ids[] array
+	int needs_redraw;              // dirty flag: set when content changes
 };
 
 extern struct window_context windows[MAX_WINDOWS];

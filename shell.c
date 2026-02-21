@@ -171,6 +171,14 @@ static OSErr resolve_path(int idx, const char* path, FSSpec* spec)
 	if (path == NULL || path[0] == '\0')
 		return fnfErr;
 
+	/* strip leading "./" — HFS has no "." for current directory */
+	while (path[0] == '.' && path[1] == '/')
+		path += 2;
+
+	/* bare "." means current directory */
+	if (path[0] == '.' && path[1] == '\0')
+		return FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, "\p", spec);
+
 	/* convert / to : for HFS, handle leading / as volume root */
 	j = 0;
 	for (i = 0; path[i] != '\0' && j < 510; i++)
@@ -1936,6 +1944,42 @@ static void cmd_ps(int idx, int argc, char* argv[])
 	}
 }
 
+static void cmd_open(int idx, int argc, char* argv[])
+{
+	FSSpec spec;
+	OSErr e;
+	FInfo finfo;
+	LaunchParamBlockRec lpb;
+
+	if (argc < 2) { vt_write(idx, "usage: open <path>\r\n"); return; }
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr) { vt_write(idx, "open: file not found\r\n"); return; }
+
+	e = FSpGetFInfo(&spec, &finfo);
+	if (e != noErr) { vt_write(idx, "open: cannot get file info\r\n"); return; }
+
+	if (finfo.fdType != 'APPL')
+	{
+		vt_write(idx, "open: not an application\r\n");
+		return;
+	}
+
+	memset(&lpb, 0, sizeof(lpb));
+	lpb.launchBlockID = extendedBlock;
+	lpb.launchEPBLength = extendedBlockLen;
+	lpb.launchAppSpec = &spec;
+	lpb.launchControlFlags = launchContinue | launchNoFileFlags;
+
+	e = LaunchApplication(&lpb);
+	if (e != noErr)
+	{
+		char buf[64];
+		snprintf(buf, sizeof(buf), "open: launch failed (error %d)\r\n", (int)e);
+		vt_write(idx, buf);
+	}
+}
+
 static void cmd_ssh(int idx, int argc, char* argv[])
 {
 	/* parse: ssh [user@]host[:port] */
@@ -2112,12 +2156,14 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    uname              show system info\r\n");
 	vt_write(idx, "    free [-m|-h]       show memory usage\r\n");
 	vt_write(idx, "    ps                 list running processes\r\n");
+	vt_write(idx, "    open <path>        launch application\r\n");
 	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
 	vt_write(idx, "    colors             display color test\r\n");
 	vt_write(idx, "    help               this message\r\n");
 	vt_write(idx, "    exit               close this tab\r\n");
 	vt_write(idx, "\r\n");
 	vt_write(idx, "  Paths: use / or : as separator, .. for parent\r\n");
+	vt_write(idx, "  Run apps by path: ./SimpleText or /Apps/SimpleText\r\n");
 	vt_write(idx, "  Tab completion works for commands and file names.\r\n");
 }
 
@@ -2173,9 +2219,9 @@ static const char* shell_commands[] = {
 	"cat", "cd", "chattr", "chmod", "chown", "clear", "cls", "colors",
 	"copy", "cp", "date", "del", "delete", "df", "dir", "echo", "exit",
 	"file", "free", "getinfo", "help", "info", "label", "less", "ls",
-	"md", "mkdir", "more", "mv", "ps", "pwd", "quit", "rd", "ren",
-	"rename", "rm", "rmdir", "setcreator", "settype", "ssh", "touch",
-	"type", "uname"
+	"md", "mkdir", "more", "mv", "open", "ps", "pwd", "quit", "rd",
+	"ren", "rename", "rm", "rmdir", "setcreator", "settype", "ssh",
+	"touch", "type", "uname"
 };
 #define NUM_SHELL_COMMANDS (sizeof(shell_commands) / sizeof(shell_commands[0]))
 
@@ -2265,6 +2311,12 @@ static void shell_complete(int idx)
 
 		if (is_first_word && word_raw_len > 0)
 		{
+			/* if word looks like a path, fall through to filesystem completion */
+			int looks_like_path = (word[0] == '/' || word[0] == '.'
+				|| memchr(word, '/', word_len) != NULL);
+
+			if (!looks_like_path)
+			{
 			char cmd_match[64];
 			int cmd_match_count = 0;
 			int cmd_match_len = 0;
@@ -2400,6 +2452,7 @@ static void shell_complete(int idx)
 			}
 
 			return; /* command completion done, skip filesystem completion */
+		} /* end if (!looks_like_path) */
 		}
 	}
 
@@ -2706,6 +2759,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "ps") == 0)         cmd_ps(idx, argc, argv);
 	else if (strcmp(cmd, "ssh") == 0)        cmd_ssh(idx, argc, argv);
 	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
+	else if (strcmp(cmd, "open") == 0)      cmd_open(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
@@ -2723,8 +2777,23 @@ static void shell_execute(int idx, char* line)
 	}
 	else
 	{
-		vt_write(idx, cmd);
-		vt_write(idx, ": command not found (type 'help')\r\n");
+		/* try to resolve as application path */
+		FSSpec spec;
+		FInfo finfo;
+		OSErr e = resolve_path(idx, cmd, &spec);
+		if (e == noErr && FSpGetFInfo(&spec, &finfo) == noErr
+			&& finfo.fdType == 'APPL')
+		{
+			char* open_argv[2];
+			open_argv[0] = "open";
+			open_argv[1] = cmd;
+			cmd_open(idx, 2, open_argv);
+		}
+		else
+		{
+			vt_write(idx, cmd);
+			vt_write(idx, ": command not found (type 'help')\r\n");
+		}
 	}
 }
 

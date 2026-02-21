@@ -966,6 +966,7 @@ static void adjust_window_for_tabs(struct window_context* wc, int tabs_appeared)
 	SizeWindow(wc->win, cur_width, new_height, true);
 	EraseRect(&(wc->win->portRect));
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 
 	/* recalculate terminal size from new window dims */
 	{
@@ -1055,6 +1056,7 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 
 	// redraw since tab bar may have appeared
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 
 	return idx;
 }
@@ -1136,6 +1138,7 @@ void close_session(int idx)
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 }
 
 void switch_session(struct window_context* wc, int idx)
@@ -1184,6 +1187,7 @@ void switch_session(struct window_context* wc, int idx)
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
+	wc->needs_redraw = 1;
 }
 
 /* ---- window lifecycle ---- */
@@ -1382,6 +1386,7 @@ void resize_con_window(struct window_context* wc, EventRecord event)
 		SizeWindow(wc->win, next_width, next_height, true);
 		EraseRect(&(wc->win->portRect));
 		InvalRect(&(wc->win->portRect));
+		wc->needs_redraw = 1;
 
 		wc->size_x = (next_width - 4)/con.cell_width;
 		wc->size_y = (usable_height - 2)/con.cell_height;
@@ -1578,9 +1583,13 @@ void event_loop(void)
 				SetPort(windows[i].win);
 				check_cursor(&windows[i]);
 
-				BeginUpdate(windows[i].win);
-				draw_screen(&windows[i], &(windows[i].win->portRect));
-				EndUpdate(windows[i].win);
+				if (windows[i].needs_redraw)
+				{
+					windows[i].needs_redraw = 0;
+					BeginUpdate(windows[i].win);
+					draw_screen(&windows[i], &(windows[i].win->portRect));
+					EndUpdate(windows[i].win);
+				}
 			}
 		}
 
