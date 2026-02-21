@@ -33,5 +33,5 @@ ELSE()
 # for PPC
   set_target_properties(SevenTTY PROPERTIES COMPILE_FLAGS "-ffunction-sections -mcpu=601 -O3 -Wall -Wextra -Wno-unused-parameter")
   set_target_properties(SevenTTY PROPERTIES LINK_FLAGS "-Wl,-gc-sections")
-  target_link_libraries(SevenTTY ThreadsLib libssh2 mbedtls mbedx509 mbedcrypto OpenTransportAppPPC OpenTransportLib OpenTptInternetLib vterm retrocrt)
+  target_link_libraries(SevenTTY ThreadsLib libssh2 mbedtls mbedx509 mbedcrypto OpenTransportAppPPC OpenTransportLib OpenTptInternetLib OpenTptInetPPC vterm retrocrt)
 ENDIF()
