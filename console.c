@@ -1063,12 +1063,13 @@ int movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
 		&& wc->win != NULL)
 	{
 		wc->needs_redraw = 1;
-		/* if cursor is dark, invalidate old location */
-		if (s->cursor_state == 1)
+		SetPort(wc->win);
+		/* invalidate old and new cursor positions */
 		{
-			SetPort(wc->win);
-			Rect inval = cell_rect(wc, s->cursor_x, s->cursor_y, (wc->win->portRect));
-			InvalRect(&inval);
+			Rect old_r = cell_rect(wc, s->cursor_x, s->cursor_y, wc->win->portRect);
+			Rect new_r = cell_rect(wc, pos.col, pos.row, wc->win->portRect);
+			InvalRect(&old_r);
+			InvalRect(&new_r);
 		}
 	}
 

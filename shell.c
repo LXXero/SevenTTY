@@ -2908,13 +2908,12 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 {
 	struct session* s = &sessions[session_idx];
 
-	/* ignore page up/down, home, end in local shell (handled by scrollback) */
-	if (c == kPageUpCharCode || c == kPageDownCharCode ||
-		c == kHomeCharCode || c == kEndCharCode)
+	/* ignore page up/down in local shell (handled by scrollback) */
+	if (c == kPageUpCharCode || c == kPageDownCharCode)
 		return;
 
-	/* Ctrl+D: close tab if line is empty */
-	if (c == 4)
+	/* Ctrl+D: close tab if line is empty (End key is also charCode 4) */
+	if (modifiers & controlKey && c == 4)
 	{
 		if (s->shell_line_len == 0)
 		{
@@ -2998,12 +2997,11 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 		return;
 	}
 
-	/* Backspace / Delete */
-	if (c == kBackspaceCharCode || c == kDeleteCharCode)
+	/* Backspace: delete char before cursor */
+	if (c == kBackspaceCharCode)
 	{
 		if (s->shell_cursor_pos > 0)
 		{
-			/* delete char before cursor */
 			memmove(s->shell_line + s->shell_cursor_pos - 1,
 					s->shell_line + s->shell_cursor_pos,
 					s->shell_line_len - s->shell_cursor_pos);
@@ -3011,8 +3009,23 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 			s->shell_cursor_pos--;
 			s->shell_line[s->shell_line_len] = '\0';
 
-			/* move back, redraw rest of line */
 			vt_write(session_idx, "\b");
+			shell_redraw_from_cursor(session_idx);
+		}
+		return;
+	}
+
+	/* Forward delete: delete char after cursor */
+	if (c == kDeleteCharCode)
+	{
+		if (s->shell_cursor_pos < s->shell_line_len)
+		{
+			memmove(s->shell_line + s->shell_cursor_pos,
+					s->shell_line + s->shell_cursor_pos + 1,
+					s->shell_line_len - s->shell_cursor_pos - 1);
+			s->shell_line_len--;
+			s->shell_line[s->shell_line_len] = '\0';
+
 			shell_redraw_from_cursor(session_idx);
 		}
 		return;

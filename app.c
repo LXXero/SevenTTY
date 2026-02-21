@@ -1499,6 +1499,10 @@ int handle_keypress(EventRecord* event)
 			}
 		}
 
+		// reset cursor to solid on keypress (stays visible during typing)
+		sessions[sid].cursor_state = 1;
+		sessions[sid].last_cursor_blink = TickCount();
+
 		// any other key snaps back to live view
 		if (sessions[sid].scroll_offset > 0)
 			scroll_reset(wc);
