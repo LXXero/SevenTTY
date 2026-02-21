@@ -8,6 +8,7 @@
 #include "app.h"
 #include "console.h"
 #include "net.h"
+#include "telnet.h"
 #include "unicode.h"
 
 #include <string.h>
@@ -1003,11 +1004,16 @@ static void vprintf_to_vterm(VTerm* vt, const char* str, va_list args)
 	{
 		if (*str == '%')
 		{
+			int is_long = 0;
 			str++;
+			if (*str == 'l') { is_long = 1; str++; }
 			switch (*str)
 			{
 				case 'd':
-					print_int_v(vt, va_arg(args, int));
+					if (is_long)
+						print_int_v(vt, (int)va_arg(args, long));
+					else
+						print_int_v(vt, va_arg(args, int));
 					break;
 				case 's':
 					print_string_v(vt, va_arg(args, char*));
@@ -1016,8 +1022,8 @@ static void vprintf_to_vterm(VTerm* vt, const char* str, va_list args)
 					vterm_input_write(vt, str-1, 1);
 					break;
 				default:
-					va_arg(args, int); // ignore
-					vterm_input_write(vt, str-1, 2);
+					va_arg(args, int);
+					vterm_input_write(vt, str-1-is_long, 2+is_long);
 					break;
 			}
 		}
@@ -1352,6 +1358,8 @@ void reset_console(struct window_context* wc, int session_idx)
 
 	if (s->type == SESSION_SSH)
 		vterm_output_set_callback(s->vterm, output_callback, (void*)(intptr_t)session_idx);
+	else if (s->type == SESSION_TELNET)
+		vterm_output_set_callback(s->vterm, tcp_output_callback, (void*)(intptr_t)session_idx);
 	else
 		vterm_output_set_callback(s->vterm, local_output_callback, (void*)(intptr_t)session_idx);
 
@@ -1389,6 +1397,8 @@ void setup_session_vterm(struct window_context* wc, int session_idx)
 
 	if (s->type == SESSION_SSH)
 		vterm_output_set_callback(s->vterm, output_callback, (void*)(intptr_t)session_idx);
+	else if (s->type == SESSION_TELNET)
+		vterm_output_set_callback(s->vterm, tcp_output_callback, (void*)(intptr_t)session_idx);
 	else
 		vterm_output_set_callback(s->vterm, local_output_callback, (void*)(intptr_t)session_idx);
 

@@ -70,6 +70,8 @@ Do NOT modify files inside these submodule directories.
 | `console.h` | ~40 | Console function prototypes |
 | `shell.c` | ~2800 | Local shell: 30+ commands (ls, cd, cat, cp, mv, rm, mkdir, ps, free, df, etc.), tab completion, history |
 | `shell.h` | ~12 | Shell function prototypes |
+| `telnet.c` | ~940 | Telnet and raw TCP (nc): OT connection, telnet IAC negotiation, read threads, inline nc |
+| `telnet.h` | ~18 | Telnet/nc function prototypes |
 | `net.c` | ~690 | SSH networking: Open Transport TCP, libssh2 session, read thread, known hosts |
 | `net.h` | ~12 | Network function prototypes |
 | `debug.c` | ~200 | libssh2 and Open Transport error code to string conversion |
@@ -98,7 +100,8 @@ windows[MAX_WINDOWS=8]        sessions[MAX_SESSIONS=8]
 ```
 
 - Each window has its own tab bar and can hold multiple sessions
-- Sessions are either `SESSION_SSH` (threaded network I/O) or `SESSION_LOCAL` (shell interpreter)
+- Sessions are `SESSION_SSH`, `SESSION_TELNET`, `SESSION_NETCAT` (threaded network I/O) or `SESSION_LOCAL` (shell interpreter)
+- Telnet opens in a new tab; nc runs inline in the local shell session (same vterm, thread reads into it)
 - Convenience macros: `ACTIVE_WIN`, `ACTIVE_S` — use these to access current window/session
 - Helper functions: `find_window_context(WindowPtr)`, `window_for_session(idx)`, `active_session_global()`
 
@@ -215,6 +218,10 @@ Converter: `tools/itermcolors2sttheme.py`
 - **Reverse video sentinel leak**: `set_draw_bg()` only checked for `COLOR_DEFAULT_BG`, so when reverse video passed `COLOR_DEFAULT_FG` (0xFE), it fell through to `palette[0xFE & 0x0F]` = palette[14] = bright cyan. Fix: both `set_draw_fg` and `set_draw_bg` must handle both `COLOR_DEFAULT_FG` and `COLOR_DEFAULT_BG`.
 - **Indexed QuickDraw color bleed**: `draw_tab_bar()` used `BackColor(whiteColor)` which doesn't override the RGB fields on a CGrafPort after `RGBBackColor()` was used. Fix: use `RGBBackColor()`/`RGBForeColor()` everywhere, never indexed calls.
 - **Numpad Enter = Ctrl+C**: `kEnterCharCode` = 0x03 = ETX, same value as Ctrl+C. Shell's `if (c == 3)` caught numpad Enter. Fix: only treat 0x03 as Ctrl+C when `controlKey` modifier is set.
+- **Right arrow = Ctrl+]**: `kRightArrowCharCode` = 0x1D = GS, same as Ctrl+]. Fix: check virtual keycode 0x1E (physical `]` key), not charcode.
+- **Right-Ctrl sends no modifier**: QEMU sends control codes without `controlKey` modifier flag for right-Ctrl. Fix: heuristic — if charcode < 32, no controlKey, and virtual keycode maps to the letter that would produce that code, treat as Ctrl+key.
+- **nc inline stuck after cancel**: If `nc_inline_disconnect` can't wait for thread to finish, `recv_buffer` stays non-NULL, trapping shell in nc mode forever. Fix: force-free buffers from main thread (safe under cooperative threading — thread is suspended).
+- **Thread must set DONE before returning**: Both `telnet_read_thread` and `nc_read_thread` must set `thread_state = DONE` at end of all exit paths, otherwise disconnect functions can't detect thread completion.
 
 ## Gotchas and Lessons Learned
 
@@ -230,3 +237,7 @@ Converter: `tools/itermcolors2sttheme.py`
 - **kEnterCharCode = 0x03**: Numpad Enter char code is ETX (same as Ctrl+C). Always check `controlKey` modifier to distinguish them
 - **Never use indexed `BackColor()`/`ForeColor()`**: On CGrafPort (color windows), use `RGBBackColor()`/`RGBForeColor()` exclusively. Indexed calls don't reliably override RGB state
 - **`#include <Resources.h>`**: Required for Resource Manager calls (`FSpCreateResFile`, `FSpOpenResFile`, `Get1Resource`, `AddResource`, etc.)
+- **Cooperative threading = no true concurrency**: Only one thread runs at a time. Safe to free shared buffers from main thread as long as the thread checks for NULL when it resumes. But never set `thread_state = DONE` from main thread — only the thread itself should do that (prevents use-after-free of endpoint)
+- **OTCancelSynchronousCalls from notifier**: The reliable way to cancel a blocking `OTConnect`. Set a deadline, check it in `tcp_ot_notifier` on `kOTSyncIdleEvent`, call `OTCancelSynchronousCalls` from there
+- **OTUseSyncIdleEvents must be false during read loop**: Otherwise `OTRcv` blocks instead of returning `kOTNoDataErr`
+- **`#include <Threads.h>`**: Required for `YieldToAnyThread()` — needed in any file that uses threading

@@ -8,6 +8,7 @@
 #include "app.h"
 #include "console.h"
 #include "net.h"
+#include "telnet.h"
 #include "shell.h"
 #include "debug.h"
 
@@ -637,10 +638,36 @@ void display_about_box(void)
 	DisposeWindow(about);
 }
 
+static void session_write(int idx, char* buf, size_t len)
+{
+	if (sessions[idx].type == SESSION_SSH)
+		ssh_write_s(idx, buf, len);
+	else if (sessions[idx].type == SESSION_TELNET)
+	{
+		/* telnet protocol: CR must be followed by LF */
+		char tbuf[512];
+		size_t ti = 0;
+		size_t i;
+		for (i = 0; i < len; i++)
+		{
+			tbuf[ti++] = buf[i];
+			if (buf[i] == '\r')
+				tbuf[ti++] = '\n';
+			if (ti >= sizeof(tbuf) - 2)
+			{
+				tcp_write_s(idx, tbuf, ti);
+				ti = 0;
+			}
+		}
+		if (ti > 0)
+			tcp_write_s(idx, tbuf, ti);
+	}
+}
+
 void ssh_paste(void)
 {
 	int sid = active_session_global();
-	if (sessions[sid].type != SESSION_SSH) return;
+	if (sessions[sid].type != SESSION_SSH && sessions[sid].type != SESSION_TELNET) return;
 
 	// GetScrap requires a handle, not a raw buffer
 	// it will increase the size of the handle if needed
@@ -649,7 +676,7 @@ void ssh_paste(void)
 
 	if (r > 0)
 	{
-		ssh_write_s(sid, *buf, r);
+		session_write(sid, *buf, r);
 	}
 
 	DisposeHandle(buf);
@@ -931,6 +958,10 @@ void init_session(struct session* s)
 	s->endpoint = kOTInvalidEndpointRef;
 	s->recv_buffer = NULL;
 	s->send_buffer = NULL;
+	s->telnet_host[0] = '\0';
+	s->telnet_port = 0;
+	s->telnet_state = 0;
+	s->telnet_sb_len = 0;
 	s->thread_command = WAIT;
 	s->thread_state = UNINITIALIZED;
 	s->shell_vRefNum = 0;
@@ -1034,7 +1065,10 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	{
 		snprintf(sessions[idx].tab_label, sizeof(sessions[idx].tab_label), "local shell");
 	}
-
+	else if (type == SESSION_TELNET)
+	{
+		snprintf(sessions[idx].tab_label, sizeof(sessions[idx].tab_label), "telnet");
+	}
 	switch_session(wc, idx);
 
 	// enable Close Tab now that we have multiple sessions
@@ -1044,7 +1078,7 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 		EnableItem(menu, FMENU_CLOSE_TAB);
 	}
 
-	// if this is an SSH session, start connecting
+	// start the session
 	if (type == SESSION_SSH)
 	{
 		if (ssh_connect(idx) == 0) ssh_disconnect(idx);
@@ -1053,6 +1087,8 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	{
 		shell_init(idx);
 	}
+	/* telnet/nc: connection is started by the shell command after
+	   setting host/port on the session. Don't auto-connect here. */
 
 	// redraw since tab bar may have appeared
 	InvalRect(&(wc->win->portRect));
@@ -1070,12 +1106,16 @@ void close_session(int idx)
 	if (wc == NULL) return;
 	if (wc->num_sessions <= 1) return; // don't close the last session in a window
 
-	// disconnect if SSH and still connected
-	if (sessions[idx].type == SESSION_SSH &&
-		sessions[idx].thread_state != DONE &&
-		sessions[idx].thread_state != UNINITIALIZED)
+	// disconnect if networked and still connected
+	// skip if thread_command is already EXIT (disconnect already in progress)
+	if (sessions[idx].thread_state != DONE &&
+		sessions[idx].thread_state != UNINITIALIZED &&
+		sessions[idx].thread_command != EXIT)
 	{
-		ssh_disconnect(idx);
+		if (sessions[idx].type == SESSION_SSH)
+			ssh_disconnect(idx);
+		else if (sessions[idx].type == SESSION_TELNET)
+			telnet_disconnect(idx);
 	}
 
 	// null out vterm callbacks before freeing to prevent damage
@@ -1086,7 +1126,7 @@ void close_session(int idx)
 		vterm_screen_set_callbacks(vts, NULL, NULL);
 	}
 
-	// only free vterm if the thread is actually done (or was never started)
+	/* free vterm if thread is done or session is local (no thread) */
 	if (sessions[idx].vterm != NULL &&
 		(sessions[idx].thread_state == DONE ||
 		 sessions[idx].thread_state == UNINITIALIZED ||
@@ -1110,31 +1150,34 @@ void close_session(int idx)
 	if (wc->num_sessions == 1)
 		adjust_window_for_tabs(wc, 0);
 
-	// update menu state
-	void* menu = GetMenuHandle(MENU_FILE);
-	int active_sid = wc->session_ids[wc->active_session_idx];
-	if (sessions[active_sid].type == SESSION_SSH)
+	/* update menu state */
 	{
-		if (sessions[active_sid].thread_state == OPEN)
+		void* menu = GetMenuHandle(MENU_FILE);
+		int active_sid = wc->session_ids[wc->active_session_idx];
+		if (sessions[active_sid].type == SESSION_SSH ||
+			sessions[active_sid].type == SESSION_TELNET)
 		{
-			DisableItem(menu, FMENU_CONNECT);
-			EnableItem(menu, FMENU_DISCONNECT);
+			if (sessions[active_sid].thread_state == OPEN)
+			{
+				DisableItem(menu, FMENU_CONNECT);
+				EnableItem(menu, FMENU_DISCONNECT);
+			}
+			else
+			{
+				EnableItem(menu, FMENU_CONNECT);
+				DisableItem(menu, FMENU_DISCONNECT);
+			}
 		}
 		else
 		{
-			EnableItem(menu, FMENU_CONNECT);
+			DisableItem(menu, FMENU_CONNECT);
 			DisableItem(menu, FMENU_DISCONNECT);
 		}
-	}
-	else
-	{
-		DisableItem(menu, FMENU_CONNECT);
-		DisableItem(menu, FMENU_DISCONNECT);
-	}
 
-	// disable Close Tab if only 1 session left
-	if (wc->num_sessions <= 1)
-		DisableItem(menu, FMENU_CLOSE_TAB);
+		/* disable Close Tab if only 1 session left */
+		if (wc->num_sessions <= 1)
+			DisableItem(menu, FMENU_CLOSE_TAB);
+	}
 
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
@@ -1161,25 +1204,28 @@ void switch_session(struct window_context* wc, int idx)
 
 	wc->active_session_idx = found;
 
-	// update menu enable/disable based on new active session
-	void* menu = GetMenuHandle(MENU_FILE);
-	if (sessions[idx].type == SESSION_SSH)
+	/* update menu enable/disable based on new active session */
 	{
-		if (sessions[idx].thread_state == OPEN)
+		void* menu = GetMenuHandle(MENU_FILE);
+		if (sessions[idx].type == SESSION_SSH ||
+			sessions[idx].type == SESSION_TELNET)
 		{
-			DisableItem(menu, FMENU_CONNECT);
-			EnableItem(menu, FMENU_DISCONNECT);
+			if (sessions[idx].thread_state == OPEN)
+			{
+				DisableItem(menu, FMENU_CONNECT);
+				EnableItem(menu, FMENU_DISCONNECT);
+			}
+			else
+			{
+				EnableItem(menu, FMENU_CONNECT);
+				DisableItem(menu, FMENU_DISCONNECT);
+			}
 		}
 		else
 		{
-			EnableItem(menu, FMENU_CONNECT);
+			DisableItem(menu, FMENU_CONNECT);
 			DisableItem(menu, FMENU_DISCONNECT);
 		}
-	}
-	else
-	{
-		DisableItem(menu, FMENU_CONNECT);
-		DisableItem(menu, FMENU_DISCONNECT);
 	}
 
 	/* update window title to match new active session */
@@ -1337,7 +1383,14 @@ int process_menu_select(int32_t result)
 				int sid = active_session_global();
 				if (ssh_connect(sid) == 0) ssh_disconnect(sid);
 			}
-			if (item == FMENU_DISCONNECT) ssh_disconnect(active_session_global());
+			if (item == FMENU_DISCONNECT)
+			{
+				int sid = active_session_global();
+				if (sessions[sid].type == SESSION_SSH)
+					ssh_disconnect(sid);
+				else if (sessions[sid].type == SESSION_TELNET)
+					telnet_disconnect(sid);
+			}
 			if (item == FMENU_NEW_WINDOW) new_window();
 			if (item == FMENU_NEW_LOCAL) new_session(wc, SESSION_LOCAL);
 			if (item == FMENU_NEW_SSH) new_session(wc, SESSION_SSH);
@@ -1401,6 +1454,8 @@ void resize_con_window(struct window_context* wc, EventRecord event)
 				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
 				if (sessions[sid].type == SESSION_SSH && sessions[sid].channel)
 					libssh2_channel_request_pty_size(sessions[sid].channel, wc->size_x, wc->size_y);
+				if (sessions[sid].type == SESSION_TELNET)
+					telnet_send_naws(sid);
 			}
 		}
 	}
@@ -1433,7 +1488,19 @@ int handle_keypress(EventRecord* event)
 					else if (num_windows > 1)
 						close_window(active_window);
 					else
-						return 1; // last window, last tab -> quit
+						return 1;
+				}
+				else if ((sessions[sid].type == SESSION_TELNET)
+						 && sessions[sid].thread_state != DONE
+						 && sessions[sid].thread_state != UNINITIALIZED)
+				{
+					telnet_disconnect(sid);
+					if (wc->num_sessions > 1)
+						close_session(sid);
+					else if (num_windows > 1)
+						close_window(active_window);
+					else
+						return 1;
 				}
 				else if (wc->num_sessions > 1)
 					close_session(sid);
@@ -1514,45 +1581,80 @@ int handle_keypress(EventRecord* event)
 			return 0;
 		}
 
-		// SSH session keypress handling
-		if (sessions[sid].type != SESSION_SSH || sessions[sid].thread_state != OPEN)
+		/* telnet escape: Ctrl+] cancels connecting or disconnects
+		   check virtual keycode 0x1E (] key) AND either controlKey
+		   modifier (left-Ctrl) or charcode 0x1D (right-Ctrl via QEMU,
+		   which sends the control code without the modifier flag) */
+		if (sessions[sid].type == SESSION_TELNET &&
+		    ((event->message & keyCodeMask) >> 8) == 0x1E &&
+		    ((event->modifiers & controlKey) || c == 0x1D) &&
+		    sessions[sid].thread_state != DONE &&
+		    sessions[sid].thread_state != UNINITIALIZED)
+		{
+			printf_s(sid, "\r\nConnection closed.\r\n");
+			telnet_disconnect(sid);
+			if (wc->num_sessions > 1)
+				close_session(sid);
+			else if (num_windows > 1)
+				close_window(active_window);
+			else
+				return 1;
+			return 0;
+		}
+
+		/* network session keypress handling (SSH, telnet) */
+		if ((sessions[sid].type != SESSION_SSH &&
+			 sessions[sid].type != SESSION_TELNET) ||
+			sessions[sid].thread_state != OPEN)
 			return 0;
 
-		// get the unmodified version of the keypress
-		uint8_t unmodified_key = keycode_to_ascii[(event->message & keyCodeMask)>>8];
+		/* get the unmodified version of the keypress */
+		{
+			uint8_t unmodified_key = keycode_to_ascii[(event->message & keyCodeMask)>>8];
+			uint8_t vkeycode = (event->message & keyCodeMask) >> 8;
 
-		// if we have a control code for this key
-		if (event->modifiers & controlKey && ascii_to_control_code[unmodified_key] != 255)
-		{
-			sessions[sid].send_buffer[0] = ascii_to_control_code[unmodified_key];
-			ssh_write_s(sid, sessions[sid].send_buffer, 1);
-		}
-		else
-		{
-			// if we have alt and the character would be printable ascii, use it
-			if (event->modifiers & optionKey && c >= 32 && c <= 126)
+			/* right-Ctrl+key: QEMU sends charcode as control code but no
+			   controlKey modifier.  Detect by checking that the virtual
+			   keycode maps to a letter (not numpad Enter 0x4C) and the
+			   charcode is a control code (< 32). */
+			if (!(event->modifiers & controlKey) &&
+			    c < 32 && c != '\r' && c != '\t' && c != '\033' &&
+			    vkeycode != 0x4C &&  /* numpad Enter */
+			    ascii_to_control_code[unmodified_key] == c)
 			{
 				sessions[sid].send_buffer[0] = c;
-				ssh_write_s(sid, sessions[sid].send_buffer, 1);
+				session_write(sid, sessions[sid].send_buffer, 1);
+			}
+			/* if we have a control code for this key */
+			else if (event->modifiers & controlKey && ascii_to_control_code[unmodified_key] != 255)
+			{
+				sessions[sid].send_buffer[0] = ascii_to_control_code[unmodified_key];
+				session_write(sid, sessions[sid].send_buffer, 1);
 			}
 			else
 			{
-				// otherwise manually send an escape if we have alt held
-				if (event->modifiers & optionKey)
+				if (event->modifiers & optionKey && c >= 32 && c <= 126)
 				{
-					sessions[sid].send_buffer[0] = '\e';
-					ssh_write_s(sid, sessions[sid].send_buffer, 1);
-				}
-
-				if (key_to_vterm[c] != VTERM_KEY_NONE)
-				{
-					// doesn't seem like vterm does modifiers properly, so don't bother
-					vterm_keyboard_key(sessions[sid].vterm, key_to_vterm[c], VTERM_MOD_NONE);
+					sessions[sid].send_buffer[0] = c;
+					session_write(sid, sessions[sid].send_buffer, 1);
 				}
 				else
 				{
-					sessions[sid].send_buffer[0] = event->modifiers & optionKey ? unmodified_key : c;
-					ssh_write_s(sid, sessions[sid].send_buffer, 1);
+					if (event->modifiers & optionKey)
+					{
+						sessions[sid].send_buffer[0] = '\e';
+						session_write(sid, sessions[sid].send_buffer, 1);
+					}
+
+					if (key_to_vterm[c] != VTERM_KEY_NONE)
+					{
+						vterm_keyboard_key(sessions[sid].vterm, key_to_vterm[c], VTERM_MOD_NONE);
+					}
+					else
+					{
+						sessions[sid].send_buffer[0] = event->modifiers & optionKey ? unmodified_key : c;
+						session_write(sid, sessions[sid].send_buffer, 1);
+					}
 				}
 			}
 		}

@@ -38,7 +38,7 @@ struct sb_cell {
 };
 
 enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
-enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL };
+enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
 
@@ -74,6 +74,13 @@ struct session
 	EndpointRef endpoint;
 	char* recv_buffer;
 	char* send_buffer;
+
+	// telnet/nc connection (SESSION_TELNET/SESSION_NETCAT only)
+	char telnet_host[256];
+	unsigned short telnet_port;
+	unsigned char telnet_state;       /* IAC parser state */
+	unsigned char telnet_sb_buf[64];  /* subnegotiation buffer */
+	int telnet_sb_len;
 
 	// thread state
 	enum THREAD_COMMAND thread_command;
@@ -208,3 +215,7 @@ void close_window(int wid);
 // connection (operates on a session)
 int ssh_connect(int session_idx);
 void ssh_disconnect(int session_idx);
+int telnet_connect(int session_idx);
+void telnet_disconnect(int session_idx);
+int nc_inline_connect(int session_idx);
+void nc_inline_disconnect(int session_idx);

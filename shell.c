@@ -11,6 +11,7 @@
 #include "app.h"
 #include "shell.h"
 #include "console.h"
+#include "telnet.h"
 
 #include <Files.h>
 #include <Folders.h>
@@ -20,11 +21,36 @@
 #include <MacMemory.h>
 #include <Processes.h>
 #include <TextUtils.h>
+#include <Threads.h>
 
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+
+/* timeout notifier for blocking OT calls in main thread (ping, host) */
+#define OT_TIMEOUT_TICKS  600  /* 10 seconds at 60 ticks/sec */
+
+static unsigned long ot_timeout_deadline = 0;
+static ProviderRef ot_timeout_provider = nil;
+
+pascal void shell_ot_timeout_notifier(void* context, OTEventCode event,
+                                      OTResult result, void* cookie)
+{
+	(void)context;
+	(void)result;
+	(void)cookie;
+	if (event == kOTSyncIdleEvent)
+	{
+		YieldToAnyThread();
+		if (ot_timeout_deadline > 0 &&
+		    TickCount() > ot_timeout_deadline &&
+		    ot_timeout_provider != nil)
+		{
+			OTCancelSynchronousCalls(ot_timeout_provider, kOTCanceledErr);
+		}
+	}
+}
 
 /* max arguments for a command */
 #define MAX_ARGS 32
@@ -2050,6 +2076,325 @@ static void cmd_ssh(int idx, int argc, char* argv[])
 	}
 }
 
+static void cmd_telnet(int idx, int argc, char* argv[])
+{
+	/* telnet host [port] */
+	struct window_context* wc;
+	int new_idx;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: telnet <host> [port]\r\n");
+		return;
+	}
+
+	wc = window_for_session(idx);
+	if (wc == NULL) return;
+
+	new_idx = new_session(wc, SESSION_TELNET);
+	if (new_idx < 0) return;
+
+	/* set host/port BEFORE starting the connection thread */
+	strncpy(sessions[new_idx].telnet_host, argv[1],
+	        sizeof(sessions[new_idx].telnet_host) - 1);
+	sessions[new_idx].telnet_host[255] = '\0';
+
+	if (argc >= 3)
+		sessions[new_idx].telnet_port = (unsigned short)atoi(argv[2]);
+	else
+		sessions[new_idx].telnet_port = 23;
+
+	snprintf(sessions[new_idx].tab_label,
+	         sizeof(sessions[new_idx].tab_label),
+	         "telnet %s", argv[1]);
+
+	if (telnet_connect(new_idx) == 0)
+		telnet_disconnect(new_idx);
+}
+
+static void cmd_nc(int idx, int argc, char* argv[])
+{
+	/* nc host port — runs inline in the current session */
+	struct session* s = &sessions[idx];
+
+	if (argc < 3)
+	{
+		vt_write(idx, "usage: nc <host> <port>\r\n");
+		return;
+	}
+
+	strncpy(s->telnet_host, argv[1], sizeof(s->telnet_host) - 1);
+	s->telnet_host[255] = '\0';
+	s->telnet_port = (unsigned short)atoi(argv[2]);
+
+	if (nc_inline_connect(idx) == 0)
+	{
+		nc_inline_disconnect(idx);
+		vt_write(idx, "nc: connection failed\r\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* network diagnostic commands                                        */
+/* ------------------------------------------------------------------ */
+
+static int is_ip_address(const char* s)
+{
+	/* quick check: all chars are digits or dots */
+	int dots = 0;
+	const char* p;
+	if (*s == '\0') return 0;
+	for (p = s; *p; p++)
+	{
+		if (*p == '.') dots++;
+		else if (*p < '0' || *p > '9') return 0;
+	}
+	return dots == 3;
+}
+
+static void cmd_host(int idx, int argc, char* argv[])
+{
+	/* DNS lookup using OT Internet Services */
+	InetSvcRef inet_svc;
+	InetHostInfo host_info;
+	OSStatus err;
+	int i;
+	char ip_str[16];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: host <hostname|ip>\r\n");
+		return;
+	}
+
+	/* reverse lookup if it's an IP address */
+	if (is_ip_address(argv[1]))
+	{
+		InetHost addr;
+		InetDomainName name;
+
+		if (InitOpenTransport() != noErr)
+		{
+			vt_write(idx, "host: Open Transport not available\r\n");
+			return;
+		}
+		err = OTInetStringToHost(argv[1], &addr);
+		if (err != noErr)
+		{
+			printf_s(idx, "host: invalid address \"%s\"\r\n", argv[1]);
+			return;
+		}
+
+		inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
+		if (err != noErr || inet_svc == NULL)
+		{
+			printf_s(idx, "host: failed to open internet services (err=%d)\r\n", (int)err);
+			return;
+		}
+
+		OTSetSynchronous(inet_svc);
+		OTSetBlocking(inet_svc);
+		OTInstallNotifier(inet_svc, shell_ot_timeout_notifier, nil);
+		OTUseSyncIdleEvents(inet_svc, true);
+
+		printf_s(idx, "Reverse lookup %s... ", argv[1]);
+
+		ot_timeout_provider = inet_svc;
+		ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+		err = OTInetAddressToName(inet_svc, addr, name);
+
+		ot_timeout_deadline = 0;
+		ot_timeout_provider = nil;
+
+		if (err == noErr)
+			printf_s(idx, "%s\r\n", name);
+		else if (err == kOTCanceledErr)
+			vt_write(idx, "timed out\r\n");
+		else
+			printf_s(idx, "failed (err=%d)\r\n", (int)err);
+
+		OTCloseProvider(inet_svc);
+		return;
+	}
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "host: Open Transport not available\r\n");
+		return;
+	}
+
+	inet_svc = OTOpenInternetServices(kDefaultInternetServicesPath, 0, &err);
+	if (err != noErr || inet_svc == NULL)
+	{
+		printf_s(idx, "host: failed to open internet services (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	OTSetSynchronous(inet_svc);
+	OTSetBlocking(inet_svc);
+	OTInstallNotifier(inet_svc, shell_ot_timeout_notifier, nil);
+	OTUseSyncIdleEvents(inet_svc, true);
+
+	printf_s(idx, "Resolving \"%s\"... ", argv[1]);
+
+	ot_timeout_provider = inet_svc;
+	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	err = OTInetStringToAddress(inet_svc, argv[1], &host_info);
+
+	ot_timeout_deadline = 0;
+	ot_timeout_provider = nil;
+
+	if (err == kOTCanceledErr)
+	{
+		vt_write(idx, "timed out\r\n");
+	}
+	else if (err != noErr)
+	{
+		printf_s(idx, "failed (err=%d)\r\n", (int)err);
+	}
+	else
+	{
+		vt_write(idx, "\r\n");
+		for (i = 0; i < kMaxHostAddrs; i++)
+		{
+			if (host_info.addrs[i] == 0) break;
+			OTInetHostToString(host_info.addrs[i], ip_str);
+			printf_s(idx, "  %s has address %s\r\n", host_info.name, ip_str);
+		}
+	}
+
+	OTCloseProvider(inet_svc);
+}
+
+static void cmd_ifconfig(int idx, int argc, char* argv[])
+{
+	/* show network interface info */
+	InetInterfaceInfo info;
+	OSStatus err;
+	SInt32 i;
+	char ip_str[16];
+
+	(void)argc;
+	(void)argv;
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "ifconfig: Open Transport not available\r\n");
+		return;
+	}
+
+	for (i = 0; ; i++)
+	{
+		err = OTInetGetInterfaceInfo(&info, i);
+		if (err != noErr) break;
+
+		printf_s(idx, "Interface %d:\r\n", (int)i);
+
+		OTInetHostToString(info.fAddress, ip_str);
+		printf_s(idx, "  address:   %s\r\n", ip_str);
+
+		OTInetHostToString(info.fNetmask, ip_str);
+		printf_s(idx, "  netmask:   %s\r\n", ip_str);
+
+		OTInetHostToString(info.fBroadcastAddr, ip_str);
+		printf_s(idx, "  broadcast: %s\r\n", ip_str);
+
+		OTInetHostToString(info.fDefaultGatewayAddr, ip_str);
+		printf_s(idx, "  gateway:   %s\r\n", ip_str);
+
+		OTInetHostToString(info.fDNSAddr, ip_str);
+		printf_s(idx, "  dns:       %s\r\n", ip_str);
+
+		vt_write(idx, "\r\n");
+	}
+
+	if (i == 0)
+		vt_write(idx, "No network interfaces found.\r\n");
+}
+
+static void cmd_ping(int idx, int argc, char* argv[])
+{
+	/* TCP connect test — measures DNS + TCP handshake time */
+	EndpointRef ep;
+	OSStatus err;
+	TCall sndCall;
+	DNSAddress hostDNSAddress;
+	char hostport[280];
+	long start_ticks, elapsed;
+	unsigned short port;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: ping <host> [port]  (TCP connect test, default port 80)\r\n");
+		return;
+	}
+
+	port = (argc >= 3) ? (unsigned short)atoi(argv[2]) : 80;
+	snprintf(hostport, sizeof(hostport), "%s:%d", argv[1], (int)port);
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "ping: Open Transport not available\r\n");
+		return;
+	}
+
+	ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, nil, &err);
+	if (err != noErr)
+	{
+		printf_s(idx, "ping: failed to open endpoint (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	OTSetSynchronous(ep);
+	OTSetBlocking(ep);
+	OTInstallNotifier(ep, shell_ot_timeout_notifier, nil);
+	OTUseSyncIdleEvents(ep, true);
+
+	err = OTBind(ep, nil, nil);
+	if (err != noErr)
+	{
+		printf_s(idx, "ping: bind failed (err=%d)\r\n", (int)err);
+		OTCloseProvider(ep);
+		return;
+	}
+
+	OTMemzero(&sndCall, sizeof(TCall));
+	sndCall.addr.buf = (UInt8 *) &hostDNSAddress;
+	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, hostport);
+
+	printf_s(idx, "Connecting to %s... ", hostport);
+
+	ot_timeout_provider = ep;
+	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	start_ticks = TickCount();
+	err = OTConnect(ep, &sndCall, nil);
+	elapsed = TickCount() - start_ticks;
+
+	ot_timeout_deadline = 0;
+	ot_timeout_provider = nil;
+
+	if (err == noErr)
+	{
+		printf_s(idx, "connected (%ld ticks, ~%ldms)\r\n",
+		         elapsed, elapsed * 1000 / 60);
+		OTSndOrderlyDisconnect(ep);
+	}
+	else if (err == kOTCanceledErr)
+	{
+		vt_write(idx, "timed out\r\n");
+	}
+	else
+	{
+		printf_s(idx, "failed (err=%d, %ld ticks)\r\n", (int)err, elapsed);
+	}
+
+	OTUnbind(ep);
+	OTCloseProvider(ep);
+}
+
 static void cmd_colors(int idx, int argc, char* argv[])
 {
 	int i;
@@ -2158,6 +2503,11 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    ps                 list running processes\r\n");
 	vt_write(idx, "    open <path>        launch application\r\n");
 	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
+	vt_write(idx, "    telnet <h> [port]  open telnet tab\r\n");
+	vt_write(idx, "    nc <host> <port>   raw TCP connection\r\n");
+	vt_write(idx, "    host <hostname>    DNS lookup\r\n");
+	vt_write(idx, "    ping <host> [port] TCP connect test\r\n");
+	vt_write(idx, "    ifconfig           show network config\r\n");
 	vt_write(idx, "    colors             display color test\r\n");
 	vt_write(idx, "    help               this message\r\n");
 	vt_write(idx, "    exit               close this tab\r\n");
@@ -2218,10 +2568,10 @@ static int escape_and_append(char* line, int pos, int max, const char* src, int 
 static const char* shell_commands[] = {
 	"cat", "cd", "chattr", "chmod", "chown", "clear", "cls", "colors",
 	"copy", "cp", "date", "del", "delete", "df", "dir", "echo", "exit",
-	"file", "free", "getinfo", "help", "info", "label", "less", "ls",
-	"md", "mkdir", "more", "mv", "open", "ps", "pwd", "quit", "rd",
-	"ren", "rename", "rm", "rmdir", "setcreator", "settype", "ssh",
-	"touch", "type", "uname"
+	"file", "free", "getinfo", "help", "host", "ifconfig", "info",
+	"label", "less", "ls", "md", "mkdir", "more", "mv", "nc", "open",
+	"ping", "ps", "pwd", "quit", "rd", "ren", "rename", "rm", "rmdir",
+	"setcreator", "settype", "ssh", "telnet", "touch", "type", "uname"
 };
 #define NUM_SHELL_COMMANDS (sizeof(shell_commands) / sizeof(shell_commands[0]))
 
@@ -2758,6 +3108,11 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "free") == 0)       cmd_free(idx, argc, argv);
 	else if (strcmp(cmd, "ps") == 0)         cmd_ps(idx, argc, argv);
 	else if (strcmp(cmd, "ssh") == 0)        cmd_ssh(idx, argc, argv);
+	else if (strcmp(cmd, "telnet") == 0)    cmd_telnet(idx, argc, argv);
+	else if (strcmp(cmd, "nc") == 0)        cmd_nc(idx, argc, argv);
+	else if (strcmp(cmd, "host") == 0)      cmd_host(idx, argc, argv);
+	else if (strcmp(cmd, "ifconfig") == 0)  cmd_ifconfig(idx, argc, argv);
+	else if (strcmp(cmd, "ping") == 0)      cmd_ping(idx, argc, argv);
 	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
 	else if (strcmp(cmd, "open") == 0)      cmd_open(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
@@ -2907,6 +3262,98 @@ void shell_init(int session_idx)
 void shell_input(int session_idx, unsigned char c, int modifiers)
 {
 	struct session* s = &sessions[session_idx];
+
+	/* nc inline mode: recv_buffer is non-NULL when nc_inline_connect was called */
+	if (s->recv_buffer != NULL && s->type == SESSION_LOCAL)
+	{
+		if (s->thread_state == DONE || s->thread_command == EXIT)
+		{
+			/* connection finished, failed, or disconnect in progress.
+			   Force cleanup — thread will check for NULL before freeing. */
+			nc_inline_disconnect(session_idx);
+			if (s->recv_buffer != NULL)
+			{
+				OTFreeMem(s->recv_buffer);
+				s->recv_buffer = NULL;
+			}
+			if (s->send_buffer != NULL)
+			{
+				OTFreeMem(s->send_buffer);
+				s->send_buffer = NULL;
+			}
+			s->thread_state = UNINITIALIZED;
+			s->thread_command = WAIT;
+			vt_write(session_idx, "\r\n(connection closed)\r\n");
+			shell_prompt(session_idx);
+			return;
+		}
+
+		if (s->thread_state == OPEN && s->endpoint != kOTInvalidEndpointRef)
+		{
+			/* Ctrl+C or Ctrl+D: disconnect */
+			if ((modifiers & controlKey) && (c == 3 || c == 4))
+			{
+				nc_inline_disconnect(session_idx);
+				s->shell_line_len = 0;
+				s->shell_line[0] = '\0';
+				vt_write(session_idx, "\r\n(disconnected)\r\n");
+				shell_prompt(session_idx);
+				return;
+			}
+			/* also catch right-ctrl / bare 0x03 or 0x04 as disconnect */
+			if (c == 3 || c == 4)
+			{
+				nc_inline_disconnect(session_idx);
+				s->shell_line_len = 0;
+				s->shell_line[0] = '\0';
+				vt_write(session_idx, "\r\n(disconnected)\r\n");
+				shell_prompt(session_idx);
+				return;
+			}
+			/* Enter: send buffered line + LF */
+			if (c == '\r')
+			{
+				int i;
+				vt_write(session_idx, "\r\n");
+				for (i = 0; i < s->shell_line_len; i++)
+					tcp_write_s(session_idx, &s->shell_line[i], 1);
+				s->send_buffer[0] = '\n';
+				tcp_write_s(session_idx, s->send_buffer, 1);
+				s->shell_line_len = 0;
+				s->shell_line[0] = '\0';
+				return;
+			}
+			/* Backspace */
+			if (c == kBackspaceCharCode)
+			{
+				if (s->shell_line_len > 0)
+				{
+					s->shell_line_len--;
+					s->shell_line[s->shell_line_len] = '\0';
+					vt_write(session_idx, "\b \b");
+				}
+				return;
+			}
+			/* buffer printable characters */
+			if (s->shell_line_len < 254 && c >= 32)
+			{
+				s->shell_line[s->shell_line_len++] = c;
+				s->shell_line[s->shell_line_len] = '\0';
+				vt_char(session_idx, c);
+			}
+			return;
+		}
+
+		/* still connecting — Ctrl+C, Ctrl+D, or Escape cancels */
+		if (c == 3 || c == 4 || c == '\033')
+		{
+			nc_inline_disconnect(session_idx);
+			vt_write(session_idx, "\r\n(cancelled)\r\n");
+			shell_prompt(session_idx);
+			return;
+		}
+		return;
+	}
 
 	/* ignore page up/down in local shell (handled by scrollback) */
 	if (c == kPageUpCharCode || c == kPageDownCharCode)
@@ -3145,7 +3592,9 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 			s->shell_cursor_pos = 0;
 			s->shell_line[0] = '\0';
 			s->shell_history_pos = -1;
-			shell_prompt(session_idx);
+			/* suppress prompt if nc inline is active (thread running) */
+			if (!(s->recv_buffer != NULL && s->type == SESSION_LOCAL))
+				shell_prompt(session_idx);
 		}
 		return;
 	}
