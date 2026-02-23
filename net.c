@@ -198,6 +198,10 @@ int ssh_setup_terminal(int session_idx)
 	int cols = wc ? wc->size_x : 80;
 	int rows = wc ? wc->size_y : 24;
 	SSH_CHECK(libssh2_channel_request_pty_ex(s->channel, prefs.terminal_string, (strlen(prefs.terminal_string)), NULL, 0, cols, rows, 0, 0));
+
+	/* try to set COLORTERM — server may reject this (AcceptEnv), that's OK */
+	libssh2_channel_setenv(s->channel, "COLORTERM", "truecolor");
+
 	SSH_CHECK(libssh2_channel_shell(s->channel));
 
 	s->thread_state = OPEN;

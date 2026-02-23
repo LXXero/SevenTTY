@@ -24,7 +24,7 @@
 #define SSH_BUFFER_SIZE 4*1024
 
 /* default terminal string */
-#define DEFAULT_TERM_STRING "xterm-16color"
+#define DEFAULT_TERM_STRING "xterm-256color"
 
 /* name for the preferences file (pascal string) */
 #define PREFERENCES_FILENAME "\pSevenTTY Preferences"
@@ -97,6 +97,17 @@
 #define CNTL_PREF_BG_COLOR  129
 #define CNTL_PREF_TERM_TYPE 130
 #define CNTL_PREF_FONT_SIZE 131
+
+/* symbol font for box drawing / block elements / CP437 */
+#define SYMF_FAMILY_ID  200
+#define SYMF_FOND_ID    200
+#define SYMF_NFNT_9     200
+#define SYMF_NFNT_10    201
+#define SYMF_NFNT_12    202
+#define SYMF_NFNT_14    203
+#define SYMF_NFNT_18    204
+#define SYMF_NFNT_24    205
+#define SYMF_NFNT_36    206
 
 /* menus */
 #define MBAR_MAIN      128

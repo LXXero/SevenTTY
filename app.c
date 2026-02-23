@@ -146,7 +146,7 @@ void set_terminal_string(void)
 	 * "vt100" just the basics
 	 * "xterm" everything
 	 * "xterm-mono" everything except color
-	 * "xterm-16color" classic 16 ANSI colors only
+	 * "xterm-256color" full 256-color + true-color RGB support
 	 */
 	switch (prefs.display_mode)
 	{
@@ -154,7 +154,7 @@ void set_terminal_string(void)
 			prefs.terminal_string = "xterm-mono";
 			break;
 		case COLOR:
-			prefs.terminal_string = "xterm-16color";
+			prefs.terminal_string = "xterm-256color";
 			break;
 		default:
 			prefs.terminal_string = DEFAULT_TERM_STRING;

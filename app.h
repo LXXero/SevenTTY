@@ -34,7 +34,7 @@ struct sb_cell {
 	unsigned char ch;    /* character (Mac Roman) */
 	unsigned char fg;    /* foreground color index */
 	unsigned char bg;    /* background color index */
-	unsigned char attrs; /* bit0=bold, bit1=reverse, bit2=underline, bit3=italic */
+	unsigned char attrs; /* bit0=bold, bit1=reverse, bit2=underline, bit3=italic, bit4=symbol font, bit5=default fg, bit6=default bg */
 };
 
 enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };

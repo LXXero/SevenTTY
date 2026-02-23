@@ -6,7 +6,7 @@
 cmake_minimum_required(VERSION 3.9)
 
 project(SevenTTY)
-add_application(SevenTTY CREATOR "SSH7" app.c console.c resources.r net.c telnet.c debug.c shell.c)
+add_application(SevenTTY CREATOR "SSH7" app.c console.c resources.r symbolfont.r net.c telnet.c debug.c shell.c)
 
 # set up and build mbedtls
 set(ENABLE_PROGRAMS OFF CACHE BOOL "disable mbedtls programs" FORCE)

@@ -156,7 +156,7 @@ All constants live in `constants.r` (shared by C code and Rez resources):
 
 - `APP_*` — application-level: version, partition size, icon IDs
 - `SSH_BUFFER_SIZE` — network buffer size
-- `DEFAULT_TERM_STRING` — terminal type ("xterm-16color")
+- `DEFAULT_TERM_STRING` — terminal type ("xterm-256color")
 - `MBAR_MAIN` — menu bar resource ID
 - `MENU_*` — menu resource IDs
 - `FMENU_*` — File menu item indices

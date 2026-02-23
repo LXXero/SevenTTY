@@ -23,58 +23,407 @@
 /* active session for a given window context */
 #define WC_S(wc) sessions[(wc)->session_ids[(wc)->active_session_idx]]
 
-/* sentinel values for default colors stored in scrollback sb_cell */
-#define COLOR_DEFAULT_FG 0xFE
-#define COLOR_DEFAULT_BG 0xFF
+/* sentinel values for default colors — negative to avoid colliding with
+   xterm 256-color palette indices (0-255) */
+#define COLOR_DEFAULT_FG (-1)
+#define COLOR_DEFAULT_BG (-2)
+
+/* packed RGB: bit 24 set = true-color RGB, bits 16-23=R, 8-15=G, 0-7=B.
+   always positive and > 255, so no collision with sentinels or palette. */
+#define COLOR_IS_RGB(c)       ((c) > 255)
+#define COLOR_PACK_RGB(r,g,b) (0x01000000 | ((r) << 16) | ((g) << 8) | (b))
 
 /* extract abstract color ID from a VTermScreenCell color field.
-   returns sentinel for default colors, or the palette index otherwise.
-   vterm stores defaults as RGB (not indexed), so non-indexed = default.
-   indexed 7 (fg) / 0 (bg) also treated as default (standard behavior). */
+   returns sentinel for default colors, palette index for indexed colors,
+   or packed RGB for true-color. */
 static int extract_fg(VTermScreenCell* cell)
 {
 	if (VTERM_COLOR_IS_DEFAULT_FG(&cell->fg)) return COLOR_DEFAULT_FG;
 	if (VTERM_COLOR_IS_INDEXED(&cell->fg))
-		return cell->fg.indexed.idx & 0x0F;
-	/* non-indexed (RGB from vterm reset) = treat as default */
-	return COLOR_DEFAULT_FG;
+		return cell->fg.indexed.idx;
+	/* true-color RGB — pack into int */
+	return COLOR_PACK_RGB(cell->fg.rgb.red, cell->fg.rgb.green, cell->fg.rgb.blue);
 }
 
 static int extract_bg(VTermScreenCell* cell)
 {
 	if (VTERM_COLOR_IS_DEFAULT_BG(&cell->bg)) return COLOR_DEFAULT_BG;
 	if (VTERM_COLOR_IS_INDEXED(&cell->bg))
-		return cell->bg.indexed.idx & 0x0F;
-	/* non-indexed (RGB from vterm reset) = treat as default */
-	return COLOR_DEFAULT_BG;
+		return cell->bg.indexed.idx;
+	/* true-color RGB — pack into int */
+	return COLOR_PACK_RGB(cell->bg.rgb.red, cell->bg.rgb.green, cell->bg.rgb.blue);
 }
 
-/* resolve abstract color ID to an RGBColor pointer.
-   sentinels map to theme_fg/theme_bg, all others to the palette. */
+/* compute RGBColor for xterm 256-color palette index 16-255.
+   indices 16-231 = 6x6x6 RGB cube, 232-255 = 24-step grayscale ramp.
+   Mac RGBColor uses 16-bit per channel (0-65535). */
+static void xterm256_to_rgb(int idx, RGBColor* c)
+{
+	if (idx < 232)
+	{
+		/* 6x6x6 color cube: index = 16 + 36*r + 6*g + b */
+		static const unsigned short cube[] = {0, 0x5F5F, 0x8787, 0xAFAF, 0xD7D7, 0xFFFF};
+		int i = idx - 16;
+		c->red   = cube[i / 36];
+		c->green = cube[(i / 6) % 6];
+		c->blue  = cube[i % 6];
+	}
+	else
+	{
+		/* grayscale ramp: 232=rgb(8,8,8) .. 255=rgb(238,238,238) */
+		unsigned short g = (8 + (idx - 232) * 10) * 257;
+		c->red = g;
+		c->green = g;
+		c->blue = g;
+	}
+}
+
+/* convert 8-bit RGB to nearest xterm 256-color index (for scrollback storage) */
+static unsigned char rgb_to_xterm256(unsigned char r, unsigned char g, unsigned char b)
+{
+	int ri, gi, bi;
+	if (r == g && g == b)
+	{
+		if (r < 8) return 16;
+		if (r > 248) return 231;
+		return 232 + (r - 8) / 10;
+	}
+	ri = (r > 47) ? (r - 35) / 40 : 0;
+	gi = (g > 47) ? (g - 35) / 40 : 0;
+	bi = (b > 47) ? (b - 35) / 40 : 0;
+	return 16 + 36 * ri + 6 * gi + bi;
+}
+
+/* extract color byte for scrollback storage (0-255 index) */
+static unsigned char vtcolor_to_byte(const VTermColor* vc)
+{
+	if (VTERM_COLOR_IS_INDEXED(vc))
+		return vc->indexed.idx;
+	return rgb_to_xterm256(vc->rgb.red, vc->rgb.green, vc->rgb.blue);
+}
+
+/* resolve abstract color ID to drawing color.
+   sentinels map to theme_fg/theme_bg, 0-15 to palette, 16-255 to xterm cube/gray,
+   packed RGB (> 255) to direct true-color. */
 static void set_draw_fg(int idx)
 {
+	RGBColor c;
 	if (idx == COLOR_DEFAULT_FG)
 		RGBForeColor(&prefs.theme_fg);
 	else if (idx == COLOR_DEFAULT_BG)
 		RGBForeColor(&prefs.theme_bg);
+	else if (COLOR_IS_RGB(idx))
+	{
+		c.red   = ((idx >> 16) & 0xFF) * 0x0101;
+		c.green = ((idx >> 8) & 0xFF) * 0x0101;
+		c.blue  = (idx & 0xFF) * 0x0101;
+		RGBForeColor(&c);
+	}
+	else if (idx < 16)
+		RGBForeColor(&prefs.palette[idx]);
 	else
-		RGBForeColor(&prefs.palette[idx & 0x0F]);
+	{
+		xterm256_to_rgb(idx, &c);
+		RGBForeColor(&c);
+	}
 }
 
 static void set_draw_bg(int idx)
 {
+	RGBColor c;
 	if (idx == COLOR_DEFAULT_BG)
 		RGBBackColor(&prefs.theme_bg);
 	else if (idx == COLOR_DEFAULT_FG)
 		RGBBackColor(&prefs.theme_fg);
+	else if (COLOR_IS_RGB(idx))
+	{
+		c.red   = ((idx >> 16) & 0xFF) * 0x0101;
+		c.green = ((idx >> 8) & 0xFF) * 0x0101;
+		c.blue  = (idx & 0xFF) * 0x0101;
+		RGBBackColor(&c);
+	}
+	else if (idx < 16)
+		RGBBackColor(&prefs.palette[idx]);
 	else
-		RGBBackColor(&prefs.palette[idx & 0x0F]);
+	{
+		xterm256_to_rgb(idx, &c);
+		RGBBackColor(&c);
+	}
 }
 
 
+static int symbol_font_lookup(uint32_t cp);
+
+/* convert UTF-8 string to Mac Roman, writing to out buffer.
+   returns number of bytes written (not including null terminator).
+   unknown chars become '?' */
+int utf8_to_macroman(const char* utf8, int utf8_len, char* out, int out_max)
+{
+	int i = 0, o = 0;
+	while (i < utf8_len && o < out_max - 1)
+	{
+		unsigned char b = (unsigned char)utf8[i];
+		uint32_t cp;
+		if (b < 0x80)
+		{
+			cp = b;
+			i++;
+		}
+		else if ((b & 0xE0) == 0xC0 && i + 1 < utf8_len)
+		{
+			cp = ((b & 0x1F) << 6) | (utf8[i+1] & 0x3F);
+			i += 2;
+		}
+		else if ((b & 0xF0) == 0xE0 && i + 2 < utf8_len)
+		{
+			cp = ((b & 0x0F) << 12) | ((utf8[i+1] & 0x3F) << 6) | (utf8[i+2] & 0x3F);
+			i += 3;
+		}
+		else if ((b & 0xF8) == 0xF0 && i + 3 < utf8_len)
+		{
+			cp = ((b & 0x07) << 18) | ((utf8[i+1] & 0x3F) << 12) |
+			     ((utf8[i+2] & 0x3F) << 6) | (utf8[i+3] & 0x3F);
+			i += 4;
+		}
+		else
+		{
+			i++;
+			continue;
+		}
+
+		if (cp < 128)
+			out[o++] = (char)cp;
+		else if (cp <= 0xFFFF)
+			out[o++] = UNICODE_BMP_NORMALIZER[cp];
+
+		else
+			out[o++] = '?';
+	}
+	out[o] = '\0';
+	return o;
+}
+
+/* symbol font lookup: returns char code (0x20-0x7E) or -1 if not in font */
+static int symbol_font_lookup(uint32_t cp)
+{
+	/* box drawing: U+2500-U+257F */
+	if (cp >= 0x2500 && cp <= 0x257F)
+	{
+		switch (cp)
+		{
+			case 0x2500: return 0x9B;  /* ─ (not 0x20 — space char doesn't render) */
+			case 0x2501: return 0x4C;  /* ━ */
+			case 0x2502: return 0x21;  /* │ */
+			case 0x2503: return 0x4D;  /* ┃ */
+			case 0x2504: return 0x4F;  /* ┄ */
+			case 0x250C: return 0x22;  /* ┌ */
+			case 0x2510: return 0x23;  /* ┐ */
+			case 0x2514: return 0x24;  /* └ */
+			case 0x2518: return 0x25;  /* ┘ */
+			case 0x251C: return 0x26;  /* ├ */
+			case 0x2524: return 0x27;  /* ┤ */
+			case 0x252C: return 0x28;  /* ┬ */
+			case 0x2534: return 0x29;  /* ┴ */
+			case 0x253C: return 0x2A;  /* ┼ */
+			case 0x254B: return 0x4E;  /* ╋ */
+			case 0x2550: return 0x2B;  /* ═ */
+			case 0x2551: return 0x2C;  /* ║ */
+			case 0x2552: return 0x36;  /* ╒ */
+			case 0x2553: return 0x37;  /* ╓ */
+			case 0x2554: return 0x2D;  /* ╔ */
+			case 0x2555: return 0x38;  /* ╕ */
+			case 0x2556: return 0x39;  /* ╖ */
+			case 0x2557: return 0x2E;  /* ╗ */
+			case 0x2558: return 0x3A;  /* ╘ */
+			case 0x2559: return 0x3B;  /* ╙ */
+			case 0x255A: return 0x2F;  /* ╚ */
+			case 0x255B: return 0x3C;  /* ╛ */
+			case 0x255C: return 0x3D;  /* ╜ */
+			case 0x255D: return 0x30;  /* ╝ */
+			case 0x255E: return 0x3E;  /* ╞ */
+			case 0x255F: return 0x3F;  /* ╟ */
+			case 0x2560: return 0x31;  /* ╠ */
+			case 0x2561: return 0x40;  /* ╡ */
+			case 0x2562: return 0x41;  /* ╢ */
+			case 0x2563: return 0x32;  /* ╣ */
+			case 0x2564: return 0x42;  /* ╤ */
+			case 0x2565: return 0x43;  /* ╥ */
+			case 0x2566: return 0x33;  /* ╦ */
+			case 0x2567: return 0x44;  /* ╧ */
+			case 0x2568: return 0x45;  /* ╨ */
+			case 0x2569: return 0x34;  /* ╩ */
+			case 0x256A: return 0x46;  /* ╪ */
+			case 0x256B: return 0x47;  /* ╫ */
+			case 0x256C: return 0x35;  /* ╬ */
+			case 0x2574: return 0x48;  /* ╴ */
+			case 0x2575: return 0x49;  /* ╵ */
+			case 0x2576: return 0x4A;  /* ╶ */
+			case 0x2577: return 0x4B;  /* ╷ */
+			/* rounded corners -> same as regular corners */
+			case 0x256D: return 0x22;  /* ╭ -> ┌ */
+			case 0x256E: return 0x23;  /* ╮ -> ┐ */
+			case 0x256F: return 0x25;  /* ╯ -> ┘ */
+			case 0x2570: return 0x24;  /* ╰ -> └ */
+			/* dashed horizontal variants -> triple dash */
+			case 0x2505: return 0x4F;  /* ┅ -> ┄ */
+			case 0x2508: return 0x4F;  /* ┈ -> ┄ */
+			case 0x2509: return 0x4F;  /* ┉ -> ┄ */
+			case 0x254C: return 0x4F;  /* ╌ -> ┄ */
+			case 0x254D: return 0x4F;  /* ╍ -> ┄ */
+			/* dashed vertical variants -> vertical line */
+			case 0x2506: return 0x21;  /* ┆ -> │ */
+			case 0x2507: return 0x4D;  /* ┇ -> ┃ */
+			case 0x250A: return 0x21;  /* ┊ -> │ */
+			case 0x250B: return 0x4D;  /* ┋ -> ┃ */
+			case 0x254E: return 0x21;  /* ╎ -> │ */
+			case 0x254F: return 0x4D;  /* ╏ -> ┃ */
+			/* heavy half lines */
+			case 0x2578: return 0x48;  /* ╸ -> ╴ */
+			case 0x2579: return 0x49;  /* ╹ -> ╵ */
+			case 0x257A: return 0x4A;  /* ╺ -> ╶ */
+			case 0x257B: return 0x4B;  /* ╻ -> ╷ */
+			case 0x257C: return 0x9B;  /* ╼ -> ─ */
+			case 0x257D: return 0x21;  /* ╽ -> │ */
+			case 0x257E: return 0x9B;  /* ╾ -> ─ */
+			case 0x257F: return 0x21;  /* ╿ -> │ */
+			/* bold corners -> regular corners */
+			case 0x2512: return 0x23;  /* ┒ -> ┐ */
+			case 0x2513: return 0x23;  /* ┓ -> ┐ */
+			case 0x2516: return 0x24;  /* ┖ -> └ */
+			case 0x2517: return 0x24;  /* ┗ -> └ */
+			case 0x251A: return 0x25;  /* ┚ -> ┘ */
+			case 0x251B: return 0x25;  /* ┛ -> ┘ */
+			case 0x250E: return 0x22;  /* ┎ -> ┌ */
+			case 0x250F: return 0x22;  /* ┏ -> ┌ */
+			case 0x2511: return 0x23;  /* ┑ -> ┐ */
+			default: return -1;
+		}
+	}
+	/* block elements: U+2580-U+259F */
+	if (cp >= 0x2580 && cp <= 0x259F)
+	{
+		if (cp <= 0x258F) return 0x50 + (cp - 0x2580);
+		if (cp == 0x2590) return 0x60;
+		if (cp >= 0x2591 && cp <= 0x2595)
+		{
+			switch (cp)
+			{
+				case 0x2591: return 0x61;
+				case 0x2592: return 0x62;
+				case 0x2593: return 0x63;
+				case 0x2594: return 0x64;
+				case 0x2595: return 0x65;
+			}
+		}
+		if (cp >= 0x2596 && cp <= 0x259F)
+			return 0x90 + (cp - 0x2596);
+		return -1;
+	}
+	/* geometric shapes */
+	switch (cp)
+	{
+		case 0x25A0: return 0x66;
+		case 0x25A1: return 0x67;
+		case 0x25AA: return 0x68;
+		case 0x25AB: return 0x69;
+		case 0x25B2: return 0x6A;
+		case 0x25B6: return 0x6B;
+		case 0x25BC: return 0x6C;
+		case 0x25C0: return 0x6D;
+		case 0x25CB: return 0x6E;
+		case 0x25CF: return 0x6F;
+	}
+	/* card suits, smileys, music notes, etc */
+	switch (cp)
+	{
+		case 0x2660: return 0x70;
+		case 0x2663: return 0x71;
+		case 0x2665: return 0x72;
+		case 0x2666: return 0x73;
+		case 0x263A: return 0x74;
+		case 0x263B: return 0x75;
+		case 0x266A: return 0x76;
+		case 0x266B: return 0x77;
+		case 0x2713: return 0x78;
+		case 0x2717: return 0x79;
+		case 0x2190: return 0x7A;
+		case 0x2191: return 0x7B;
+		case 0x2192: return 0x7C;
+		case 0x2193: return 0x7D;
+		case 0x2194: return 0x7E;
+	}
+	/* small triangle variants -> use same glyph as full-size */
+	switch (cp)
+	{
+		case 0x25B4: return 0x6A;  /* ▴ small up triangle -> ▲ */
+		case 0x25B8: return 0x6B;  /* ▸ small right triangle -> ▶ */
+		case 0x25BE: return 0x6C;  /* ▾ small down triangle -> ▼ */
+		case 0x25C2: return 0x6D;  /* ◂ small left triangle -> ◀ */
+	}
+	/* Claude CLI: prompt marker + search icon */
+	if (cp == 0x23F5) return 0x7F;  /* ⏵ */
+	if (cp == 0x276F) return 0x9A;  /* ❯ pointer / prompt marker */
+	if (cp == 0x2315) return 0x8F;  /* ⌕ telephone recorder / search icon */
+	/* Claude CLI: spinner dingbats */
+	switch (cp)
+	{
+		case 0x2217: return 0x80;  /* ∗ */
+		case 0x2722: return 0x81;  /* ✢ */
+		case 0x2733: return 0x82;  /* ✳ */
+		case 0x2736: return 0x82;  /* ✶ six-pointed star (Claude spinner) */
+		case 0x273B: return 0x83;  /* ✻ */
+		case 0x273D: return 0x84;  /* ✽ */
+	}
+	/* Claude CLI: braille spinner */
+	switch (cp)
+	{
+		case 0x280B: return 0x85;  /* ⠋ */
+		case 0x2819: return 0x86;  /* ⠙ */
+		case 0x2839: return 0x87;  /* ⠹ */
+		case 0x2838: return 0x88;  /* ⠸ */
+		case 0x283C: return 0x89;  /* ⠼ */
+		case 0x2834: return 0x8A;  /* ⠴ */
+		case 0x2826: return 0x8B;  /* ⠦ */
+		case 0x2827: return 0x8C;  /* ⠧ */
+		case 0x2807: return 0x8D;  /* ⠇ */
+		case 0x280F: return 0x8E;  /* ⠏ */
+	}
+	/* middle dot / separator */
+	switch (cp)
+	{
+		case 0x00B7: return 0xAD;  /* · middle dot */
+		case 0x22C5: return 0xAD;  /* ⋅ dot operator */
+		case 0x2027: return 0xAD;  /* ‧ hyphenation point */
+		case 0x2024: return 0xAD;  /* ․ one dot leader */
+		case 0x2219: return 0xAD;  /* ∙ bullet operator */
+	}
+	/* figures/UI chars: diamonds, checks, boxes, stars, etc. */
+	switch (cp)
+	{
+		case 0x25C6: return 0x9C;  /* ◆ black diamond (lozenge) */
+		case 0x25C7: return 0x9D;  /* ◇ white diamond */
+		case 0x2714: return 0x9E;  /* ✔ heavy check mark (tick) */
+		case 0x2718: return 0x9F;  /* ✘ heavy ballot X (cross) */
+		case 0x25FB: return 0xA0;  /* ◻ white medium square */
+		case 0x25FC: return 0xA1;  /* ◼ black medium square */
+		case 0x25C9: return 0xA2;  /* ◉ fisheye (radioOn) */
+		case 0x25EF: return 0xA3;  /* ◯ large circle (radioOff) */
+		case 0x2610: return 0xA4;  /* ☐ ballot box (checkboxOff) */
+		case 0x2612: return 0xA5;  /* ☒ ballot box with X (checkboxOn) */
+		case 0x2605: return 0xA6;  /* ★ black star */
+		case 0x2630: return 0xA7;  /* ☰ trigram/hamburger */
+		case 0x25B3: return 0xA8;  /* △ white up triangle */
+		case 0x26A0: return 0xA9;  /* ⚠ warning sign */
+		case 0x25CE: return 0xAA;  /* ◎ bullseye */
+		case 0x25CC: return 0xAB;  /* ◌ dotted circle */
+		case 0x2139: return 0xAC;  /* ℹ info */
+	}
+	return -1;
+}
+
 char key_to_vterm[256] = { VTERM_KEY_NONE };
 
-int font_offset = 0;
+int font_ascent = 0;
 
 void setup_key_translation(void)
 {
@@ -116,7 +465,7 @@ void print_string(const char* c)
 inline void draw_char(struct window_context* wc, int x, int y, Rect* r, char c)
 {
 	short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	MoveTo(r->left + 2 + x * con.cell_width, r->top + 2 - font_offset + ((y+1) * con.cell_height) + top_offset);
+	MoveTo(r->left + 2 + x * con.cell_width, r->top + 2 + font_ascent + (y * con.cell_height) + top_offset);
 	DrawChar(c);
 }
 
@@ -553,14 +902,14 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 			struct sb_cell* sc = &s->scrollback[sb_idx][col];
 			cell->chars[0] = sc->ch;
 			cell->width = 1;
-			if (sc->fg == COLOR_DEFAULT_FG)
+			if (sc->attrs & 32)
 				cell->fg.type = VTERM_COLOR_DEFAULT_FG;
 			else
 			{
 				cell->fg.type = VTERM_COLOR_INDEXED;
 				cell->fg.indexed.idx = sc->fg;
 			}
-			if (sc->bg == COLOR_DEFAULT_BG)
+			if (sc->attrs & 64)
 				cell->bg.type = VTERM_COLOR_DEFAULT_BG;
 			else
 			{
@@ -571,6 +920,7 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 			cell->attrs.reverse = (sc->attrs & 2) ? 1 : 0;
 			cell->attrs.underline = (sc->attrs & 4) ? 1 : 0;
 			cell->attrs.italic = (sc->attrs & 8) ? 1 : 0;
+			cell->attrs.strike = (sc->attrs & 16) ? 1 : 0;
 		}
 		else
 		{
@@ -586,6 +936,24 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 		pos.row = display_row - s->scroll_offset;
 		pos.col = col;
 		return vterm_screen_get_cell(s->vts, pos, cell);
+	}
+}
+
+/* draw a text run, splitting at symbol font boundaries */
+static void draw_run_with_symbols(char* text, char* is_sym, int start, int len)
+{
+	int i = 0;
+	while (i < len)
+	{
+		int sub_start = i;
+		int sub_sym = is_sym[start + i];
+		while (i < len && is_sym[start + i] == sub_sym)
+			i++;
+		if (sub_sym)
+			TextFont(SYMF_FAMILY_ID);
+		else
+			TextFont(kFontIDMonaco);
+		DrawText(text, start + sub_start, i - sub_start);
 	}
 }
 
@@ -638,9 +1006,10 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 	VTermPos pos = {.row = 0, .col = 0};
 
 	char row_text[wc->size_x];
+	char row_is_symbol[wc->size_x];
 	Rect run_rect;
 	short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	int vertical_offset = r->top + con.cell_height - font_offset + 2 + top_offset;
+	int vertical_offset = r->top + font_ascent + 2 + top_offset;
 	int run_start_col, run_length;
 	short run_face, next_face;
 	int run_inverted;
@@ -669,18 +1038,50 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
 		{
 			int cell_fg, cell_bg;
+			int sym_code;
 			ok = get_cell_scrolled(wc, pos.row, pos.col, &vtsc);
 
 			uint32_t glyph = vtsc.chars[0];
+			uint32_t orig_cp = glyph;
 
 			if (glyph == 0) glyph = ' ';
 
-			// normalize some unicode
-			if (glyph > 127)
+			/* For scrollback cells, strike bit = symbol font flag (we set it).
+			   For live cells, strike = actual strikethrough — ignore it. */
+			if (WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset)
+				row_is_symbol[pos.col] = vtsc.attrs.strike ? 1 : 0;
+			else
+				row_is_symbol[pos.col] = 0;
+
+			// normalize some unicode (only for live cells — scrollback is pre-normalized)
+			if (glyph > 127 && !(WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset))
 			{
-				if (glyph <= 0xFFFF)
+				/* try symbol font first — handles chars like U+00B7 that
+				   have Mac Roman equivalents but render poorly in Monaco */
+				sym_code = symbol_font_lookup(orig_cp);
+				if (sym_code >= 0)
+				{
+					glyph = sym_code;
+					row_is_symbol[pos.col] = 1;
+				}
+				else if (glyph <= 0xFFFF)
 				{
 					glyph = UNICODE_BMP_NORMALIZER[glyph];
+					/* if we got lozenge fallback, try Mac Roman overrides */
+					if ((char)glyph == MAC_ROMAN_LOZENGE && orig_cp > 127)
+					{
+						switch (orig_cp)
+						{
+							case 0x2014: glyph = 0xD1; break; /* em dash */
+							case 0x2013: glyph = 0xD0; break; /* en dash */
+							case 0x2018: glyph = 0xD4; break; /* left single quote */
+							case 0x2019: glyph = 0xD5; break; /* right single quote */
+							case 0x201C: glyph = 0xD2; break; /* left double quote */
+							case 0x201D: glyph = 0xD3; break; /* right double quote */
+							case 0x2026: glyph = 0xC9; break; /* ellipsis */
+							case 0x2122: glyph = 0xAA; break; /* trademark */
+						}
+					}
 				}
 				else
 				{
@@ -716,7 +1117,8 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 				EraseRect(&run_rect);
 				MoveTo(run_rect.left, vertical_offset);
 				TextFace(run_face);
-				DrawText(row_text, run_start_col, run_length);
+				TextFont(kFontIDMonaco);
+				draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
 
 				/* then reset everything to start a new run */
 				run_inverted = vtsc.attrs.reverse ^ (i < select_end && i >= select_start);
@@ -749,7 +1151,8 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 				EraseRect(&run_rect);
 				MoveTo(run_rect.left, vertical_offset);
 				TextFace(run_face);
-				DrawText(row_text, run_start_col, run_length);
+				TextFont(kFontIDMonaco);
+				draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
 			}
 			else
 			{
@@ -761,6 +1164,8 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 
 		vertical_offset += con.cell_height;
 	}
+
+	TextFont(kFontIDMonaco);
 
 	/* do the cursor if needed */
 	if (WC_S(wc).cursor_state && WC_S(wc).cursor_visible)
@@ -864,12 +1269,13 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 
 	char row_text[wc->size_x];
 	char row_invert[wc->size_x];
+	char row_is_symbol[wc->size_x];
 	Rect cr;
 
 	VTermScreenCell here = {0};
 
 	short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	int vertical_offset = r->top + con.cell_height - font_offset + 2 + top_offset;
+	int vertical_offset = r->top + font_ascent + 2 + top_offset;
 
 	for (pos.row = 0; pos.row < wc->size_y; pos.row++)
 	{
@@ -880,13 +1286,23 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 			int ret = get_cell_scrolled(wc, pos.row, pos.col, &here);
 
 			uint32_t glyph = here.chars[0];
+			uint32_t orig_cp = glyph;
+			int sym_code;
 
 			if (glyph == 0) glyph = ' ';
+
+			row_is_symbol[pos.col] = 0;
 
 			// normalize some unicode
 			if (glyph > 127)
 			{
-				if (glyph <= 0xFFFF)
+				sym_code = symbol_font_lookup(orig_cp);
+				if (sym_code >= 0)
+				{
+					glyph = sym_code;
+					row_is_symbol[pos.col] = 1;
+				}
+				else if (glyph <= 0xFFFF)
 				{
 					glyph = UNICODE_BMP_NORMALIZER[glyph];
 				}
@@ -905,7 +1321,8 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 		}
 
 		MoveTo(r->left + 2, vertical_offset);
-		DrawText(row_text, 0, wc->size_x);
+		TextFont(kFontIDMonaco);
+		draw_run_with_symbols(row_text, row_is_symbol, 0, wc->size_x);
 
 		for (int i = 0; i < wc->size_x; i++)
 		{
@@ -1109,13 +1526,15 @@ int settermprop(VTermProp prop, VTermValue *val, void *user)
 	switch (prop)
 	{
 		case VTERM_PROP_TITLE: // string
-			if (wc != NULL && idx == wc->session_ids[wc->active_session_idx])
-				set_window_title(wc->win, val->string.str, val->string.len);
-			// also update tab label
 			{
-				int len = val->string.len < 63 ? val->string.len : 63;
-				strncpy(s->tab_label, val->string.str, len);
-				s->tab_label[len] = '\0';
+				char mr_title[256];
+				int mr_len = utf8_to_macroman(val->string.str, val->string.len, mr_title, sizeof(mr_title));
+				if (wc != NULL && idx == wc->session_ids[wc->active_session_idx])
+					set_window_title(wc->win, mr_title, mr_len);
+				/* also update tab label */
+				if (mr_len > 63) mr_len = 63;
+				strncpy(s->tab_label, mr_title, mr_len);
+				s->tab_label[mr_len] = '\0';
 			}
 			return 1;
 		case VTERM_PROP_CURSORVISIBLE: // bool
@@ -1164,23 +1583,36 @@ static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
 	for (i = 0; i < store_cols; i++)
 	{
 		uint32_t ch = cells[i].chars[0];
+		int is_sym = 0;
 		if (ch == 0) ch = ' ';
-		if (ch > 127) ch = '?';
+		if (ch > 127)
+		{
+			uint32_t orig = ch;
+			int sc = symbol_font_lookup(orig);
+			if (sc >= 0) { ch = sc; is_sym = 1; }
+			else if (ch <= 0xFFFF)
+				ch = UNICODE_BMP_NORMALIZER[ch];
+			else
+				ch = MAC_ROMAN_LOZENGE;
+		}
 		s->scrollback[s->sb_head][i].ch = (unsigned char)ch;
-		s->scrollback[s->sb_head][i].fg = VTERM_COLOR_IS_DEFAULT_FG(&cells[i].fg) ? COLOR_DEFAULT_FG : cells[i].fg.indexed.idx;
-		s->scrollback[s->sb_head][i].bg = VTERM_COLOR_IS_DEFAULT_BG(&cells[i].bg) ? COLOR_DEFAULT_BG : cells[i].bg.indexed.idx;
+		s->scrollback[s->sb_head][i].fg = VTERM_COLOR_IS_DEFAULT_FG(&cells[i].fg) ? 0 : vtcolor_to_byte(&cells[i].fg);
+		s->scrollback[s->sb_head][i].bg = VTERM_COLOR_IS_DEFAULT_BG(&cells[i].bg) ? 0 : vtcolor_to_byte(&cells[i].bg);
 		s->scrollback[s->sb_head][i].attrs =
 			(cells[i].attrs.bold ? 1 : 0) |
 			(cells[i].attrs.reverse ? 2 : 0) |
 			(cells[i].attrs.underline ? 4 : 0) |
-			(cells[i].attrs.italic ? 8 : 0);
+			(cells[i].attrs.italic ? 8 : 0) |
+			(is_sym ? 16 : 0) |
+			(VTERM_COLOR_IS_DEFAULT_FG(&cells[i].fg) ? 32 : 0) |
+			(VTERM_COLOR_IS_DEFAULT_BG(&cells[i].bg) ? 64 : 0);
 	}
 	for (i = store_cols; i < SCROLLBACK_COLS; i++)
 	{
 		s->scrollback[s->sb_head][i].ch = ' ';
-		s->scrollback[s->sb_head][i].fg = COLOR_DEFAULT_FG;
-		s->scrollback[s->sb_head][i].bg = COLOR_DEFAULT_BG;
-		s->scrollback[s->sb_head][i].attrs = 0;
+		s->scrollback[s->sb_head][i].fg = 0;
+		s->scrollback[s->sb_head][i].bg = 0;
+		s->scrollback[s->sb_head][i].attrs = 32 | 64; /* default fg + default bg */
 	}
 
 	s->sb_head = (s->sb_head + 1) % SCROLLBACK_LINES;
@@ -1209,23 +1641,22 @@ static int sb_popline(int cols, VTermScreenCell *cells, void *user)
 	/* convert compact sb_cell back to VTermScreenCell */
 	for (i = 0; i < copy_cols; i++)
 	{
-		unsigned char sfg = s->scrollback[s->sb_head][i].fg;
-		unsigned char sbg = s->scrollback[s->sb_head][i].bg;
+		unsigned char sa = s->scrollback[s->sb_head][i].attrs;
 		memset(&cells[i], 0, sizeof(VTermScreenCell));
 		cells[i].chars[0] = s->scrollback[s->sb_head][i].ch;
 		cells[i].width = 1;
-		if (sfg == COLOR_DEFAULT_FG)
+		if (sa & 32)
 			cells[i].fg.type = VTERM_COLOR_DEFAULT_FG;
 		else
-			vterm_color_indexed(&cells[i].fg, sfg);
-		if (sbg == COLOR_DEFAULT_BG)
+			vterm_color_indexed(&cells[i].fg, s->scrollback[s->sb_head][i].fg);
+		if (sa & 64)
 			cells[i].bg.type = VTERM_COLOR_DEFAULT_BG;
 		else
-			vterm_color_indexed(&cells[i].bg, sbg);
-		cells[i].attrs.bold = (s->scrollback[s->sb_head][i].attrs & 1) ? 1 : 0;
-		cells[i].attrs.reverse = (s->scrollback[s->sb_head][i].attrs & 2) ? 1 : 0;
-		cells[i].attrs.underline = (s->scrollback[s->sb_head][i].attrs & 4) ? 1 : 0;
-		cells[i].attrs.italic = (s->scrollback[s->sb_head][i].attrs & 8) ? 1 : 0;
+			vterm_color_indexed(&cells[i].bg, s->scrollback[s->sb_head][i].bg);
+		cells[i].attrs.bold = (sa & 1) ? 1 : 0;
+		cells[i].attrs.reverse = (sa & 2) ? 1 : 0;
+		cells[i].attrs.underline = (sa & 4) ? 1 : 0;
+		cells[i].attrs.italic = (sa & 8) ? 1 : 0;
 	}
 	for (i = copy_cols; i < cols; i++)
 	{
@@ -1315,7 +1746,7 @@ void font_size_change(struct window_context* wc)
 	GetFontInfo(&fi);
 
 	con.cell_height = fi.ascent + fi.descent + fi.leading + 1;
-	font_offset = fi.descent;
+	font_ascent = fi.ascent;
 
 	con.cell_width = CharWidth(' ');
 
@@ -1447,7 +1878,7 @@ void init_font_metrics(void)
 	GetFontInfo(&fi);
 
 	con.cell_height = fi.ascent + fi.descent + fi.leading + 1;
-	font_offset = fi.descent;
+	font_ascent = fi.ascent;
 	con.cell_width = CharWidth(' ');
 
 	TextFont(save_font);
