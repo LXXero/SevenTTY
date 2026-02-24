@@ -3281,8 +3281,11 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 
 		if (s->thread_state == OPEN && s->endpoint != kOTInvalidEndpointRef)
 		{
-			/* Ctrl+C or Ctrl+D: disconnect */
-			if ((modifiers & controlKey) && (c == 3 || c == 4))
+			/* Ctrl+C or Ctrl+D: disconnect
+			   right-Ctrl via QEMU sends charcode without controlKey modifier,
+			   so also accept bare charcode 3/4 if not numpad Enter or End key */
+			if ((c == 3 || c == 4) &&
+				((modifiers & controlKey) || (vkeycode != 0x4C && vkeycode != 0x77)))
 			{
 				nc_inline_disconnect(session_idx);
 				s->shell_line_len = 0;
@@ -3340,8 +3343,8 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 	if (c == kPageUpCharCode || c == kPageDownCharCode)
 		return;
 
-	/* Ctrl+D: close tab if line is empty (End key is also charCode 4) */
-	if (modifiers & controlKey && c == 4)
+	/* Ctrl+D: close tab if line is empty (End key is also charCode 4 but vkeycode 0x77) */
+	if (c == 4 && ((modifiers & controlKey) || vkeycode != 0x77))
 	{
 		if (s->shell_line_len == 0)
 		{
@@ -3357,8 +3360,9 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 		return;
 	}
 
-	/* Ctrl+C: cancel line (numpad Enter is also charCode 0x03 but without controlKey) */
-	if (modifiers & controlKey && (c == 3 || c == 'c'))
+	/* Ctrl+C: cancel line (numpad Enter is also charCode 0x03 but vkeycode 0x4C) */
+	if ((c == 3 && ((modifiers & controlKey) || vkeycode != 0x4C)) ||
+		(modifiers & controlKey && c == 'c'))
 	{
 		vt_write(session_idx, "^C\r\n");
 		s->shell_line_len = 0;

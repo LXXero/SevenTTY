@@ -20,15 +20,25 @@ void ssh_write_s(int session_idx, char* buf, size_t len)
 {
 	struct session* s = &sessions[session_idx];
 
-	if (s->thread_state == OPEN && s->thread_command != EXIT)
+	while (len > 0 && s->thread_state == OPEN && s->thread_command != EXIT)
 	{
 		int r = libssh2_channel_write(s->channel, buf, len);
+
+		if (r == LIBSSH2_ERROR_EAGAIN)
+		{
+			YieldToAnyThread();
+			continue;
+		}
 
 		if (r < 1)
 		{
 			printf_s(session_idx, "Failed to write to channel, closing connection.\r\n");
 			s->thread_command = EXIT;
+			return;
 		}
+
+		buf += r;
+		len -= r;
 	}
 }
 

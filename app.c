@@ -1876,9 +1876,13 @@ void event_loop(void)
 						if (n > 0 && sessions[sid].thread_state == OPEN)
 							session_write(sid, outbuf, n);
 
-						/* restore callback */
-						vterm_output_set_callback(sessions[sid].vterm,
-							output_callback, (void*)(intptr_t)sid);
+						/* restore the correct callback for session type */
+						if (sessions[sid].type == SESSION_SSH)
+							vterm_output_set_callback(sessions[sid].vterm,
+								output_callback, (void*)(intptr_t)sid);
+						else if (sessions[sid].type == SESSION_TELNET)
+							vterm_output_set_callback(sessions[sid].vterm,
+								tcp_output_callback, (void*)(intptr_t)sid);
 					}
 				}
 				break;
