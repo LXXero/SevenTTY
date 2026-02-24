@@ -3268,21 +3268,12 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 	{
 		if (s->thread_state == DONE || s->thread_command == EXIT)
 		{
-			/* connection finished, failed, or disconnect in progress.
-			   Force cleanup — thread will check for NULL before freeing. */
+			/* connection finished, failed, or disconnect in progress */
 			nc_inline_disconnect(session_idx);
-			if (s->recv_buffer != NULL)
-			{
-				OTFreeMem(s->recv_buffer);
-				s->recv_buffer = NULL;
-			}
-			if (s->send_buffer != NULL)
-			{
-				OTFreeMem(s->send_buffer);
-				s->send_buffer = NULL;
-			}
-			s->thread_state = UNINITIALIZED;
-			s->thread_command = WAIT;
+			if (s->thread_state != UNINITIALIZED ||
+				s->recv_buffer != NULL ||
+				s->send_buffer != NULL)
+				return;
 			vt_write(session_idx, "\r\n(connection closed)\r\n");
 			shell_prompt(session_idx);
 			return;

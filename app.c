@@ -966,12 +966,62 @@ void init_session(struct session* s)
 	s->telnet_sb_len = 0;
 	s->thread_command = WAIT;
 	s->thread_state = UNINITIALIZED;
+	s->thread_id = kNoThreadID;
 	s->shell_vRefNum = 0;
 	s->shell_dirID = 0;
 	s->shell_line[0] = '\0';
 	s->shell_line_len = 0;
 	s->shell_cursor_pos = 0;
 	s->window_id = -1;
+}
+
+int session_reap_thread(int session_idx, int force_stop)
+{
+	struct session* s;
+	OSErr err = noErr;
+	ThreadID current = kNoThreadID;
+	ThreadState state = kReadyThreadState;
+	void* thread_result = NULL;
+
+	if (session_idx < 0 || session_idx >= MAX_SESSIONS) return 0;
+	s = &sessions[session_idx];
+	if (s->thread_id == kNoThreadID) return 1;
+
+	/* Never try to dispose the currently-running thread. */
+	err = MacGetCurrentThread(&current);
+	if (err == noErr && current == s->thread_id) return 0;
+
+	err = GetThreadState(s->thread_id, &state);
+	if (err == threadNotFoundErr)
+	{
+		s->thread_id = kNoThreadID;
+		if (s->thread_state != UNINITIALIZED)
+			s->thread_state = DONE;
+		return 1;
+	}
+	if (err != noErr) return 0;
+
+	if (!force_stop && state != kStoppedThreadState) return 0;
+
+	if (force_stop && state != kStoppedThreadState)
+	{
+		SetThreadState(s->thread_id, kStoppedThreadState, kNoThreadID);
+		YieldToAnyThread();
+
+		err = GetThreadState(s->thread_id, &state);
+		if (err != noErr || state != kStoppedThreadState) return 0;
+	}
+
+	err = DisposeThread(s->thread_id, &thread_result, true);
+	if (err == noErr || err == threadNotFoundErr)
+	{
+		s->thread_id = kNoThreadID;
+		if (s->thread_state != UNINITIALIZED)
+			s->thread_state = DONE;
+		return 1;
+	}
+
+	return 0;
 }
 
 /* adjust window size when tab bar appears/disappears, keeping terminal rows the same */
@@ -1040,7 +1090,8 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	for (i = 0; i < MAX_SESSIONS; i++)
 	{
 		if (!sessions[i].in_use &&
-			sessions[i].thread_state == DONE)
+			sessions[i].thread_state == DONE &&
+			sessions[i].thread_id == kNoThreadID)
 		{
 			idx = i;
 			break;
@@ -1110,9 +1161,11 @@ void close_session(int idx)
 	if (wc->num_sessions <= 1) return; // don't close the last session in a window
 
 	// disconnect networked sessions (waits for thread to reach DONE)
-	if (sessions[idx].type == SESSION_SSH && sessions[idx].thread_state != DONE)
+	if (sessions[idx].type == SESSION_SSH &&
+		(sessions[idx].thread_state != DONE || sessions[idx].thread_id != kNoThreadID))
 		ssh_disconnect(idx);
-	else if (sessions[idx].type == SESSION_TELNET && sessions[idx].thread_state != DONE)
+	else if (sessions[idx].type == SESSION_TELNET &&
+		(sessions[idx].thread_state != DONE || sessions[idx].thread_id != kNoThreadID))
 		telnet_disconnect(idx);
 
 	// null out vterm callbacks to prevent use during teardown
@@ -1125,11 +1178,16 @@ void close_session(int idx)
 
 	/* local sessions have no thread — safe to mark DONE for slot reuse */
 	if (sessions[idx].type == SESSION_LOCAL)
+	{
 		sessions[idx].thread_state = DONE;
+		sessions[idx].thread_id = kNoThreadID;
+	}
 
 	/* free vterm only if thread is confirmed done;
 	   if thread timed out, leak rather than use-after-free */
-	if (sessions[idx].vterm != NULL && sessions[idx].thread_state == DONE)
+	if (sessions[idx].vterm != NULL &&
+		sessions[idx].thread_state == DONE &&
+		sessions[idx].thread_id == kNoThreadID)
 	{
 		vterm_free(sessions[idx].vterm);
 		sessions[idx].vterm = NULL;
@@ -1299,9 +1357,11 @@ void close_window(int wid)
 		int sid = wc->session_ids[0];
 
 		// disconnect networked sessions (waits for thread to reach DONE)
-		if (sessions[sid].type == SESSION_SSH && sessions[sid].thread_state != DONE)
+		if (sessions[sid].type == SESSION_SSH &&
+			(sessions[sid].thread_state != DONE || sessions[sid].thread_id != kNoThreadID))
 			ssh_disconnect(sid);
-		else if (sessions[sid].type == SESSION_TELNET && sessions[sid].thread_state != DONE)
+		else if (sessions[sid].type == SESSION_TELNET &&
+			(sessions[sid].thread_state != DONE || sessions[sid].thread_id != kNoThreadID))
 			telnet_disconnect(sid);
 
 		// null out vterm callbacks to prevent use during teardown
@@ -1314,10 +1374,15 @@ void close_window(int wid)
 
 		/* local sessions have no thread — safe to mark DONE for slot reuse */
 		if (sessions[sid].type == SESSION_LOCAL)
+		{
 			sessions[sid].thread_state = DONE;
+			sessions[sid].thread_id = kNoThreadID;
+		}
 
 		/* free vterm only if thread is confirmed done */
-		if (sessions[sid].vterm != NULL && sessions[sid].thread_state == DONE)
+		if (sessions[sid].vterm != NULL &&
+			sessions[sid].thread_state == DONE &&
+			sessions[sid].thread_id == kNoThreadID)
 		{
 			vterm_free(sessions[sid].vterm);
 			sessions[sid].vterm = NULL;
@@ -1667,6 +1732,44 @@ int handle_keypress(EventRecord* event)
 	return 0;
 }
 
+static void reap_detached_sessions(void)
+{
+	int i;
+	for (i = 0; i < MAX_SESSIONS; i++)
+	{
+		struct session* s = &sessions[i];
+
+		if (s->in_use) continue;
+
+		if (s->thread_id != kNoThreadID)
+		{
+			if (s->thread_state == DONE)
+				session_reap_thread(i, 0);
+			else if (s->thread_command == EXIT)
+				session_reap_thread(i, 1);
+		}
+
+		if (s->thread_state == DONE && s->thread_id == kNoThreadID)
+		{
+			if (s->recv_buffer != NULL)
+			{
+				OTFreeMem(s->recv_buffer);
+				s->recv_buffer = NULL;
+			}
+			if (s->send_buffer != NULL)
+			{
+				OTFreeMem(s->send_buffer);
+				s->send_buffer = NULL;
+			}
+			if (s->vterm != NULL)
+			{
+				vterm_free(s->vterm);
+				s->vterm = NULL;
+			}
+		}
+	}
+}
+
 void event_loop(void)
 {
 	int exit_event_loop = 0;
@@ -1684,6 +1787,7 @@ void event_loop(void)
 		while (!WaitNextEvent(everyEvent, &event, sleep_time, NULL))
 		{
 			YieldToAnyThread();
+			reap_detached_sessions();
 
 			// iterate all windows for idle tasks
 			int i;
@@ -1825,6 +1929,7 @@ void event_loop(void)
 		}
 
 		YieldToAnyThread();
+		reap_detached_sessions();
 	} while (!exit_event_loop && !exit_requested);
 }
 
@@ -2343,6 +2448,17 @@ int ssh_connect(int session_idx)
 
 	ok = safety_checks();
 
+	/* If a previous worker finished, dispose it before spawning another. */
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(session_idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			printf_s(session_idx, "Previous worker thread could not be reclaimed.\r\n");
+			return 0;
+		}
+	}
+
 	// reset the console if we have any crap from earlier
 	if (wc != NULL && s->thread_state == DONE) reset_console(wc, session_idx);
 
@@ -2392,6 +2508,10 @@ int ssh_connect(int session_idx)
 			printf_s(session_idx, "Failed to create network read thread.\r\n");
 			ok = 0;
 		}
+		else
+		{
+			s->thread_id = read_thread_id;
+		}
 	}
 
 	// if we got the thread, tell it to begin operation
@@ -2419,6 +2539,7 @@ int ssh_connect(int session_idx)
 		/* no thread was created — mark DONE so ssh_disconnect
 		   won't wait 5s for a thread that doesn't exist */
 		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
 	}
 
 	return ok;
@@ -2457,9 +2578,17 @@ void ssh_disconnect(int session_idx)
 		}
 	}
 
+	if (s->thread_id != kNoThreadID)
+	{
+		if (!session_reap_thread(session_idx, 0))
+			session_reap_thread(session_idx, 1);
+		if (s->thread_id != kNoThreadID)
+			printf_s(session_idx, "Warning: worker thread could not be reclaimed.\r\n");
+	}
+
 	/* only free buffers if thread actually finished — if it timed out
 	   the thread may still be using them; leak rather than use-after-free */
-	if (s->thread_state == DONE)
+	if (s->thread_state == DONE && s->thread_id == kNoThreadID)
 	{
 		if (s->recv_buffer != NULL)
 		{
@@ -2497,7 +2626,10 @@ int main(int argc, char** argv)
 	{
 		int i;
 		for (i = 0; i < MAX_SESSIONS; i++)
+		{
 			sessions[i].thread_state = DONE;
+			sessions[i].thread_id = kNoThreadID;
+		}
 	}
 
 	// expands the application heap to its maximum requested size

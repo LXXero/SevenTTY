@@ -13,6 +13,7 @@
 #include <StandardFile.h>
 #include <Folders.h>
 #include <Quickdraw.h>
+#include <Threads.h>
 
 #define COLOR_FROM_THEME -1
 
@@ -85,6 +86,7 @@ struct session
 	// thread state
 	enum THREAD_COMMAND thread_command;
 	enum THREAD_STATE thread_state;
+	ThreadID thread_id;
 
 	// local shell state (SESSION_LOCAL only)
 	short shell_vRefNum;
@@ -207,6 +209,7 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type);
 void close_session(int idx);
 void switch_session(struct window_context* wc, int idx);
 void init_session(struct session* s);
+int session_reap_thread(int session_idx, int force_stop);
 
 // window management
 int new_window(void);

@@ -745,6 +745,17 @@ int telnet_connect(int session_idx)
 	OSStatus err = noErr;
 	ThreadID tid = 0;
 
+	/* If a previous worker finished, dispose it before spawning another. */
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(session_idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			printf_s(session_idx, "Previous worker thread could not be reclaimed.\r\n");
+			return 0;
+		}
+	}
+
 	if (InitOpenTransport() != noErr)
 	{
 		printf_s(session_idx, "Failed to initialize Open Transport.\r\n");
@@ -775,6 +786,7 @@ int telnet_connect(int session_idx)
 		printf_s(session_idx, "Failed to create read thread.\r\n");
 		return 0;
 	}
+	s->thread_id = tid;
 
 	s->thread_command = READ;
 	s->type = SESSION_TELNET;
@@ -824,8 +836,17 @@ void telnet_disconnect(int session_idx)
 		}
 	}
 
+	if (s->thread_id != kNoThreadID)
+	{
+		if (!session_reap_thread(session_idx, 0))
+			session_reap_thread(session_idx, 1);
+		if (s->thread_id != kNoThreadID)
+			printf_s(session_idx, "Warning: worker thread could not be reclaimed.\r\n");
+	}
+
 	/* only free buffers if thread is done; otherwise thread owns them */
-	if (s->thread_state == DONE || s->thread_state == UNINITIALIZED)
+	if ((s->thread_state == DONE && s->thread_id == kNoThreadID) ||
+		s->thread_state == UNINITIALIZED)
 	{
 		if (s->recv_buffer != NULL)
 		{
@@ -865,6 +886,17 @@ int nc_inline_connect(int session_idx)
 	OSStatus err = noErr;
 	ThreadID tid = 0;
 
+	/* If a previous worker finished, dispose it before spawning another. */
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(session_idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			printf_s(session_idx, "Previous worker thread could not be reclaimed.\r\n");
+			return 0;
+		}
+	}
+
 	if (InitOpenTransport() != noErr)
 	{
 		printf_s(session_idx, "Failed to initialize Open Transport.\r\n");
@@ -893,6 +925,7 @@ int nc_inline_connect(int session_idx)
 		printf_s(session_idx, "Failed to create read thread.\r\n");
 		return 0;
 	}
+	s->thread_id = tid;
 
 	s->thread_command = READ;
 	return 1;
@@ -922,10 +955,19 @@ void nc_inline_disconnect(int session_idx)
 		}
 	}
 
+	if (s->thread_id != kNoThreadID)
+	{
+		if (!session_reap_thread(session_idx, 0))
+			session_reap_thread(session_idx, 1);
+		if (s->thread_id != kNoThreadID)
+			printf_s(session_idx, "Warning: worker thread could not be reclaimed.\r\n");
+	}
+
 	/* only free buffers if thread is done; otherwise thread owns them.
 	   If thread is still running, DON'T reset state — let the thread
 	   finish and set DONE, then shell_input's DONE check will clean up. */
-	if (s->thread_state == DONE || s->thread_state == UNINITIALIZED)
+	if ((s->thread_state == DONE && s->thread_id == kNoThreadID) ||
+		s->thread_state == UNINITIALIZED)
 	{
 		if (s->recv_buffer != NULL)
 		{
