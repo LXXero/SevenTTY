@@ -18,7 +18,9 @@ features
 * **SSH client**: password and public key authentication, known hosts verification
 * **Scrollback**: Shift+Page Up/Down to scroll through history (100 lines per session)
 * **Copy/paste**: mouse text selection with Cmd+C/V
-* **16-color terminal**: xterm-compatible with bold, italic, underline, reverse video
+* **Telnet & raw TCP**: `telnet host [port]` opens in a new tab; `nc host port` for raw TCP inline
+* **256-color & true-color**: xterm-256color with RGB support via Color QuickDraw, bold, italic, underline, reverse video
+* **Symbol font**: custom bitmap font for box drawing, block elements, shading, and geometric shapes — seamless rendering at all font sizes
 * **Color themes**: load iTerm2-compatible `.sttheme` files, or use built-in Dark (Tango) and Light palettes
 * **Configurable**: font size, display mode (color/monochrome), foreground/background colors, prompt color, terminal type string
 
@@ -46,7 +48,7 @@ keyboard shortcuts
 
 color themes
 ------------
-SevenTTY supports custom 16-color palettes via `.sttheme` files. Use the **Preferences → Theme...** button to load a theme, or select the built-in **Dark** (Tango palette) or **Light** modes.
+SevenTTY supports custom color palettes via `.sttheme` files (16 ANSI colors plus background, foreground, and cursor). Use the **Preferences → Theme...** button to load a theme, or select the built-in **Dark** (Tango palette) or **Light** modes.
 
 To convert an iTerm2 color scheme:
 
