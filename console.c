@@ -729,7 +729,8 @@ size_t get_selection(struct window_context* wc, char** selection)
 
 	ssize_t len = MAX(a,b) - MIN(a,b) + 1;
 
-	char* output = malloc(sizeof(char) * len);
+	char* output = malloc(len + 1);
+	if (output == NULL) { *selection = NULL; return 0; }
 
 	int start_row = MIN(WC_S(wc).select_start_y, WC_S(wc).select_end_y);
 	int start_col = MIN(WC_S(wc).select_start_x, WC_S(wc).select_end_x);
@@ -747,7 +748,7 @@ size_t get_selection(struct window_context* wc, char** selection)
 		output[i] = (char)vtsc.chars[0];
 	}
 
-	output[len-1] = '\0';
+	output[len] = '\0';
 
 	*selection = output;
 
@@ -1463,6 +1464,7 @@ void printf_i(const char* str, ...)
 
 void printf_s(int session_idx, const char* str, ...)
 {
+	if (sessions[session_idx].vterm == NULL) return;
 	va_list args;
 	va_start(args, str);
 	vprintf_to_vterm(sessions[session_idx].vterm, str, args);

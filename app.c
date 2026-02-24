@@ -694,6 +694,8 @@ void ssh_copy(void)
 
 	e = PutScrap(len, 'TEXT', selection);
 	if (e != noErr) printf_i("Failed to PutScrap!");
+
+	free(selection);
 }
 
 int qd_color_to_menu_item(int qd_color)
@@ -1037,7 +1039,8 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	int i;
 	for (i = 0; i < MAX_SESSIONS; i++)
 	{
-		if (!sessions[i].in_use)
+		if (!sessions[i].in_use &&
+			sessions[i].thread_state == DONE)
 		{
 			idx = i;
 			break;
@@ -1106,31 +1109,27 @@ void close_session(int idx)
 	if (wc == NULL) return;
 	if (wc->num_sessions <= 1) return; // don't close the last session in a window
 
-	// disconnect if networked and still connected
-	// skip if thread_command is already EXIT (disconnect already in progress)
-	if (sessions[idx].thread_state != DONE &&
-		sessions[idx].thread_state != UNINITIALIZED &&
-		sessions[idx].thread_command != EXIT)
-	{
-		if (sessions[idx].type == SESSION_SSH)
-			ssh_disconnect(idx);
-		else if (sessions[idx].type == SESSION_TELNET)
-			telnet_disconnect(idx);
-	}
+	// disconnect networked sessions (waits for thread to reach DONE)
+	if (sessions[idx].type == SESSION_SSH && sessions[idx].thread_state != DONE)
+		ssh_disconnect(idx);
+	else if (sessions[idx].type == SESSION_TELNET && sessions[idx].thread_state != DONE)
+		telnet_disconnect(idx);
 
-	// null out vterm callbacks before freeing to prevent damage
-	// callbacks from accessing the window during teardown
+	// null out vterm callbacks to prevent use during teardown
 	if (sessions[idx].vterm != NULL)
 	{
 		VTermScreen* vts = vterm_obtain_screen(sessions[idx].vterm);
 		vterm_screen_set_callbacks(vts, NULL, NULL);
+		vterm_output_set_callback(sessions[idx].vterm, NULL, NULL);
 	}
 
-	/* free vterm if thread is done or session is local (no thread) */
-	if (sessions[idx].vterm != NULL &&
-		(sessions[idx].thread_state == DONE ||
-		 sessions[idx].thread_state == UNINITIALIZED ||
-		 sessions[idx].type == SESSION_LOCAL))
+	/* local sessions have no thread — safe to mark DONE for slot reuse */
+	if (sessions[idx].type == SESSION_LOCAL)
+		sessions[idx].thread_state = DONE;
+
+	/* free vterm only if thread is confirmed done;
+	   if thread timed out, leak rather than use-after-free */
+	if (sessions[idx].vterm != NULL && sessions[idx].thread_state == DONE)
 	{
 		vterm_free(sessions[idx].vterm);
 		sessions[idx].vterm = NULL;
@@ -1299,26 +1298,26 @@ void close_window(int wid)
 	{
 		int sid = wc->session_ids[0];
 
-		// disconnect SSH if needed
-		if (sessions[sid].type == SESSION_SSH &&
-			sessions[sid].thread_state != DONE &&
-			sessions[sid].thread_state != UNINITIALIZED)
-		{
+		// disconnect networked sessions (waits for thread to reach DONE)
+		if (sessions[sid].type == SESSION_SSH && sessions[sid].thread_state != DONE)
 			ssh_disconnect(sid);
-		}
+		else if (sessions[sid].type == SESSION_TELNET && sessions[sid].thread_state != DONE)
+			telnet_disconnect(sid);
 
-		// null out vterm callbacks
+		// null out vterm callbacks to prevent use during teardown
 		if (sessions[sid].vterm != NULL)
 		{
 			VTermScreen* vts = vterm_obtain_screen(sessions[sid].vterm);
 			vterm_screen_set_callbacks(vts, NULL, NULL);
+			vterm_output_set_callback(sessions[sid].vterm, NULL, NULL);
 		}
 
-		// free vterm
-		if (sessions[sid].vterm != NULL &&
-			(sessions[sid].thread_state == DONE ||
-			 sessions[sid].thread_state == UNINITIALIZED ||
-			 sessions[sid].type == SESSION_LOCAL))
+		/* local sessions have no thread — safe to mark DONE for slot reuse */
+		if (sessions[sid].type == SESSION_LOCAL)
+			sessions[sid].thread_state = DONE;
+
+		/* free vterm only if thread is confirmed done */
+		if (sessions[sid].vterm != NULL && sessions[sid].thread_state == DONE)
 		{
 			vterm_free(sessions[sid].vterm);
 			sessions[sid].vterm = NULL;
@@ -1577,7 +1576,7 @@ int handle_keypress(EventRecord* event)
 		// for local shell sessions, keypresses go to shell handler
 		if (sessions[sid].type == SESSION_LOCAL)
 		{
-			shell_input(sid, c, event->modifiers);
+			shell_input(sid, c, event->modifiers, (event->message & keyCodeMask) >> 8);
 			return 0;
 		}
 
@@ -1613,13 +1612,18 @@ int handle_keypress(EventRecord* event)
 			uint8_t unmodified_key = keycode_to_ascii[(event->message & keyCodeMask)>>8];
 			uint8_t vkeycode = (event->message & keyCodeMask) >> 8;
 
+			/* numpad Enter (vkeycode 0x4C): treat as Return */
+			if (vkeycode == 0x4C)
+			{
+				sessions[sid].send_buffer[0] = '\r';
+				session_write(sid, sessions[sid].send_buffer, 1);
+			}
 			/* right-Ctrl+key: QEMU sends charcode as control code but no
 			   controlKey modifier.  Detect by checking that the virtual
 			   keycode maps to a letter (not numpad Enter 0x4C) and the
 			   charcode is a control code (< 32). */
-			if (!(event->modifiers & controlKey) &&
+			else if (!(event->modifiers & controlKey) &&
 			    c < 32 && c != '\r' && c != '\t' && c != '\033' &&
-			    vkeycode != 0x4C &&  /* numpad Enter */
 			    ascii_to_control_code[unmodified_key] == c)
 			{
 				sessions[sid].send_buffer[0] = c;
@@ -2042,13 +2046,17 @@ int key_dialog(void)
 		NoteAlert(ALRT_PUBKEY, nil);
 		StandardFileReply pubkey;
 		StandardGetFile(NULL, 0, NULL, &pubkey);
-		FSpPathFromLocation(&pubkey.sfFile, &path_length, &full_path);
+		if (!pubkey.sfGood) return 0;
+		if (FSpPathFromLocation(&pubkey.sfFile, &path_length, &full_path) != noErr
+			|| full_path == NULL || path_length <= 0)
+		{
+			if (full_path != NULL) DisposeHandle(full_path);
+			return 0;
+		}
 		prefs.pubkey_path = malloc(path_length+1);
+		if (prefs.pubkey_path == NULL) { DisposeHandle(full_path); return 0; }
 		strncpy(prefs.pubkey_path, (char*)(*full_path), path_length+1);
 		DisposeHandle(full_path);
-
-		// if the user hit cancel, 0
-		if (!pubkey.sfGood) return 0;
 	}
 
 	path_length = 0;
@@ -2060,13 +2068,17 @@ int key_dialog(void)
 		NoteAlert(ALRT_PRIVKEY, nil);
 		StandardFileReply privkey;
 		StandardGetFile(NULL, 0, NULL, &privkey);
-		FSpPathFromLocation(&privkey.sfFile, &path_length, &full_path);
+		if (!privkey.sfGood) return 0;
+		if (FSpPathFromLocation(&privkey.sfFile, &path_length, &full_path) != noErr
+			|| full_path == NULL || path_length <= 0)
+		{
+			if (full_path != NULL) DisposeHandle(full_path);
+			return 0;
+		}
 		prefs.privkey_path = malloc(path_length+1);
+		if (prefs.privkey_path == NULL) { DisposeHandle(full_path); return 0; }
 		strncpy(prefs.privkey_path, (char*)(*full_path), path_length+1);
 		DisposeHandle(full_path);
-
-		// if the user hit cancel, 0
-		if (!privkey.sfGood) return 0;
 	}
 
 	// get the key decryption password
@@ -2199,6 +2211,8 @@ int intro_dialog(void)
 	{
 		int hlen = (unsigned char)prefs.hostname[0];
 		int plen = (unsigned char)prefs.port[0];
+		if (hlen + 2 + plen >= (int)sizeof(prefs.hostname))
+			plen = sizeof(prefs.hostname) - hlen - 3;
 		prefs.hostname[hlen + 1] = ':';
 		memcpy(prefs.hostname + hlen + 2, prefs.port + 1, plen);
 		prefs.hostname[hlen + 2 + plen] = '\0';
@@ -2400,6 +2414,12 @@ int ssh_connect(int session_idx)
 		DisableItem(menu, FMENU_CONNECT);
 		EnableItem(menu, FMENU_DISCONNECT);
 	}
+	else if (read_thread_id == 0)
+	{
+		/* no thread was created — mark DONE so ssh_disconnect
+		   won't wait 5s for a thread that doesn't exist */
+		s->thread_state = DONE;
+	}
 
 	return ok;
 }
@@ -2412,7 +2432,7 @@ void ssh_disconnect(int session_idx)
 	// tell the read thread to finish, then let it run to actually do so
 	s->thread_command = EXIT;
 
-	if (s->thread_state != UNINITIALIZED && s->thread_state != DONE)
+	if (s->thread_state != DONE)
 	{
 		// force-break any stuck OT calls
 		if (s->endpoint != kOTInvalidEndpointRef)
@@ -2425,7 +2445,7 @@ void ssh_disconnect(int session_idx)
 			long timeout = TickCount() + 300;
 			while (s->thread_state != DONE && TickCount() < timeout)
 			{
-				if (wc != NULL)
+				if (wc != NULL && wc->win != NULL)
 				{
 					SetPort(wc->win);
 					BeginUpdate(wc->win);
@@ -2437,15 +2457,20 @@ void ssh_disconnect(int session_idx)
 		}
 	}
 
-	if (s->recv_buffer != NULL)
+	/* only free buffers if thread actually finished — if it timed out
+	   the thread may still be using them; leak rather than use-after-free */
+	if (s->thread_state == DONE)
 	{
-		OTFreeMem(s->recv_buffer);
-		s->recv_buffer = NULL;
-	}
-	if (s->send_buffer != NULL)
-	{
-		OTFreeMem(s->send_buffer);
-		s->send_buffer = NULL;
+		if (s->recv_buffer != NULL)
+		{
+			OTFreeMem(s->recv_buffer);
+			s->recv_buffer = NULL;
+		}
+		if (s->send_buffer != NULL)
+		{
+			OTFreeMem(s->send_buffer);
+			s->send_buffer = NULL;
+		}
 	}
 
 	// update tab label
@@ -2468,6 +2493,13 @@ void ssh_disconnect(int session_idx)
 
 int main(int argc, char** argv)
 {
+	// mark all session slots as safe to reuse (no thread running)
+	{
+		int i;
+		for (i = 0; i < MAX_SESSIONS; i++)
+			sessions[i].thread_state = DONE;
+	}
+
 	// expands the application heap to its maximum requested size
 	// supposedly good for performance
 	// also required before creating threads!

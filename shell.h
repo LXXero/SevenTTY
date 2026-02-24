@@ -8,5 +8,5 @@
 #pragma once
 
 void shell_init(int session_idx);
-void shell_input(int session_idx, unsigned char c, int modifiers);
+void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char vkeycode);
 void shell_prompt(int idx);

@@ -55,9 +55,11 @@ void ssh_read(int session_idx)
 		}
 	}
 
-	while (rc > 0)
+	while (rc > 0 && s->vterm != NULL)
 	{
-		rc -= vterm_input_write(s->vterm, s->recv_buffer, rc);
+		size_t written = vterm_input_write(s->vterm, s->recv_buffer, rc);
+		if (written == 0) break;
+		rc -= written;
 	}
 }
 
@@ -219,6 +221,12 @@ char* host_hash(int session_idx)
 	const char* host_key_hash = NULL;
 
 	host_key_hash = libssh2_hostkey_hash(s->ssh_session, LIBSSH2_HOSTKEY_HASH_SHA256);
+	if (host_key_hash == NULL)
+	{
+		human_readable[0] = 7;
+		memcpy(human_readable+1, "unknown", 7);
+		return human_readable;
+	}
 	mbedtls_base64_encode((unsigned char*)human_readable+1, 64, &length, (unsigned const char*)host_key_hash, 32);
 
 	human_readable[0] = (unsigned char)length;
@@ -248,20 +256,35 @@ char* known_hosts_full_path(int* found)
 
 		// if the file exists, we found it else make an empty one
 		if (e == noErr) *found = 1;
-		else if (e == noErr) e = FSpCreate(&known_hosts_file, creator_type, pref_type, smSystemScript);
+		else if (e == fnfErr) e = FSpCreate(&known_hosts_file, creator_type, pref_type, smSystemScript);
 
 		if (e != noErr) ok = 0;
 	}
 
-	Handle full_path_handle;
-	int path_length;
+	if (ok)
+	{
+		Handle full_path_handle = NULL;
+		int path_length = 0;
+		OSErr pe = FSpPathFromLocation(&known_hosts_file, &path_length, &full_path_handle);
+		if (pe == noErr && full_path_handle != NULL && path_length > 0)
+		{
+			char* full_path = malloc(path_length+1);
+			if (full_path != NULL)
+			{
+				strncpy(full_path, (char*)(*full_path_handle), path_length+1);
+				DisposeHandle(full_path_handle);
+				return full_path;
+			}
+			DisposeHandle(full_path_handle);
+		}
+		else if (full_path_handle != NULL)
+		{
+			DisposeHandle(full_path_handle);
+		}
+	}
 
-	FSpPathFromLocation(&known_hosts_file, &path_length, &full_path_handle);
-	char* full_path = malloc(path_length+1);
-	strncpy(full_path, (char*)(*full_path_handle), path_length+1);
-	DisposeHandle(full_path_handle);
-
-	return full_path;
+	*found = 0;
+	return NULL;
 }
 
 int known_hosts(int session_idx)
@@ -280,7 +303,7 @@ int known_hosts(int session_idx)
 
 	LIBSSH2_KNOWNHOSTS* kh = libssh2_knownhost_init(s->ssh_session);
 
-	if (known_hosts_file_exists)
+	if (known_hosts_file_exists && known_hosts_file_path != NULL)
 	{
 		// load known hosts file
 
@@ -365,6 +388,8 @@ int known_hosts(int session_idx)
 		DisposeDialog(dlg);
 		FlushEvents(everyEvent, -1);
 
+		if (!safe_to_connect) goto kh_done;
+
 		printf_s(session_idx, "Saving host and key... ");
 
 		int save_type = 0;
@@ -404,6 +429,8 @@ int known_hosts(int session_idx)
 		prefs.hostname[prefs.hostname[0]+1] = ':';
 
 		if (e != 0) printf_s(session_idx, "failed to add to known hosts: %s\r\n", libssh2_error_string(e));
+		else if (known_hosts_file_path == NULL)
+			printf_s(session_idx, "failed to resolve known hosts file path.\r\n");
 		else
 		{
 			e = libssh2_knownhost_writefile(kh, known_hosts_file_path, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
@@ -412,6 +439,7 @@ int known_hosts(int session_idx)
 		}
 	}
 
+kh_done:
 	free(hash_string);
 
 	libssh2_knownhost_free(kh);
@@ -572,6 +600,7 @@ void* read_thread(void* arg)
 
 	if (s->thread_command == EXIT)
 	{
+		s->thread_state = DONE;
 		return 0;
 	}
 

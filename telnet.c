@@ -755,6 +755,8 @@ int telnet_connect(int session_idx)
 	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
 	if (s->recv_buffer == NULL || s->send_buffer == NULL)
 	{
+		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
+		if (s->send_buffer) { OTFreeMem(s->send_buffer); s->send_buffer = NULL; }
 		printf_s(session_idx, "Failed to allocate buffers.\r\n");
 		return 0;
 	}
@@ -768,6 +770,8 @@ int telnet_connect(int session_idx)
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
 		printf_s(session_idx, "Failed to create read thread.\r\n");
 		return 0;
 	}
@@ -871,6 +875,8 @@ int nc_inline_connect(int session_idx)
 	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
 	if (s->recv_buffer == NULL || s->send_buffer == NULL)
 	{
+		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
+		if (s->send_buffer) { OTFreeMem(s->send_buffer); s->send_buffer = NULL; }
 		printf_s(session_idx, "Failed to allocate buffers.\r\n");
 		return 0;
 	}
@@ -882,6 +888,8 @@ int nc_inline_connect(int session_idx)
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
 		printf_s(session_idx, "Failed to create read thread.\r\n");
 		return 0;
 	}

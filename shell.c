@@ -3259,7 +3259,7 @@ void shell_init(int session_idx)
 	shell_prompt(session_idx);
 }
 
-void shell_input(int session_idx, unsigned char c, int modifiers)
+void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char vkeycode)
 {
 	struct session* s = &sessions[session_idx];
 
@@ -3300,18 +3300,8 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 				shell_prompt(session_idx);
 				return;
 			}
-			/* also catch right-ctrl / bare 0x03 or 0x04 as disconnect */
-			if (c == 3 || c == 4)
-			{
-				nc_inline_disconnect(session_idx);
-				s->shell_line_len = 0;
-				s->shell_line[0] = '\0';
-				vt_write(session_idx, "\r\n(disconnected)\r\n");
-				shell_prompt(session_idx);
-				return;
-			}
-			/* Enter: send buffered line + LF */
-			if (c == '\r')
+			/* Enter or numpad Enter (vkeycode 0x4C): send buffered line + LF */
+			if (c == '\r' || vkeycode == 0x4C)
 			{
 				int i;
 				vt_write(session_idx, "\r\n");
@@ -3565,8 +3555,8 @@ void shell_input(int session_idx, unsigned char c, int modifiers)
 		return;
 	}
 
-	/* Enter / Return */
-	if (c == kReturnCharCode || c == kEnterCharCode)
+	/* Enter / Return / numpad Enter (vkeycode 0x4C) */
+	if (c == kReturnCharCode || vkeycode == 0x4C)
 	{
 		vt_write(session_idx, "\r\n");
 
