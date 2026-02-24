@@ -38,3 +38,5 @@ void setup_session_vterm(struct window_context* wc, int session_idx);
 void scroll_up(struct window_context* wc);
 void scroll_down(struct window_context* wc);
 void scroll_reset(struct window_context* wc);
+
+void output_callback(const char *s, size_t len, void *user);

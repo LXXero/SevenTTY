@@ -1836,8 +1836,51 @@ void event_loop(void)
 				break;
 
 			case keyDown:
-			case autoKey: // autokey means we're repeating a held down key event
-				exit_event_loop = handle_keypress(&event);
+			case autoKey: /* autokey means we're repeating a held down key event */
+				{
+					int sid = active_session_global();
+					int is_net = (sid >= 0 &&
+						(sessions[sid].type == SESSION_SSH ||
+						 sessions[sid].type == SESSION_TELNET) &&
+						sessions[sid].vterm != NULL &&
+						sessions[sid].thread_state == OPEN);
+
+					/* null vterm output callback so output buffers internally */
+					if (is_net)
+						vterm_output_set_callback(sessions[sid].vterm, NULL, NULL);
+
+					exit_event_loop = handle_keypress(&event);
+
+					/* drain a few queued autoKey events to coalesce writes,
+					   but cap it to avoid overshooting in TUI lists */
+					if (is_net && !exit_event_loop)
+					{
+						EventRecord next_ev;
+						int batch = 0;
+						while (batch < 4 && EventAvail(autoKeyMask, &next_ev))
+						{
+							if (!WaitNextEvent(autoKeyMask, &next_ev, 0, NULL))
+								break;
+							exit_event_loop = handle_keypress(&next_ev);
+							if (exit_event_loop) break;
+							batch++;
+						}
+					}
+
+					/* flush buffered vterm output in one write */
+					if (is_net && sessions[sid].vterm != NULL)
+					{
+						char outbuf[4096];
+						size_t n = vterm_output_read(sessions[sid].vterm,
+							outbuf, sizeof(outbuf));
+						if (n > 0 && sessions[sid].thread_state == OPEN)
+							session_write(sid, outbuf, n);
+
+						/* restore callback */
+						vterm_output_set_callback(sessions[sid].vterm,
+							output_callback, (void*)(intptr_t)sid);
+					}
+				}
 				break;
 
 			case mouseDown:
