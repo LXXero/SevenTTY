@@ -528,7 +528,7 @@ resource 'MENU' (MENU_FONT_SIZE) {
 };
 
 resource 'DLOG' (DLOG_PREFERENCES) {
-	{ 50, 100, 235, 420 },
+	{ 50, 100, 255, 420 },
 	dBoxProc,
 	visible,
 	noGoAway,
@@ -540,10 +540,10 @@ resource 'DLOG' (DLOG_PREFERENCES) {
 
 resource 'DITL' (DITL_PREFERENCES) {
 	{
-		{ 155, 230, 175, 310 },
+		{ 175, 230, 195, 310 },
 		Button { enabled, "OK" };
 
-		{ 220-10-20-5, 320-10-80-5, 220-10+5, 320-10+5 }, /* box for border */
+		{ 240-10-20-5, 320-10-80-5, 240-10+5, 320-10+5 }, /* box for border */
 		UserItem { enabled };
 
 		{ 10, 35, 28, 130 },
@@ -570,20 +570,23 @@ resource 'DITL' (DITL_PREFERENCES) {
 		{ 100, 150, 119, 300 },
 		Control { enabled, CNTL_PREF_FONT_SIZE };
 
-		{ 155, 10, 175, 90 },
+		{ 175, 10, 195, 90 },
 		Button { enabled, "Cancel" };
 
-		{ 128, 10, 148, 90 },
+		{ 148, 10, 168, 90 },
 		Button { enabled, "Theme..." };
 
-		{ 128, 100, 148, 230 },
+		{ 148, 100, 168, 230 },
 		StaticText { enabled, "Default Dark" };
 
-		{ 155, 100, 175, 155 },
+		{ 175, 100, 195, 155 },
 		Button { enabled, "Dark" };
 
-		{ 155, 160, 175, 220 },
+		{ 175, 160, 195, 220 },
 		Button { enabled, "Light" };
+
+		{ 128, 10, 146, 220 },
+		CheckBox { enabled, "Bold is bright colors" };
 	}
 };
 

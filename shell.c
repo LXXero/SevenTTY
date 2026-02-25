@@ -3252,8 +3252,7 @@ void shell_init(int session_idx)
 	s->shell_saved_line[0] = '\0';
 	s->shell_saved_len = 0;
 
-	vt_write(session_idx, "\033[2J\033[H");
-	vt_write(session_idx, "SevenTTY local shell\r\n");
+	vt_write(session_idx, "\033[32mS\033[33me\033[31mv\033[35me\033[34mn\033[36mT\033[32mT\033[33mY\033[0m local shell\r\n");
 	vt_write(session_idx, "type 'help' for commands\r\n\r\n");
 
 	shell_prompt(session_idx);

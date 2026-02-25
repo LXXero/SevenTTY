@@ -1818,6 +1818,8 @@ void reset_console(struct window_context* wc, int session_idx)
 				prefs.palette[ci].blue >> 8);
 			vterm_state_set_palette_color(vtermstate, ci, &pc);
 		}
+
+		vterm_state_set_bold_highbright(vtermstate, prefs.bold_is_bright);
 	}
 }
 
@@ -1857,6 +1859,9 @@ void setup_session_vterm(struct window_context* wc, int session_idx)
 				prefs.palette[ci].blue >> 8);
 			vterm_state_set_palette_color(vtermstate, ci, &pc);
 		}
+
+		/* bold + color 0-7 promotes to bright 8-15 (standard BBS behavior) */
+		vterm_state_set_bold_highbright(vtermstate, prefs.bold_is_bright);
 	}
 }
 
@@ -1914,6 +1919,8 @@ void update_console_colors(struct window_context* wc)
 				prefs.palette[ci].blue >> 8);
 			vterm_state_set_palette_color(vtermstate, ci, &pc);
 		}
+
+		vterm_state_set_bold_highbright(vtermstate, prefs.bold_is_bright);
 	}
 
 	SetPort(wc->win);

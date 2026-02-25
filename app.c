@@ -165,7 +165,7 @@ void set_terminal_string(void)
 /* ---- Resource-based preferences ---- */
 
 /* disk layout for 'PREF' resource — bump DISK_PREFS_VERSION if you change this struct */
-#define DISK_PREFS_VERSION 1
+#define DISK_PREFS_VERSION 2
 
 struct disk_prefs
 {
@@ -189,6 +189,8 @@ struct disk_prefs
 	char port[256];         /* pascal string */
 	char privkey_path[1024];
 	char pubkey_path[1024];
+	/* v2 fields — append only, never insert above */
+	short bold_is_bright;
 };
 
 static OSErr get_prefs_spec(FSSpec* spec)
@@ -286,6 +288,9 @@ have_file:
 	if (prefs.pubkey_path)
 		strncpy(dp->pubkey_path, prefs.pubkey_path, 1023);
 	dp->pubkey_path[1023] = '\0';
+
+	/* v2 fields */
+	dp->bold_is_bright = (short)prefs.bold_is_bright;
 
 	HUnlock(h);
 
@@ -390,6 +395,7 @@ void init_prefs(void)
 	prefs.bg_color = COLOR_FROM_THEME;
 	prefs.font_size = 9;
 	prefs.prompt_color = 4; /* blue */
+	prefs.bold_is_bright = 1;
 
 	init_dark_palette();
 
@@ -532,7 +538,8 @@ void load_prefs(void)
 		return;
 	}
 
-	if (GetHandleSize(h) < (long)sizeof(struct disk_prefs))
+	/* v1 struct is smaller (no bold_is_bright); accept either size */
+	if (GetHandleSize(h) < (long)(sizeof(struct disk_prefs) - sizeof(short)))
 	{
 		ReleaseResource(h);
 		CloseResFile(refNum);
@@ -542,7 +549,7 @@ void load_prefs(void)
 	HLock(h);
 	dp = (struct disk_prefs*)*h;
 
-	if (dp->version != DISK_PREFS_VERSION)
+	if (dp->version < 1 || dp->version > DISK_PREFS_VERSION)
 	{
 		HUnlock(h);
 		ReleaseResource(h);
@@ -588,6 +595,10 @@ void load_prefs(void)
 		strncpy(prefs.pubkey_path, dp->pubkey_path, 1023);
 		prefs.pubkey_path[1023] = '\0';
 	}
+
+	/* v2 fields */
+	if (dp->version >= 2)
+		prefs.bold_is_bright = dp->bold_is_bright;
 
 	HUnlock(h);
 	ReleaseResource(h);
@@ -831,6 +842,12 @@ void preferences_window(void)
 	font_size_menu = (ControlHandle)itemH;
 	SetControlValue(font_size_menu, font_size_to_menu_item(prefs.font_size));
 
+	/* bold-is-bright checkbox (item 16) */
+	ControlHandle bold_bright_check;
+	GetDialogItem(dlg, 16, &type, &itemH, &box);
+	bold_bright_check = (ControlHandle)itemH;
+	SetControlValue(bold_bright_check, prefs.bold_is_bright ? 1 : 0);
+
 	/* set up theme name display (item 13) */
 	{
 		Handle themeH;
@@ -905,6 +922,11 @@ void preferences_window(void)
 			SetControlValue(bg_color_menu, 1);
 			SetControlValue(fg_color_menu, 1);
 		}
+		else if (item == 16)
+		{
+			/* toggle bold-is-bright checkbox */
+			SetControlValue(bold_bright_check, GetControlValue(bold_bright_check) ? 0 : 1);
+		}
 	} while(item != 1 && item != 11);
 
 	/* save if OK'd */
@@ -915,6 +937,7 @@ void preferences_window(void)
 
 		prefs.bg_color = menu_item_to_qd_color(GetControlValue(bg_color_menu));
 		prefs.fg_color = menu_item_to_qd_color(GetControlValue(fg_color_menu));
+		prefs.bold_is_bright = GetControlValue(bold_bright_check) ? 1 : 0;
 		apply_color_overrides();
 		int new_font_size = menu_item_to_font_size(GetControlValue(font_size_menu));
 
@@ -2737,18 +2760,18 @@ int main(int argc, char** argv)
 		int sid = active_session_global();
 		char* logo =
 			"\033[2J\033[H"
-			"  ____                      _____ _______   __\r\n"
-			" / ___|  _____   _____ _ __|_   _|_   _\\ \\ / /\r\n"
-			" \\___ \\ / _ \\ \\ / / _ \\ '_ \\ | |   | |  \\ V /\r\n"
-			"  ___) |  __/\\ V /  __/ | | || |   | |   | |\r\n"
-			" |____/ \\___| \\_/ \\___|_| |_||_|   |_|   |_|\r\n"
-			"version " APP_VERSION ", based on ssheven by cy384\r\n"
+			"\033[32m  ____                      _____ _______   __\r\n"
+			"\033[33m / ___|  _____   _____ _ __|_   _|_   _\\ \\ / /\r\n"
+			"\033[31m \\___ \\ / _ \\ \\ / / _ \\ '_ \\ | |   | |  \\ V /\r\n"
+			"\033[35m  ___) |  __/\\ V /  __/ | | || |   | |   | |\r\n"
+			"\033[34m |____/ \\___| \\_/ \\___|_| |_||_|   |_|   |_|\r\n"
+			"\033[36mversion " APP_VERSION ", based on ssheven by cy384\r\n"
 #if defined(__ppc__)
 			"running in PPC mode.\r\n"
 #else
 			"running in 68k mode.\r\n"
 #endif
-			"type 'help' for commands\r\n\r\n";
+			"\033[0mtype 'help' for commands\r\n\r\n";
 		vterm_input_write(sessions[sid].vterm, logo, strlen(logo));
 		shell_prompt(sid);
 	}

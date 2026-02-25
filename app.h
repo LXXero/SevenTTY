@@ -188,6 +188,7 @@ struct preferences
 	RGBColor orig_theme_fg;
 	int theme_loaded;
 	int prompt_color; /* ANSI color index 0-15, default 4 (blue) */
+	int bold_is_bright; /* 1 = bold promotes color 0-7 to 8-15 (default) */
 	char theme_name[64];
 };
 
