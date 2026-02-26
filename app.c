@@ -995,6 +995,8 @@ void init_session(struct session* s)
 	s->shell_line[0] = '\0';
 	s->shell_line_len = 0;
 	s->shell_cursor_pos = 0;
+	s->wget_url[0] = '\0';
+	s->wget_no_progress = 0;
 	s->window_id = -1;
 }
 
@@ -1190,6 +1192,34 @@ void close_session(int idx)
 	else if (sessions[idx].type == SESSION_TELNET &&
 		(sessions[idx].thread_state != DONE || sessions[idx].thread_id != kNoThreadID))
 		telnet_disconnect(idx);
+	else if (sessions[idx].type == SESSION_LOCAL)
+	{
+		struct session* s = &sessions[idx];
+
+		/* nc inline mode has its own disconnect lifecycle. */
+		if (s->recv_buffer != NULL)
+		{
+			nc_inline_disconnect(idx);
+		}
+		else
+		{
+			/* local worker commands (e.g. wget) share thread state fields. */
+			if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+				session_reap_thread(idx, 0);
+			else if (s->thread_id != kNoThreadID)
+			{
+				s->thread_command = EXIT;
+				if (s->endpoint != kOTInvalidEndpointRef)
+					OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
+
+				if (!session_reap_thread(idx, 0))
+					session_reap_thread(idx, 1);
+
+				if (s->thread_id != kNoThreadID)
+					printf_s(idx, "Warning: local worker thread could not be reclaimed.\r\n");
+			}
+		}
+	}
 
 	// null out vterm callbacks to prevent use during teardown
 	if (sessions[idx].vterm != NULL)
@@ -1197,13 +1227,6 @@ void close_session(int idx)
 		VTermScreen* vts = vterm_obtain_screen(sessions[idx].vterm);
 		vterm_screen_set_callbacks(vts, NULL, NULL);
 		vterm_output_set_callback(sessions[idx].vterm, NULL, NULL);
-	}
-
-	/* local sessions have no thread — safe to mark DONE for slot reuse */
-	if (sessions[idx].type == SESSION_LOCAL)
-	{
-		sessions[idx].thread_state = DONE;
-		sessions[idx].thread_id = kNoThreadID;
 	}
 
 	/* free vterm only if thread is confirmed done;
@@ -1386,6 +1409,34 @@ void close_window(int wid)
 		else if (sessions[sid].type == SESSION_TELNET &&
 			(sessions[sid].thread_state != DONE || sessions[sid].thread_id != kNoThreadID))
 			telnet_disconnect(sid);
+		else if (sessions[sid].type == SESSION_LOCAL)
+		{
+			struct session* s = &sessions[sid];
+
+			/* nc inline mode has its own disconnect lifecycle. */
+			if (s->recv_buffer != NULL)
+			{
+				nc_inline_disconnect(sid);
+			}
+			else
+			{
+				/* local worker commands (e.g. wget) share thread state fields. */
+				if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+					session_reap_thread(sid, 0);
+				else if (s->thread_id != kNoThreadID)
+				{
+					s->thread_command = EXIT;
+					if (s->endpoint != kOTInvalidEndpointRef)
+						OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
+
+					if (!session_reap_thread(sid, 0))
+						session_reap_thread(sid, 1);
+
+					if (s->thread_id != kNoThreadID)
+						printf_s(sid, "Warning: local worker thread could not be reclaimed.\r\n");
+				}
+			}
+		}
 
 		// null out vterm callbacks to prevent use during teardown
 		if (sessions[sid].vterm != NULL)
@@ -1393,13 +1444,6 @@ void close_window(int wid)
 			VTermScreen* vts = vterm_obtain_screen(sessions[sid].vterm);
 			vterm_screen_set_callbacks(vts, NULL, NULL);
 			vterm_output_set_callback(sessions[sid].vterm, NULL, NULL);
-		}
-
-		/* local sessions have no thread — safe to mark DONE for slot reuse */
-		if (sessions[sid].type == SESSION_LOCAL)
-		{
-			sessions[sid].thread_state = DONE;
-			sessions[sid].thread_id = kNoThreadID;
 		}
 
 		/* free vterm only if thread is confirmed done */
@@ -1638,7 +1682,7 @@ int handle_keypress(EventRecord* event)
 	}
 	else if (c)
 	{
-		// shift+page up/down: scroll through scrollback buffer
+		// shift+page up/down: scroll through scrollback buffer (half page)
 		if (event->modifiers & (shiftKey | rightShiftKey))
 		{
 			if (c == kPageUpCharCode)
@@ -1649,6 +1693,21 @@ int handle_keypress(EventRecord* event)
 			else if (c == kPageDownCharCode)
 			{
 				scroll_down(wc);
+				return 0;
+			}
+		}
+
+		// cmd+up/down: scroll line by line
+		if (event->modifiers & cmdKey)
+		{
+			if (c == kUpArrowCharCode)
+			{
+				scroll_up_line(wc);
+				return 0;
+			}
+			else if (c == kDownArrowCharCode)
+			{
+				scroll_down_line(wc);
 				return 0;
 			}
 		}
@@ -1793,6 +1852,24 @@ static void reap_detached_sessions(void)
 	}
 }
 
+/* Local shell workers (e.g. wget) need low-latency scheduling while active;
+   otherwise WaitNextEvent sleep can make cooperative yields feel like stalls. */
+static int has_active_local_worker(void)
+{
+	int i;
+	for (i = 0; i < MAX_SESSIONS; i++)
+	{
+		struct session* s = &sessions[i];
+		if (!s->in_use) continue;
+		if (s->type != SESSION_LOCAL) continue;
+		if (s->recv_buffer != NULL) continue; /* nc inline has separate behavior */
+		if (s->thread_id == kNoThreadID) continue;
+		if (s->thread_state == DONE || s->thread_state == UNINITIALIZED) continue;
+		return 1;
+	}
+	return 0;
+}
+
 void event_loop(void)
 {
 	int exit_event_loop = 0;
@@ -1807,7 +1884,8 @@ void event_loop(void)
 	do
 	{
 		// wait to get a GUI event
-		while (!WaitNextEvent(everyEvent, &event, sleep_time, NULL))
+		while (!WaitNextEvent(everyEvent, &event,
+		                      has_active_local_worker() ? 1 : sleep_time, NULL))
 		{
 			YieldToAnyThread();
 			reap_detached_sessions();

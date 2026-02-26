@@ -1133,31 +1133,262 @@ static void cmd_mkdir(int idx, int argc, char* argv[])
 	}
 }
 
+/* wait for y/n + Enter, pumping events to keep UI alive */
+static int shell_confirm(int idx)
+{
+	EventRecord evt;
+	char answer = 0; /* 0=no input yet, 'y' or 'n' */
+
+	while (1)
+	{
+		if (WaitNextEvent(everyEvent, &evt, 10, NULL))
+		{
+			if (evt.what == keyDown)
+			{
+				char c = evt.message & charCodeMask;
+				if (c == 13 || c == 3) /* Return or Enter */
+				{
+					if (answer == 'y') { vt_write(idx, "\r\n"); return 1; }
+					if (answer == 'n') { vt_write(idx, "\r\n"); return 0; }
+					/* no valid input yet, default to no */
+					vt_write(idx, "n\r\n");
+					return 0;
+				}
+				else if (c == 27) /* Escape = cancel */
+				{
+					vt_write(idx, "n\r\n");
+					return 0;
+				}
+				else if (c == 'y' || c == 'Y')
+				{
+					answer = 'y';
+					vt_write(idx, "y");
+				}
+				else if (c == 'n' || c == 'N')
+				{
+					answer = 'n';
+					vt_write(idx, "n");
+				}
+				else if (c == 8 || c == 127) /* backspace/delete */
+				{
+					if (answer)
+					{
+						vt_write(idx, "\b \b");
+						answer = 0;
+					}
+				}
+			}
+			else if (evt.what == updateEvt)
+			{
+				WindowPtr evtWin = (WindowPtr)evt.message;
+				struct window_context* ewc = find_window_context(evtWin);
+				if (ewc)
+				{
+					SetPort(evtWin);
+					BeginUpdate(evtWin);
+					draw_screen(ewc, &(evtWin->portRect));
+					EndUpdate(evtWin);
+				}
+			}
+		}
+		YieldToAnyThread();
+	}
+}
+
+/* simple --more-- pager: returns 0 to continue, 1 if user quit (q/Esc) */
+static int shell_more_prompt(int idx)
+{
+	EventRecord evt;
+	vt_write(idx, "\033[7m--more--\033[0m");
+	while (1)
+	{
+		if (WaitNextEvent(everyEvent, &evt, 10, NULL))
+		{
+			if (evt.what == keyDown)
+			{
+				char c = evt.message & charCodeMask;
+				/* erase the --more-- prompt */
+				vt_write(idx, "\r\033[K");
+				if (c == 'q' || c == 'Q' || c == 27) /* q or Escape = quit */
+					return 1;
+				return 0; /* any other key = next page */
+			}
+			else if (evt.what == updateEvt)
+			{
+				WindowPtr evtWin = (WindowPtr)evt.message;
+				struct window_context* ewc = find_window_context(evtWin);
+				if (ewc)
+				{
+					SetPort(evtWin);
+					BeginUpdate(evtWin);
+					draw_screen(ewc, &(evtWin->portRect));
+					EndUpdate(evtWin);
+				}
+			}
+		}
+		YieldToAnyThread();
+	}
+}
+
+/* paginated write: outputs lines with --more-- prompt every screenful */
+static void shell_paged_write(int idx, const char** lines, int nlines)
+{
+	struct window_context* wc = window_for_session(idx);
+	int page_size = wc ? wc->size_y - 2 : 22; /* leave room for prompt */
+	int line_count = 0;
+	int i;
+
+	for (i = 0; i < nlines; i++)
+	{
+		vt_write(idx, lines[i]);
+		vt_write(idx, "\r\n");
+		line_count++;
+
+		if (line_count >= page_size && i + 1 < nlines)
+		{
+			if (shell_more_prompt(idx))
+				return; /* user pressed q */
+			line_count = 0;
+		}
+	}
+}
+
 static void cmd_rm(int idx, int argc, char* argv[])
 {
+	int i;
+	int interactive = 0;
+	int start = 1;
+
 	if (argc < 2)
 	{
-		vt_write(idx, "usage: rm <file>\r\n");
+		vt_write(idx, "usage: rm [-i] <file ...>\r\n");
 		return;
 	}
 
-	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[1], &spec);
-	if (e != noErr)
+	if (argc >= 2 && strcmp(argv[1], "-i") == 0)
 	{
-		vt_write(idx, "rm: file not found: ");
-		vt_write(idx, argv[1]);
-		vt_write(idx, "\r\n");
+		interactive = 1;
+		start = 2;
+	}
+
+	if (start >= argc)
+	{
+		vt_write(idx, "usage: rm [-i] <file ...>\r\n");
 		return;
 	}
 
-	e = FSpDelete(&spec);
-	if (e == fLckdErr)
-		vt_write(idx, "rm: file is locked\r\n");
-	else if (e == fBsyErr)
-		vt_write(idx, "rm: file is busy\r\n");
-	else if (e != noErr)
-		vt_write(idx, "rm: delete failed\r\n");
+	for (i = start; i < argc; i++)
+	{
+		if (is_glob(argv[i]))
+		{
+			/* expand glob against current directory */
+			struct session* s = &sessions[idx];
+			CInfoPBRec pb;
+			Str255 name;
+			short gi;
+			int matched = 0;
+
+			for (gi = 1; ; gi++)
+			{
+				FSSpec fspec;
+				OSErr e;
+				char name_c[256];
+				int nl;
+
+				memset(&pb, 0, sizeof(pb));
+				pb.hFileInfo.ioNamePtr = name;
+				pb.hFileInfo.ioVRefNum = s->shell_vRefNum;
+				pb.hFileInfo.ioDirID = s->shell_dirID;
+				pb.hFileInfo.ioFDirIndex = gi;
+
+				if (PBGetCatInfoSync(&pb) != noErr) break;
+
+				nl = name[0];
+				if (nl > 255) nl = 255;
+				memcpy(name_c, name + 1, nl);
+				name_c[nl] = '\0';
+
+				/* skip directories */
+				if (pb.hFileInfo.ioFlAttrib & ioDirMask) continue;
+
+				if (!glob_match(argv[i], name_c)) continue;
+
+				matched++;
+
+				if (interactive)
+				{
+					vt_write(idx, "rm: delete ");
+					vt_write(idx, name_c);
+					vt_write(idx, "? (y/n) ");
+					if (!shell_confirm(idx)) continue;
+				}
+
+				fspec.vRefNum = s->shell_vRefNum;
+				fspec.parID = s->shell_dirID;
+				fspec.name[0] = name[0];
+				memcpy(fspec.name + 1, name + 1, name[0]);
+
+				e = FSpDelete(&fspec);
+				if (e == noErr)
+				{
+					gi--; /* deleted entry shifts directory indices down */
+				}
+				else if (e == fLckdErr)
+				{
+					vt_write(idx, "rm: locked: ");
+					vt_write(idx, name_c);
+					vt_write(idx, "\r\n");
+				}
+				else if (e == fBsyErr)
+				{
+					vt_write(idx, "rm: busy: ");
+					vt_write(idx, name_c);
+					vt_write(idx, "\r\n");
+				}
+				else if (e != noErr)
+				{
+					vt_write(idx, "rm: failed: ");
+					vt_write(idx, name_c);
+					vt_write(idx, "\r\n");
+				}
+			}
+
+			if (!matched)
+			{
+				vt_write(idx, "rm: no match: ");
+				vt_write(idx, argv[i]);
+				vt_write(idx, "\r\n");
+			}
+		}
+		else
+		{
+			FSSpec spec;
+			OSErr e = resolve_path(idx, argv[i], &spec);
+			if (e != noErr)
+			{
+				vt_write(idx, "rm: not found: ");
+				vt_write(idx, argv[i]);
+				vt_write(idx, "\r\n");
+				continue;
+			}
+
+			if (interactive)
+			{
+				vt_write(idx, "rm: delete ");
+				vt_write(idx, argv[i]);
+				vt_write(idx, "? (y/n) ");
+				if (!shell_confirm(idx)) continue;
+			}
+
+			e = FSpDelete(&spec);
+			if (e == fLckdErr)
+				vt_write(idx, "rm: file is locked\r\n");
+			else if (e == fBsyErr)
+				vt_write(idx, "rm: file is busy\r\n");
+			else if (e != noErr)
+				vt_write(idx, "rm: delete failed\r\n");
+		}
+	}
 }
 
 static void cmd_rmdir(int idx, int argc, char* argv[])
@@ -3465,78 +3696,258 @@ static void cmd_uptime(int idx, int argc, char** argv)
 /* cal - display calendar for current month                           */
 /* ------------------------------------------------------------------ */
 
+static const char* cal_month_names[] = {
+	"", "January", "February", "March", "April",
+	"May", "June", "July", "August", "September",
+	"October", "November", "December"
+};
+static const int cal_mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+
+static int cal_days_in_month(int month, int year)
+{
+	int d = cal_mdays[month];
+	if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+		d = 29;
+	return d;
+}
+
+static int cal_dow_first(int month, int year)
+{
+	int y = year, m = month, z;
+	if (m < 3) { m += 12; y--; }
+	z = (1 + (13 * (m + 1)) / 5 + y + y / 4 - y / 100 + y / 400) % 7;
+	return (z + 6) % 7; /* 0=Sun */
+}
+
+/* render one month into a grid: rows x 20 chars.
+   grid[row] is a 22-char buffer. Returns number of rows used.
+   today_row/today_col: set to the grid position of today's date (col = char offset). */
+static int cal_render_month(int month, int year, int today,
+                            char grid[8][22], int* today_row, int* today_col)
+{
+	int dow = cal_dow_first(month, year);
+	int dim = cal_days_in_month(month, year);
+	int row = 0, col, day;
+	char hdr[22];
+	int hlen, pad;
+
+	*today_row = -1;
+	*today_col = -1;
+
+	/* row 0: centered month name */
+	snprintf(hdr, sizeof(hdr), "%s %d", cal_month_names[month], year);
+	hlen = strlen(hdr);
+	pad = (20 - hlen) / 2;
+	if (pad < 0) pad = 0;
+	memset(grid[row], ' ', 20);
+	grid[row][20] = '\0';
+	memcpy(grid[row] + pad, hdr, hlen);
+	row++;
+
+	/* row 1: day-of-week header */
+	strcpy(grid[row], "Su Mo Tu We Th Fr Sa");
+	row++;
+
+	/* init day grid row */
+	memset(grid[row], ' ', 20);
+	grid[row][20] = '\0';
+
+	day = 1;
+	col = dow;
+	while (day <= dim)
+	{
+		grid[row][col * 3]     = (day >= 10) ? ('0' + day / 10) : ' ';
+		grid[row][col * 3 + 1] = '0' + day % 10;
+
+		if (day == today)
+		{
+			*today_row = row;
+			*today_col = col * 3;
+		}
+
+		col++;
+		if (col == 7 && day < dim)
+		{
+			col = 0;
+			row++;
+			memset(grid[row], ' ', 20);
+			grid[row][20] = '\0';
+		}
+		day++;
+	}
+	row++;
+	return row;
+}
+
 static void cmd_cal(int idx, int argc, char** argv)
 {
 	unsigned long secs;
 	DateTimeRec dt;
 	int year, month;
-	int dow_first, days_in_month;
-	int day;
 	char buf[32];
-	static const char* month_names[] = {
-		"", "January", "February", "March", "April",
-		"May", "June", "July", "August", "September",
-		"October", "November", "December"
-	};
-	static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
-
-	(void)argc;
-	(void)argv;
 
 	GetDateTime(&secs);
 	SecondsToDate(secs, &dt);
-	year = dt.year;
-	month = dt.month;
 
-	/* days in this month */
-	days_in_month = mdays[month];
-	if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
-		days_in_month = 29;
-
-	/* day of week for the 1st (Zeller's congruence) */
+	if (argc >= 2)
 	{
-		int y = year, m = month;
-		if (m < 3) { m += 12; y--; }
-		dow_first = (1 + (13 * (m + 1)) / 5 + y + y / 4 - y / 100 + y / 400) % 7;
-		/* Zeller: 0=Sat, 1=Sun, ..., 6=Fri -> convert to 0=Sun */
-		dow_first = (dow_first + 6) % 7;
-	}
-
-	/* header */
-	snprintf(buf, sizeof(buf), "   %s %d", month_names[month], year);
-	vt_write(idx, buf);
-	vt_write(idx, "\r\n");
-	vt_write(idx, "Su Mo Tu We Th Fr Sa\r\n");
-
-	/* leading spaces */
-	{
-		int s;
-		for (s = 0; s < dow_first; s++)
-			vt_write(idx, "   ");
-	}
-
-	for (day = 1; day <= days_in_month; day++)
-	{
-		if (day == dt.day)
+		int val = atoi(argv[1]);
+		if (argc == 2 && val > 12 && val <= 9999)
 		{
-			snprintf(buf, sizeof(buf), "\033[7m%2d\033[0m", day);
-			vt_write(idx, buf);
-		}
-		else
-		{
-			snprintf(buf, sizeof(buf), "%2d", day);
-			vt_write(idx, buf);
+			/* cal <year> — show full year, 3 months per row */
+			int row_group;
+			char line[128];
+
+			year = val;
+
+			/* year header */
+			snprintf(buf, sizeof(buf), "%d", year);
+			{
+				int blen = strlen(buf);
+				int pad = (64 - blen) / 2;
+				int i;
+				for (i = 0; i < pad; i++) line[i] = ' ';
+				memcpy(line + pad, buf, blen);
+				line[pad + blen] = '\0';
+			}
+			vt_write(idx, line);
+			vt_write(idx, "\r\n\r\n");
+
+			for (row_group = 0; row_group < 4; row_group++)
+			{
+				char g0[8][22], g1[8][22], g2[8][22];
+				int r0, r1, r2, maxr, r;
+				int t0r, t0c, t1r, t1c, t2r, t2c;
+				int m0 = row_group * 3 + 1;
+				int m1 = m0 + 1;
+				int m2 = m0 + 2;
+
+				r0 = cal_render_month(m0, year,
+					(year == dt.year && m0 == dt.month) ? dt.day : 0, g0, &t0r, &t0c);
+				r1 = cal_render_month(m1, year,
+					(year == dt.year && m1 == dt.month) ? dt.day : 0, g1, &t1r, &t1c);
+				r2 = cal_render_month(m2, year,
+					(year == dt.year && m2 == dt.month) ? dt.day : 0, g2, &t2r, &t2c);
+
+				maxr = r0;
+				if (r1 > maxr) maxr = r1;
+				if (r2 > maxr) maxr = r2;
+
+				/* pad shorter grids with blank rows */
+				for (r = r0; r < maxr; r++)
+				{
+					memset(g0[r], ' ', 20);
+					g0[r][20] = '\0';
+				}
+				for (r = r1; r < maxr; r++)
+				{
+					memset(g1[r], ' ', 20);
+					g1[r][20] = '\0';
+				}
+				for (r = r2; r < maxr; r++)
+				{
+					memset(g2[r], ' ', 20);
+					g2[r][20] = '\0';
+				}
+
+				for (r = 0; r < maxr; r++)
+				{
+					/* emit each month column, highlighting today */
+					char* grids[3];
+					int trows[3], tcols[3];
+					int gi;
+					grids[0] = g0[r]; grids[1] = g1[r]; grids[2] = g2[r];
+					trows[0] = t0r; trows[1] = t1r; trows[2] = t2r;
+					tcols[0] = t0c; tcols[1] = t1c; tcols[2] = t2c;
+
+					for (gi = 0; gi < 3; gi++)
+					{
+						if (gi > 0) vt_write(idx, "  ");
+						if (trows[gi] == r && tcols[gi] >= 0)
+						{
+							/* print chars before today */
+							char tmp[22];
+							int tc = tcols[gi];
+							memcpy(tmp, grids[gi], tc);
+							tmp[tc] = '\0';
+							vt_write(idx, tmp);
+							/* today in reverse */
+							tmp[0] = grids[gi][tc];
+							tmp[1] = grids[gi][tc + 1];
+							tmp[2] = '\0';
+							vt_write(idx, "\033[7m");
+							vt_write(idx, tmp);
+							vt_write(idx, "\033[0m");
+							/* rest of row */
+							if (tc + 2 < 20)
+							{
+								memcpy(tmp, grids[gi] + tc + 2, 20 - tc - 2);
+								tmp[20 - tc - 2] = '\0';
+								vt_write(idx, tmp);
+							}
+						}
+						else
+						{
+							char tmp[22];
+							memcpy(tmp, grids[gi], 20);
+							tmp[20] = '\0';
+							vt_write(idx, tmp);
+						}
+					}
+					vt_write(idx, "\r\n");
+				}
+				if (row_group < 3)
+					vt_write(idx, "\r\n");
+			}
+			return;
 		}
 
-		if ((dow_first + day) % 7 == 0)
-			vt_write(idx, "\r\n");
-		else
-			vt_write(idx, " ");
+		/* cal <month> [year] */
+		month = val;
+		if (month < 1 || month > 12)
+		{
+			vt_write(idx, "cal: invalid month\r\n");
+			return;
+		}
+		year = (argc >= 3) ? atoi(argv[2]) : dt.year;
+	}
+	else
+	{
+		year = dt.year;
+		month = dt.month;
 	}
 
-	/* trailing newline if row didn't end on Saturday */
-	if ((dow_first + days_in_month) % 7 != 0)
+	/* single month display */
+	{
+		int dow = cal_dow_first(month, year);
+		int dim = cal_days_in_month(month, year);
+		int day, s;
+
+		snprintf(buf, sizeof(buf), "   %s %d", cal_month_names[month], year);
+		vt_write(idx, buf);
 		vt_write(idx, "\r\n");
+		vt_write(idx, "Su Mo Tu We Th Fr Sa\r\n");
+
+		for (s = 0; s < dow; s++)
+			vt_write(idx, "   ");
+
+		for (day = 1; day <= dim; day++)
+		{
+			if (day == dt.day && month == dt.month && year == dt.year)
+				snprintf(buf, sizeof(buf), "\033[7m%2d\033[0m", day);
+			else
+				snprintf(buf, sizeof(buf), "%2d", day);
+			vt_write(idx, buf);
+
+			if ((dow + day) % 7 == 0)
+				vt_write(idx, "\r\n");
+			else
+				vt_write(idx, " ");
+		}
+
+		if ((dow + dim) % 7 != 0)
+			vt_write(idx, "\r\n");
+	}
 }
 
 /* ------------------------------------------------------------------ */
@@ -4606,6 +5017,1155 @@ static void cmd_cut(int idx, int argc, char** argv)
 }
 
 /* ------------------------------------------------------------------ */
+/* wget - HTTP file download with Mac type/creator detection          */
+/* ------------------------------------------------------------------ */
+
+/* extension -> type/creator mapping for common Mac files */
+struct ext_typecreator {
+	const char* ext;
+	OSType type;
+	OSType creator;
+};
+
+static const struct ext_typecreator ext_map[] = {
+	/* archives */
+	{ "sit",   'SIT!', 'SITx' },
+	{ "sea",   'APPL', 'aust' },
+	{ "hqx",   'TEXT', 'SITx' },
+	{ "bin",   'mBIN', 'SITx' },
+	{ "zip",   'ZIP ', 'SITx' },
+	{ "gz",    'Gzip', 'SITx' },
+	{ "tar",   'TARF', 'SITx' },
+	{ "tgz",   'Gzip', 'SITx' },
+	{ "z",     'ZIVU', 'SITx' },
+	{ "uu",    'TEXT', 'SITx' },
+	{ "cpt",   'PACT', 'CPCT' },
+	{ "dd",    'DDf1', 'DDsk' },
+	/* disk images */
+	{ "img",   'rohd', 'ddsk' },
+	{ "dsk",   'dImg', 'ddsk' },
+	{ "dmg",   'dImg', 'ddsk' },
+	{ "smi",   'APPL', 'ddsk' },
+	{ "toast", 'CDr3', 'TOAS' },
+	{ "iso",   'rodh', 'ddsk' },
+	/* text */
+	{ "txt",   'TEXT', 'ttxt' },
+	{ "text",  'TEXT', 'ttxt' },
+	{ "htm",   'TEXT', 'MOSS' },
+	{ "html",  'TEXT', 'MOSS' },
+	{ "css",   'TEXT', 'ttxt' },
+	{ "js",    'TEXT', 'ttxt' },
+	{ "xml",   'TEXT', 'ttxt' },
+	{ "csv",   'TEXT', 'ttxt' },
+	{ "c",     'TEXT', 'ttxt' },
+	{ "h",     'TEXT', 'ttxt' },
+	/* images */
+	{ "gif",   'GIFf', 'ogle' },
+	{ "jpg",   'JPEG', 'ogle' },
+	{ "jpeg",  'JPEG', 'ogle' },
+	{ "png",   'PNGf', 'ogle' },
+	{ "bmp",   'BMPf', 'ogle' },
+	{ "tif",   'TIFF', 'ogle' },
+	{ "tiff",  'TIFF', 'ogle' },
+	{ "pict",  'PICT', 'ogle' },
+	/* audio */
+	{ "aif",   'AIFF', 'SCPL' },
+	{ "aiff",  'AIFF', 'SCPL' },
+	{ "wav",   'WAVE', 'SCPL' },
+	{ "mp3",   'MPG3', 'TVOD' },
+	{ "mid",   'Midi', 'TVOD' },
+	{ "midi",  'Midi', 'TVOD' },
+	/* documents */
+	{ "pdf",   'PDF ', 'CARO' },
+	{ "doc",   'W8BN', 'MSWD' },
+	{ "xls",   'XLS8', 'XCEL' },
+	{ "ppt",   'SLD8', 'PPT3' },
+	{ "rtf",   'TEXT', 'MSWD' },
+	/* applications */
+	{ "rsrc",  'rsrc', 'RSED' },
+	{ "rom",   'ROM ', 'ttxt' },
+	{ NULL, 0, 0 }
+};
+
+/* case-insensitive extension lookup */
+static int lookup_ext_type(const char* filename, OSType* type, OSType* creator)
+{
+	const char* dot;
+	const struct ext_typecreator* m;
+	char ext[16];
+	int i, len;
+
+	/* find last dot */
+	dot = NULL;
+	{
+		const char* p = filename;
+		while (*p) { if (*p == '.') dot = p; p++; }
+	}
+	if (!dot) return 0;
+	dot++; /* skip the dot */
+
+	len = strlen(dot);
+	if (len == 0 || len > 15) return 0;
+	for (i = 0; i < len; i++)
+		ext[i] = tolower((unsigned char)dot[i]);
+	ext[len] = '\0';
+
+	for (m = ext_map; m->ext; m++)
+	{
+		if (strcmp(ext, m->ext) == 0)
+		{
+			*type = m->type;
+			*creator = m->creator;
+			return 1;
+		}
+	}
+	return 0;
+}
+
+/* check for MacBinary header and extract type/creator */
+static int check_macbinary(const unsigned char* hdr, int hdr_len,
+                           OSType* type, OSType* creator, long* data_len, long* rsrc_len)
+{
+	int name_len;
+
+	if (hdr_len < 128) return 0;
+
+	/* MacBinary I/II/III checks */
+	if (hdr[0] != 0) return 0;        /* version must be 0 */
+	name_len = hdr[1];
+	if (name_len < 1 || name_len > 63) return 0;
+	if (hdr[74] != 0) return 0;       /* must be zero */
+	if (hdr[82] != 0) return 0;       /* must be zero */
+
+	/* data fork length (bytes 83-86, big-endian) */
+	*data_len = ((long)hdr[83] << 24) | ((long)hdr[84] << 16) |
+	            ((long)hdr[85] << 8) | (long)hdr[86];
+	/* resource fork length (bytes 87-90) */
+	*rsrc_len = ((long)hdr[87] << 24) | ((long)hdr[88] << 16) |
+	            ((long)hdr[89] << 8) | (long)hdr[90];
+
+	/* sanity: lengths should be reasonable */
+	if (*data_len < 0 || *rsrc_len < 0) return 0;
+	if (*data_len > 16777216L || *rsrc_len > 16777216L) return 0;
+
+	/* type (bytes 65-68) and creator (bytes 69-72) */
+	*type    = ((OSType)hdr[65] << 24) | ((OSType)hdr[66] << 16) |
+	           ((OSType)hdr[67] << 8) | (OSType)hdr[68];
+	*creator = ((OSType)hdr[69] << 24) | ((OSType)hdr[70] << 16) |
+	           ((OSType)hdr[71] << 8) | (OSType)hdr[72];
+
+	return 1;
+}
+
+/* find a header value (case-insensitive); returns pointer into hdr or NULL */
+static const char* http_header_find(const char* headers, const char* name)
+{
+	int name_len = strlen(name);
+	const char* p = headers;
+	while (*p)
+	{
+		/* start of a line */
+		int i;
+		int match = 1;
+		for (i = 0; i < name_len; i++)
+		{
+			if (p[i] == '\0' ||
+			    tolower((unsigned char)p[i]) != tolower((unsigned char)name[i]))
+			{
+				match = 0;
+				break;
+			}
+		}
+		if (match && p[name_len] == ':')
+		{
+			const char* val = p + name_len + 1;
+			while (*val == ' ') val++;
+			return val;
+		}
+		/* advance to next line */
+		while (*p && *p != '\n') p++;
+		if (*p == '\n') p++;
+	}
+	return NULL;
+}
+
+/* extract filename from URL path or Content-Disposition header */
+static void extract_filename(const char* url_path, const char* headers,
+                             char* out, int maxlen)
+{
+	const char* p;
+	const char* name_start;
+
+	/* try Content-Disposition first */
+	p = http_header_find(headers, "content-disposition");
+	if (p)
+	{
+		const char* fn = strstr(p, "filename=");
+		if (!fn) fn = strstr(p, "filename*=");
+		if (fn)
+		{
+			fn = strchr(fn, '=') + 1;
+			if (*fn == '"') fn++;
+			{
+				int i = 0;
+				while (*fn && *fn != '"' && *fn != '\r' && *fn != '\n' && i < maxlen - 1)
+					out[i++] = *fn++;
+				out[i] = '\0';
+				if (i > 0) return;
+			}
+		}
+	}
+
+	/* fall back to URL path */
+	name_start = url_path;
+	p = url_path;
+	while (*p)
+	{
+		if (*p == '/') name_start = p + 1;
+		p++;
+	}
+
+	{
+		int i = 0;
+		while (*name_start && *name_start != '?' && *name_start != '#' && i < maxlen - 1)
+			out[i++] = *name_start++;
+		out[i] = '\0';
+	}
+
+	if (out[0] == '\0')
+		strncpy(out, "download", maxlen - 1);
+}
+
+/* ---- TLS support for HTTPS ---- */
+
+#include <mbedtls/ssl.h>
+#include <mbedtls/ctr_drbg.h>
+#include <mbedtls/entropy.h>
+#include <mbedtls/net_sockets.h>
+
+/* I/O callbacks for mbedtls over Open Transport */
+static int wget_tls_send(void* ctx, const unsigned char* buf, size_t len)
+{
+	OTResult r;
+	EndpointRef ep = (EndpointRef)ctx;
+	r = OTSnd(ep, (void*)buf, len, 0);
+	if (r == kOTFlowErr) return MBEDTLS_ERR_SSL_WANT_WRITE;
+	if (r < 0) return MBEDTLS_ERR_NET_SEND_FAILED;
+	return (int)r;
+}
+
+static int wget_tls_recv(void* ctx, unsigned char* buf, size_t len)
+{
+	OTResult r;
+	EndpointRef ep = (EndpointRef)ctx;
+	r = OTRcv(ep, buf, len, nil);
+	if (r == kOTNoDataErr) return MBEDTLS_ERR_SSL_WANT_READ;
+	if (r == kOTLookErr)
+	{
+		/* check for orderly disconnect */
+		OTResult ev = OTLook(ep);
+		if (ev == T_ORDREL)
+		{
+			OTRcvOrderlyDisconnect(ep);
+			return 0; /* clean EOF */
+		}
+		return MBEDTLS_ERR_NET_RECV_FAILED;
+	}
+	if (r == 0) return 0; /* clean EOF */
+	if (r < 0) return MBEDTLS_ERR_NET_RECV_FAILED;
+	return (int)r;
+}
+
+static long wget_percent(long total_written, long content_length)
+{
+	if (content_length <= 0) return 0;
+	if (total_written <= 0) return 0;
+	if (total_written >= content_length) return 100;
+
+	/* Avoid overflow from total_written * 100 on 32-bit long. */
+	if (content_length >= 100)
+	{
+		long unit = content_length / 100;
+		long pct = total_written / unit;
+		if (pct > 100) pct = 100;
+		return pct;
+	}
+
+	return (total_written * 100L) / content_length;
+}
+
+static int wget_progress_step(int idx,
+                              long total_written,
+                              long content_length,
+                              long* next_progress_bytes,
+                              int* progress_live,
+                              int show_progress)
+{
+	char pbuf[96];
+	const long step = 524288L; /* 512 KB: lower UI overhead, higher throughput */
+
+	if (total_written < *next_progress_bytes)
+		return 0;
+
+	*next_progress_bytes = total_written + step;
+
+	if (!show_progress)
+		return 1;
+
+	if (content_length > 0)
+	{
+		long pct = wget_percent(total_written, content_length);
+		snprintf(pbuf, sizeof(pbuf),
+		         "\rDownloaded %ld / %ld bytes (%ld%%)",
+		         total_written, content_length, pct);
+	}
+	else
+	{
+		snprintf(pbuf, sizeof(pbuf), "\rDownloaded %ld bytes", total_written);
+	}
+
+	vt_write(idx, pbuf);
+	vt_write(idx, "\033[K");
+	*progress_live = 1;
+	return 1;
+}
+
+static void cmd_wget_run(int idx, const char* initial_url, int no_progress)
+{
+	const char* url = initial_url;
+	char host[256];
+	char path[512];
+	unsigned short port;
+	int use_tls = 0;
+	EndpointRef ep;
+	OSStatus err;
+	TCall sndCall;
+	DNSAddress hostDNSAddress;
+	char hostport[280];
+	char request[1024];
+	int req_len;
+	/* TLS state */
+	mbedtls_ssl_context ssl;
+	mbedtls_ssl_config ssl_conf;
+	mbedtls_ctr_drbg_context ctr_drbg;
+	mbedtls_entropy_context entropy;
+	int tls_initialized = 0;
+	/* response parsing */
+	char resp_buf[4096]; /* header accumulation buffer */
+	int resp_len = 0;
+	int header_done = 0;
+	int status_code = 0;
+	long content_length = -1;
+	char headers_str[2048];
+	/* file output */
+	char filename[64];
+	char local_name[32]; /* HFS 31 char limit */
+	Str255 pname;
+	FSSpec out_spec;
+	short out_ref = 0;
+	struct session* s = &sessions[idx];
+	long total_written = 0;
+	int progress_live = 0;
+	/* type/creator */
+	OSType ftype = 'BINA';
+	OSType fcreator = '????';
+	/* MacBinary detection */
+	unsigned char first_bytes[128];
+	int first_bytes_len = 0;
+	int checked_macbinary = 0;
+	int download_ok = 0;
+	/* redirect */
+	int redirect_count = 0;
+	char redirect_url[512];
+	unsigned long download_start_tick = 0;
+	unsigned long download_elapsed_ticks = 0;
+
+retry_redirect:
+	/* parse URL */
+	{
+		const char* p = url;
+		int hi = 0;
+
+		if (strncmp(p, "https://", 8) == 0)
+		{
+			use_tls = 1;
+			port = 443;
+			p += 8;
+		}
+		else if (strncmp(p, "http://", 7) == 0)
+		{
+			use_tls = 0;
+			port = 80;
+			p += 7;
+		}
+		else
+		{
+			use_tls = 0;
+			port = 80;
+		}
+
+		/* extract host[:port] */
+		host[0] = '\0';
+		while (*p && *p != '/' && *p != ':' && hi < (int)sizeof(host) - 1)
+			host[hi++] = *p++;
+		host[hi] = '\0';
+
+		if (*p == ':')
+		{
+			unsigned long pv = 0;
+			int ndigits = 0;
+			p++;
+			while (*p >= '0' && *p <= '9')
+			{
+				pv = pv * 10 + (*p - '0');
+				ndigits++;
+				p++;
+			}
+			if (ndigits == 0 || pv == 0 || pv > 65535)
+			{
+				vt_write(idx, "wget: invalid port\r\n");
+				return;
+			}
+			port = (unsigned short)pv;
+		}
+
+		/* path (default /) */
+		if (*p == '/')
+			strncpy(path, p, sizeof(path) - 1);
+		else
+			strcpy(path, "/");
+		path[sizeof(path) - 1] = '\0';
+	}
+
+	if (host[0] == '\0')
+	{
+		vt_write(idx, "wget: invalid URL\r\n");
+		return;
+	}
+
+	/* connect */
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "wget: Open Transport not available\r\n");
+		return;
+	}
+
+	ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, nil, &err);
+	if (err != noErr)
+	{
+		printf_s(idx, "wget: failed to open endpoint (err=%d)\r\n", (int)err);
+		return;
+	}
+	s->endpoint = ep;
+
+	OTSetSynchronous(ep);
+	OTSetBlocking(ep);
+	OTInstallNotifier(ep, shell_ot_timeout_notifier, nil);
+	OTUseSyncIdleEvents(ep, true);
+
+	err = OTBind(ep, nil, nil);
+	if (err != noErr)
+	{
+		printf_s(idx, "wget: bind failed (err=%d)\r\n", (int)err);
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		return;
+	}
+
+	snprintf(hostport, sizeof(hostport), "%s:%d", host, (int)port);
+
+	OTMemzero(&sndCall, sizeof(TCall));
+	sndCall.addr.buf = (UInt8*) &hostDNSAddress;
+	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, hostport);
+
+	printf_s(idx, "Connecting to %s%s... ",
+	         use_tls ? "(TLS) " : "", hostport);
+
+	ot_timeout_provider = ep;
+	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	err = OTConnect(ep, &sndCall, nil);
+
+	ot_timeout_deadline = 0;
+	ot_timeout_provider = nil;
+
+	if (err != noErr)
+	{
+		if (err == kOTCanceledErr)
+			vt_write(idx, "timed out\r\n");
+		else
+			printf_s(idx, "failed (err=%d)\r\n", (int)err);
+		OTUnbind(ep);
+		OTCloseProvider(ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		return;
+	}
+
+	vt_write(idx, "connected.\r\n");
+
+	/* switch to non-blocking for handshake and recv */
+	OTSetNonBlocking(ep);
+	OTUseSyncIdleEvents(ep, false);
+
+	/* TLS handshake if HTTPS */
+	if (use_tls)
+	{
+		int ret;
+		unsigned long hs_deadline = TickCount() + 1800; /* 30 sec */
+
+		vt_write(idx, "TLS handshake... ");
+
+		mbedtls_ssl_init(&ssl);
+		mbedtls_ssl_config_init(&ssl_conf);
+		mbedtls_ctr_drbg_init(&ctr_drbg);
+		mbedtls_entropy_init(&entropy);
+
+		mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy, NULL, 0);
+
+		mbedtls_ssl_config_defaults(&ssl_conf,
+		                            MBEDTLS_SSL_IS_CLIENT,
+		                            MBEDTLS_SSL_TRANSPORT_STREAM,
+		                            MBEDTLS_SSL_PRESET_DEFAULT);
+
+		/* skip cert verification (no CA store on classic Mac) */
+		mbedtls_ssl_conf_authmode(&ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+		mbedtls_ssl_conf_rng(&ssl_conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+
+		/* force TLS 1.2 max — 1.3 is unreliable on 68K */
+		mbedtls_ssl_conf_max_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+		mbedtls_ssl_conf_min_tls_version(&ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+		mbedtls_ssl_setup(&ssl, &ssl_conf);
+		mbedtls_ssl_set_hostname(&ssl, host);
+
+		/* set I/O callbacks */
+		mbedtls_ssl_set_bio(&ssl, (void*)ep, wget_tls_send, wget_tls_recv, NULL);
+
+		/* handshake (may need multiple round-trips) */
+		while ((ret = mbedtls_ssl_handshake(&ssl)) != 0)
+		{
+			if (s->thread_command == EXIT || !s->in_use)
+			{
+				vt_write(idx, "cancelled\r\n");
+				mbedtls_ssl_free(&ssl);
+				mbedtls_ssl_config_free(&ssl_conf);
+				mbedtls_ctr_drbg_free(&ctr_drbg);
+				mbedtls_entropy_free(&entropy);
+				OTSndOrderlyDisconnect(ep);
+				OTUnbind(ep);
+				OTCloseProvider(ep);
+				s->endpoint = kOTInvalidEndpointRef;
+				return;
+			}
+
+			if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE)
+			{
+				if (TickCount() > hs_deadline)
+				{
+					vt_write(idx, "timed out\r\n");
+					mbedtls_ssl_free(&ssl);
+					mbedtls_ssl_config_free(&ssl_conf);
+					mbedtls_ctr_drbg_free(&ctr_drbg);
+					mbedtls_entropy_free(&entropy);
+					OTSndOrderlyDisconnect(ep);
+					OTUnbind(ep);
+					OTCloseProvider(ep);
+					s->endpoint = kOTInvalidEndpointRef;
+					return;
+				}
+				YieldToAnyThread();
+				continue;
+			}
+			printf_s(idx, "failed (err=-0x%04x)\r\n", (unsigned int)-ret);
+			mbedtls_ssl_free(&ssl);
+			mbedtls_ssl_config_free(&ssl_conf);
+			mbedtls_ctr_drbg_free(&ctr_drbg);
+			mbedtls_entropy_free(&entropy);
+			OTSndOrderlyDisconnect(ep);
+			OTUnbind(ep);
+			OTCloseProvider(ep);
+			s->endpoint = kOTInvalidEndpointRef;
+			return;
+		}
+
+		vt_write(idx, "ok.\r\n");
+		tls_initialized = 1;
+	}
+
+	/* send HTTP request */
+	snprintf(request, sizeof(request),
+	         "GET %s HTTP/1.0\r\n"
+	         "Host: %s\r\n"
+	         "User-Agent: SevenTTY/1.1\r\n"
+	         "Connection: close\r\n"
+	         "\r\n",
+	         path, host);
+	req_len = strlen(request);
+
+	{
+		int send_ok = 0;
+		if (use_tls)
+		{
+			int sent = 0;
+			while (sent < req_len)
+			{
+				if (s->thread_command == EXIT || !s->in_use) break;
+				int ret = mbedtls_ssl_write(&ssl,
+				          (unsigned char*)request + sent, req_len - sent);
+				if (ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+				    ret == MBEDTLS_ERR_SSL_WANT_READ) { YieldToAnyThread(); continue; }
+				if (ret <= 0) break;
+				sent += ret;
+			}
+			send_ok = (sent == req_len);
+		}
+		else
+		{
+			int sent = 0;
+			while (sent < req_len)
+			{
+				if (s->thread_command == EXIT || !s->in_use) break;
+				OTResult r = OTSnd(ep, request + sent, req_len - sent, 0);
+				if (r == kOTFlowErr) { YieldToAnyThread(); continue; }
+				if (r < 0) break;
+				sent += r;
+			}
+			send_ok = (sent == req_len);
+		}
+
+		if (!send_ok)
+		{
+			vt_write(idx, "wget: send failed\r\n");
+			if (tls_initialized)
+			{
+				mbedtls_ssl_close_notify(&ssl);
+				mbedtls_ssl_free(&ssl);
+				mbedtls_ssl_config_free(&ssl_conf);
+				mbedtls_ctr_drbg_free(&ctr_drbg);
+				mbedtls_entropy_free(&entropy);
+			}
+			OTSndOrderlyDisconnect(ep);
+			OTUnbind(ep);
+			OTCloseProvider(ep);
+			s->endpoint = kOTInvalidEndpointRef;
+			return;
+		}
+	}
+
+	printf_s(idx, "GET %s\r\n", path);
+
+	/* already non-blocking from after connect */
+	resp_len = 0;
+	header_done = 0;
+	headers_str[0] = '\0';
+
+	{
+	long next_progress_bytes = 524288L;
+	unsigned long next_progress_yield_tick = TickCount() + 2;
+	unsigned long recv_deadline = TickCount() + 1800; /* 30 sec inactivity timeout */
+	download_start_tick = TickCount();
+	while (1)
+	{
+		int r;
+		char buf[4096];
+		unsigned long now = TickCount();
+
+		if (s->thread_command == EXIT || !s->in_use)
+		{
+			vt_write(idx, "\r\nwget: cancelled\r\n");
+			break;
+		}
+
+		if (now > recv_deadline)
+		{
+			vt_write(idx, "\r\nwget: receive timed out\r\n");
+			break;
+		}
+
+		if (use_tls)
+		{
+			r = mbedtls_ssl_read(&ssl, (unsigned char*)buf, sizeof(buf));
+			if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+			    r == MBEDTLS_ERR_SSL_WANT_WRITE)
+			{ YieldToAnyThread(); continue; }
+			if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || r == 0)
+			{ download_ok = 1; break; }
+			if (r < 0) break;
+		}
+		else
+		{
+			OTResult otr = OTRcv(ep, buf, sizeof(buf), nil);
+			if (otr == kOTNoDataErr) { YieldToAnyThread(); continue; }
+			if (otr == kOTLookErr)
+			{
+				OTResult ev = OTLook(ep);
+				if (ev == T_ORDREL)
+				{
+					OTRcvOrderlyDisconnect(ep);
+					download_ok = 1;
+				}
+				break;
+			}
+			if (otr == 0) { download_ok = 1; break; }
+			if (otr < 0) break;
+			r = (int)otr;
+		}
+
+		recv_deadline = TickCount() + 1800; /* reset on data received */
+
+		if (!header_done)
+		{
+			/* accumulate into resp_buf to find end of headers */
+			int copy = r;
+			int overflow = 0; /* bytes from buf that didn't fit in resp_buf */
+			if (resp_len + copy > (int)sizeof(resp_buf) - 1)
+			{
+				copy = (int)sizeof(resp_buf) - 1 - resp_len;
+				overflow = r - copy;
+			}
+			if (copy <= 0)
+			{
+				vt_write(idx, "\r\nwget: response headers too large\r\n");
+				break;
+			}
+			memcpy(resp_buf + resp_len, buf, copy);
+			resp_len += copy;
+			resp_buf[resp_len] = '\0';
+
+			/* look for \r\n\r\n */
+			{
+				char* end = strstr(resp_buf, "\r\n\r\n");
+				if (end)
+				{
+					int header_len = (end - resp_buf) + 4;
+					int body_start = header_len;
+					int body_bytes = resp_len - body_start;
+
+					/* parse status line */
+					{
+						const char* sp = strchr(resp_buf, ' ');
+						if (sp) status_code = atoi(sp + 1);
+					}
+
+					/* copy headers for later inspection */
+					{
+						int hcopy = header_len;
+						if (hcopy > (int)sizeof(headers_str) - 1)
+							hcopy = (int)sizeof(headers_str) - 1;
+						memcpy(headers_str, resp_buf, hcopy);
+						headers_str[hcopy] = '\0';
+					}
+
+					/* handle redirects */
+					if (status_code >= 300 && status_code < 400)
+					{
+						const char* loc = http_header_find(headers_str, "location");
+						if (loc && redirect_count < 5)
+						{
+							int li = 0;
+							while (*loc && *loc != '\r' && *loc != '\n' && li < (int)sizeof(redirect_url) - 1)
+								redirect_url[li++] = *loc++;
+							redirect_url[li] = '\0';
+
+							/* handle relative redirects */
+							if (redirect_url[0] == '/' && redirect_url[1] == '/')
+							{
+								/* scheme-relative: //host/path */
+								char abs_url[800];
+								snprintf(abs_url, sizeof(abs_url), "%s%s",
+								         use_tls ? "https:" : "http:",
+								         redirect_url);
+								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+								redirect_url[sizeof(redirect_url) - 1] = '\0';
+							}
+							else if (redirect_url[0] == '/')
+							{
+								/* absolute path: /path */
+								char abs_url[800];
+								snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s",
+								         use_tls ? "https://" : "http://",
+								         host, (int)port, redirect_url);
+								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+								redirect_url[sizeof(redirect_url) - 1] = '\0';
+							}
+							else if (strncmp(redirect_url, "http://", 7) != 0 &&
+							         strncmp(redirect_url, "https://", 8) != 0)
+							{
+								/* bare relative: foo/bar -> resolve against current path */
+								char abs_url[800];
+								char base_path[512];
+								char* last_slash;
+								strncpy(base_path, path, sizeof(base_path) - 1);
+								base_path[sizeof(base_path) - 1] = '\0';
+								last_slash = strrchr(base_path, '/');
+								if (last_slash) last_slash[1] = '\0';
+								else strcpy(base_path, "/");
+								snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s%s",
+								         use_tls ? "https://" : "http://",
+								         host, (int)port, base_path, redirect_url);
+								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+								redirect_url[sizeof(redirect_url) - 1] = '\0';
+							}
+
+							printf_s(idx, "Redirect %d -> %s\r\n", status_code, redirect_url);
+
+							if (tls_initialized)
+							{
+								mbedtls_ssl_close_notify(&ssl);
+								mbedtls_ssl_free(&ssl);
+								mbedtls_ssl_config_free(&ssl_conf);
+								mbedtls_ctr_drbg_free(&ctr_drbg);
+								mbedtls_entropy_free(&entropy);
+								tls_initialized = 0;
+							}
+
+							OTSndOrderlyDisconnect(ep);
+							OTUnbind(ep);
+							OTCloseProvider(ep);
+							s->endpoint = kOTInvalidEndpointRef;
+
+							url = redirect_url;
+							redirect_count++;
+							resp_len = 0;
+							goto retry_redirect;
+						}
+					}
+
+					if (status_code != 200)
+					{
+						printf_s(idx, "HTTP %d\r\n", status_code);
+						break;
+					}
+
+					/* get content-length */
+					{
+						const char* cl = http_header_find(headers_str, "content-length");
+						if (cl) content_length = atol(cl);
+					}
+
+					/* figure out filename */
+					extract_filename(path, headers_str, filename, sizeof(filename));
+
+					/* truncate to 31 chars for HFS */
+					{
+						int nlen = strlen(filename);
+						if (nlen > 31) nlen = 31;
+						memcpy(local_name, filename, nlen);
+						local_name[nlen] = '\0';
+					}
+
+					printf_s(idx, "Saving to: %s", local_name);
+					if (content_length >= 0)
+						printf_s(idx, " (%ld bytes)", content_length);
+					vt_write(idx, "\r\n");
+
+					/* create output file */
+					{
+						int nlen = strlen(local_name);
+						pname[0] = nlen;
+						memcpy(pname + 1, local_name, nlen);
+					}
+
+					/* delete if exists */
+					{
+						FSSpec tmp;
+						if (FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &tmp) == noErr)
+							HDelete(s->shell_vRefNum, s->shell_dirID, pname);
+					}
+
+					HCreate(s->shell_vRefNum, s->shell_dirID, pname, ftype, fcreator);
+					FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &out_spec);
+
+					err = FSpOpenDF(&out_spec, fsRdWrPerm, &out_ref);
+					if (err != noErr)
+					{
+						vt_write(idx, "wget: cannot create output file\r\n");
+						break;
+					}
+
+					header_done = 1;
+
+					/* write any body data already received */
+					if (body_bytes > 0)
+					{
+						unsigned char* body_data = (unsigned char*)(resp_buf + body_start);
+						long wcount = body_bytes;
+
+						/* save first bytes for MacBinary check */
+						if (first_bytes_len < 128)
+						{
+							int grab = 128 - first_bytes_len;
+							if (grab > body_bytes) grab = body_bytes;
+							memcpy(first_bytes + first_bytes_len, body_data, grab);
+							first_bytes_len += grab;
+						}
+
+						FSWrite(out_ref, &wcount, body_data);
+						total_written += wcount;
+						if (wget_progress_step(idx, total_written, content_length,
+						                       &next_progress_bytes, &progress_live,
+						                       !no_progress) &&
+						    TickCount() >= next_progress_yield_tick)
+						{
+							YieldToAnyThread();
+							next_progress_yield_tick = TickCount() + 2;
+						}
+					}
+
+					/* write overflow bytes that didn't fit in resp_buf */
+					if (overflow > 0)
+					{
+						unsigned char* ovf_data = (unsigned char*)(buf + copy);
+						long wcount = overflow;
+
+						if (first_bytes_len < 128)
+						{
+							int grab = 128 - first_bytes_len;
+							if (grab > overflow) grab = overflow;
+							memcpy(first_bytes + first_bytes_len, ovf_data, grab);
+							first_bytes_len += grab;
+						}
+
+						FSWrite(out_ref, &wcount, ovf_data);
+						total_written += wcount;
+						if (wget_progress_step(idx, total_written, content_length,
+						                       &next_progress_bytes, &progress_live,
+						                       !no_progress) &&
+						    TickCount() >= next_progress_yield_tick)
+						{
+							YieldToAnyThread();
+							next_progress_yield_tick = TickCount() + 2;
+						}
+					}
+				}
+			}
+		}
+		else
+		{
+			/* body data */
+			long wcount = r;
+
+			/* save first bytes for MacBinary check */
+			if (first_bytes_len < 128)
+			{
+				int grab = 128 - first_bytes_len;
+				if (grab > r) grab = r;
+				memcpy(first_bytes + first_bytes_len, buf, grab);
+				first_bytes_len += grab;
+			}
+
+			FSWrite(out_ref, &wcount, buf);
+			total_written += wcount;
+
+			if (wget_progress_step(idx, total_written, content_length,
+			                       &next_progress_bytes, &progress_live,
+			                       !no_progress) &&
+			    TickCount() >= next_progress_yield_tick)
+			{
+				YieldToAnyThread();
+				next_progress_yield_tick = TickCount() + 2;
+			}
+		}
+	}
+	download_elapsed_ticks = TickCount() - download_start_tick;
+	} /* recv_deadline scope */
+
+	if (progress_live)
+		vt_write(idx, "\r\n");
+
+	/* clean up TLS */
+	if (tls_initialized)
+	{
+		mbedtls_ssl_close_notify(&ssl);
+		mbedtls_ssl_free(&ssl);
+		mbedtls_ssl_config_free(&ssl_conf);
+		mbedtls_ctr_drbg_free(&ctr_drbg);
+		mbedtls_entropy_free(&entropy);
+	}
+
+	/* clean up connection */
+	OTSndOrderlyDisconnect(ep);
+	OTUnbind(ep);
+	OTCloseProvider(ep);
+	s->endpoint = kOTInvalidEndpointRef;
+
+	if (out_ref)
+	{
+		FSClose(out_ref);
+
+		/* detect type/creator */
+
+		/* first: check for MacBinary header */
+		if (first_bytes_len >= 128)
+		{
+			OSType mb_type, mb_creator;
+			long mb_data, mb_rsrc;
+			if (check_macbinary(first_bytes, first_bytes_len,
+			                    &mb_type, &mb_creator, &mb_data, &mb_rsrc))
+			{
+				ftype = mb_type;
+				fcreator = mb_creator;
+				checked_macbinary = 1;
+				{
+					char tb[5], cb[5];
+					memcpy(tb, &mb_type, 4); tb[4] = '\0';
+					memcpy(cb, &mb_creator, 4); cb[4] = '\0';
+					printf_s(idx, "\r\nMacBinary detected: type='%s' creator='%s'\r\n",
+					         tb, cb);
+				}
+			}
+		}
+
+		/* second: try extension mapping */
+		if (!checked_macbinary)
+		{
+			if (lookup_ext_type(filename, &ftype, &fcreator))
+			{
+				char tb[5], cb[5];
+				memcpy(tb, &ftype, 4); tb[4] = '\0';
+				memcpy(cb, &fcreator, 4); cb[4] = '\0';
+				printf_s(idx, "\r\nType from extension: '%s'/'%s'\r\n", tb, cb);
+			}
+		}
+
+		/* set type/creator */
+		{
+			FInfo finfo;
+			if (FSpGetFInfo(&out_spec, &finfo) == noErr)
+			{
+				finfo.fdType = ftype;
+				finfo.fdCreator = fcreator;
+				FSpSetFInfo(&out_spec, &finfo);
+			}
+		}
+
+		if (download_ok && content_length >= 0 && total_written < content_length)
+			download_ok = 0;
+
+		if (download_ok)
+			printf_s(idx, "\r\n%ld bytes saved to %s\r\n", total_written, local_name);
+		else
+			printf_s(idx, "\r\n%ld bytes saved to %s (INCOMPLETE)\r\n",
+			         total_written, local_name);
+
+		if (download_elapsed_ticks > 0)
+		{
+			long kb = total_written / 1024L;
+			long kbps = (kb * 60L) / (long)download_elapsed_ticks;
+			printf_s(idx, "Average speed: %ld KB/s\r\n", kbps);
+		}
+	}
+	else if (status_code == 200)
+	{
+		vt_write(idx, "wget: no data received\r\n");
+	}
+
+}
+
+static int local_shell_worker_active(const struct session* s)
+{
+	return (s->type == SESSION_LOCAL &&
+	        s->recv_buffer == NULL &&
+	        s->thread_id != kNoThreadID &&
+	        s->thread_state != DONE &&
+	        s->thread_state != UNINITIALIZED);
+}
+
+static void* wget_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
+
+	cmd_wget_run(idx, s->wget_url, s->wget_no_progress ? 1 : 0);
+
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	if (s->in_use && s->type == SESSION_LOCAL && s->recv_buffer == NULL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+static void cmd_wget(int idx, int argc, char** argv)
+{
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
+	int argi = 1;
+	int no_progress = 0;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: wget [-n] <url>\r\n");
+		return;
+	}
+
+	if (strcmp(argv[argi], "-n") == 0 || strcmp(argv[argi], "--no-progress") == 0)
+	{
+		no_progress = 1;
+		argi++;
+	}
+
+	if (argi >= argc)
+	{
+		vt_write(idx, "usage: wget [-n] <url>\r\n");
+		return;
+	}
+
+	if (argi + 1 < argc)
+	{
+		vt_write(idx, "wget: too many arguments\r\n");
+		vt_write(idx, "usage: wget [-n] <url>\r\n");
+		return;
+	}
+
+	if (s->recv_buffer != NULL)
+	{
+		vt_write(idx, "wget: unavailable while nc session is active\r\n");
+		return;
+	}
+
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			vt_write(idx, "wget: previous worker thread could not be reclaimed\r\n");
+			return;
+		}
+	}
+
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "wget: another local command is already running\r\n");
+		return;
+	}
+
+	strncpy(s->wget_url, argv[argi], sizeof(s->wget_url) - 1);
+	s->wget_url[sizeof(s->wget_url) - 1] = '\0';
+	s->wget_no_progress = no_progress ? 1 : 0;
+
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
+
+	err = NewThread(kCooperativeThread, wget_worker_thread,
+	                (void*)(long)idx, 200000,
+	                kCreateIfNeeded, NULL, &tid);
+	if (err != noErr)
+	{
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "wget: failed to create worker thread (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	s->thread_id = tid;
+}
+
+/* ------------------------------------------------------------------ */
 /* realpath - resolve to full absolute path                           */
 /* ------------------------------------------------------------------ */
 
@@ -4883,88 +6443,95 @@ static void cmd_readlink(int idx, int argc, char** argv)
 
 static void cmd_help(int idx, int argc, char* argv[])
 {
-	vt_write(idx, "SevenTTY local shell - commands:\r\n");
-	vt_write(idx, "\r\n");
-	vt_write(idx, "  \033[1mFile operations:\033[0m\r\n");
-	vt_write(idx, "    ls [-la] [path]    list directory\r\n");
-	vt_write(idx, "    cd [path]          change directory\r\n");
-	vt_write(idx, "    pwd                print working directory\r\n");
-	vt_write(idx, "    cat <file>         show file contents\r\n");
-	vt_write(idx, "    head [-n N] <file> show first N lines\r\n");
-	vt_write(idx, "    tail [-n N] <file> show last N lines\r\n");
-	vt_write(idx, "    grep [-ivnc] s f   search for string in file\r\n");
-	vt_write(idx, "    hexdump <file>     hex + ASCII dump\r\n");
-	vt_write(idx, "    strings [-n N] f   printable strings in file\r\n");
-	vt_write(idx, "    hexdump and xxd are different formats:\r\n");
-	vt_write(idx, "    xxd [-r] <file>    xxd-style dump (-r=reverse)\r\n");
-	vt_write(idx, "    nl <file>          cat with line numbers\r\n");
-	vt_write(idx, "    cut -d. -f1,3 f    extract delimited fields\r\n");
-	vt_write(idx, "    fold [-w N] <file> wrap lines to N columns\r\n");
-	vt_write(idx, "    rev <file>         reverse each line\r\n");
-	vt_write(idx, "    cmp <f1> <f2>      compare two files\r\n");
-	vt_write(idx, "    cp <src> <dst>     copy file (both forks)\r\n");
-	vt_write(idx, "    mv <old> <new>     rename file\r\n");
-	vt_write(idx, "    rm <file>          delete file\r\n");
-	vt_write(idx, "    mkdir <name>       create directory\r\n");
-	vt_write(idx, "    rmdir <dir>        remove empty directory\r\n");
-	vt_write(idx, "    touch <file>       create or update timestamp\r\n");
-	vt_write(idx, "    ln -s <tgt> <lnk>  create Mac alias\r\n");
-	vt_write(idx, "    readlink <alias>   show alias target\r\n");
-	vt_write(idx, "    realpath <path>    full absolute path\r\n");
-	vt_write(idx, "    which <command>    find application path\r\n");
-	vt_write(idx, "    wc [-lwc] <file>   line/word/byte count\r\n");
-	vt_write(idx, "    rot13 <file>       ROT13 encode/decode\r\n");
-	vt_write(idx, "    dos2unix <file>    CRLF to LF (in-place)\r\n");
-	vt_write(idx, "    unix2dos <file>    LF to CRLF (in-place)\r\n");
-	vt_write(idx, "    mac2unix <file>    CR to LF (in-place)\r\n");
-	vt_write(idx, "    unix2mac <file>    LF to CR (in-place)\r\n");
-	vt_write(idx, "\r\n");
-	vt_write(idx, "  \033[1mChecksums:\033[0m\r\n");
-	vt_write(idx, "    md5sum <file>      MD5 hash\r\n");
-	vt_write(idx, "    sha1sum <file>     SHA-1 hash\r\n");
-	vt_write(idx, "    sha256sum <file>   SHA-256 hash\r\n");
-	vt_write(idx, "    sha512sum <file>   SHA-512 hash\r\n");
-	vt_write(idx, "    crc32 <file>       CRC32 checksum\r\n");
-	vt_write(idx, "\r\n");
-	vt_write(idx, "  \033[1mMac-specific:\033[0m\r\n");
-	vt_write(idx, "    getinfo <file>     show full file info\r\n");
-	vt_write(idx, "    chown TYPE:CREA f  set type/creator codes\r\n");
-	vt_write(idx, "    settype TYPE f     set file type\r\n");
-	vt_write(idx, "    setcreator CREA f  set file creator\r\n");
-	vt_write(idx, "    chmod +w|-w f      unlock/lock file\r\n");
-	vt_write(idx, "    chattr [+-]li f    set lock/invisible\r\n");
-	vt_write(idx, "    label <0-7> f      set Finder label color\r\n");
-	vt_write(idx, "\r\n");
-	vt_write(idx, "  \033[1mSystem:\033[0m\r\n");
-	vt_write(idx, "    basename <path>    filename part of path\r\n");
-	vt_write(idx, "    dirname <path>     directory part of path\r\n");
-	vt_write(idx, "    seq [first] last   print number sequence\r\n");
-	vt_write(idx, "    sleep <seconds>    wait N seconds\r\n");
-	vt_write(idx, "    echo [text...]     print text\r\n");
-	vt_write(idx, "    clear              clear screen\r\n");
-	vt_write(idx, "    df [-m|-h]         show disk usage\r\n");
-	vt_write(idx, "    date               show date/time\r\n");
-	vt_write(idx, "    uptime             time since boot\r\n");
-	vt_write(idx, "    cal                calendar for this month\r\n");
-	vt_write(idx, "    uname              show system info\r\n");
-	vt_write(idx, "    hostname           computer name\r\n");
-	vt_write(idx, "    free [-m|-h]       show memory usage\r\n");
-	vt_write(idx, "    ps                 list running processes\r\n");
-	vt_write(idx, "    history            command history\r\n");
-	vt_write(idx, "    open <path>        launch application\r\n");
-	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
-	vt_write(idx, "    telnet <h> [port]  open telnet tab\r\n");
-	vt_write(idx, "    nc <host> <port>   raw TCP connection\r\n");
-	vt_write(idx, "    host <hostname>    DNS lookup\r\n");
-	vt_write(idx, "    ping <host> [port] TCP connect test\r\n");
-	vt_write(idx, "    ifconfig           show network config\r\n");
-	vt_write(idx, "    colors             display color test\r\n");
-	vt_write(idx, "    help               this message\r\n");
-	vt_write(idx, "    exit               close this tab\r\n");
-	vt_write(idx, "\r\n");
-	vt_write(idx, "  Paths: use / or : as separator, .. for parent\r\n");
-	vt_write(idx, "  Run apps by path: ./SimpleText or /Apps/SimpleText\r\n");
-	vt_write(idx, "  Tab completion works for commands and file names.\r\n");
+	static const char* help_lines[] = {
+		"SevenTTY local shell - commands:",
+		"",
+		"  \033[1mFile operations:\033[0m",
+		"    ls [-la] [path]    list directory",
+		"    cd [path]          change directory",
+		"    pwd                print working directory",
+		"    cat <file>         show file contents",
+		"    head [-n N] <file> show first N lines",
+		"    tail [-n N] <file> show last N lines",
+		"    grep [-ivnc] s f   search for string in file",
+		"    hexdump <file>     hex + ASCII dump",
+		"    strings [-n N] f   printable strings in file",
+		"    xxd [-r] <file>    xxd-style dump (-r=reverse)",
+		"    nl <file>          cat with line numbers",
+		"    cut -d. -f1,3 f    extract delimited fields",
+		"    fold [-w N] <file> wrap lines to N columns",
+		"    rev <file>         reverse each line",
+		"    cmp <f1> <f2>      compare two files",
+		"    cp <src> <dst>     copy file (both forks)",
+		"    mv <old> <new>     rename file",
+		"    rm [-i] <file>     delete file (-i=confirm)",
+		"    mkdir <name>       create directory",
+		"    rmdir <dir>        remove empty directory",
+		"    touch <file>       create or update timestamp",
+		"    ln -s <tgt> <lnk>  create Mac alias",
+		"    readlink <alias>   show alias target",
+		"    realpath <path>    full absolute path",
+		"    which <command>    find application path",
+		"    wc [-lwc] <file>   line/word/byte count",
+		"    rot13 <file>       ROT13 encode/decode",
+		"    dos2unix <file>    CRLF to LF (in-place)",
+		"    unix2dos <file>    LF to CRLF (in-place)",
+		"    mac2unix <file>    CR to LF (in-place)",
+		"    unix2mac <file>    LF to CR (in-place)",
+		"",
+		"  \033[1mChecksums:\033[0m",
+		"    md5sum <file>      MD5 hash",
+		"    sha1sum <file>     SHA-1 hash",
+		"    sha256sum <file>   SHA-256 hash",
+		"    sha512sum <file>   SHA-512 hash",
+		"    crc32 <file>       CRC32 checksum",
+		"",
+		"  \033[1mMac-specific:\033[0m",
+		"    getinfo <file>     show full file info",
+		"    chown TYPE:CREA f  set type/creator codes",
+		"    settype TYPE f     set file type",
+		"    setcreator CREA f  set file creator",
+		"    chmod +w|-w f      unlock/lock file",
+		"    chattr [+-]li f    set lock/invisible",
+		"    label <0-7> f      set Finder label color",
+		"",
+		"  \033[1mSystem:\033[0m",
+		"    basename <path>    filename part of path",
+		"    dirname <path>     directory part of path",
+		"    seq [first] last   print number sequence",
+		"    sleep <seconds>    wait N seconds",
+		"    echo [text...]     print text",
+		"    clear              clear screen",
+		"    df [-m|-h]         show disk usage",
+		"    date               show date/time",
+		"    uptime             time since boot",
+		"    cal                calendar for this month",
+		"    uname              show system info",
+		"    hostname           computer name",
+		"    free [-m|-h]       show memory usage",
+		"    ps                 list running processes",
+		"    history            command history",
+		"    open <path>        launch application",
+		"    ssh [user@]h[:p]   open SSH tab",
+		"    telnet <h> [port]  open telnet tab",
+		"    wget [-n] <url>    HTTP download",
+		"    nc <host> <port>   raw TCP connection",
+		"    host <hostname>    DNS lookup",
+		"    ping <host> [port] TCP connect test",
+		"    ifconfig           show network config",
+		"    colors             display color test",
+		"    help               this message",
+		"    exit               close this tab",
+		"",
+		"  Paths: use / or : as separator, .. for parent",
+		"  Run apps by path: ./SimpleText or /Apps/SimpleText",
+		"  Tab completion works for commands and file names.",
+		"  Scroll: Shift+PgUp/PgDn (page), Cmd+Up/Down (line)"
+	};
+
+	(void)argc;
+	(void)argv;
+	shell_paged_write(idx, help_lines, sizeof(help_lines) / sizeof(help_lines[0]));
 }
 
 /* ------------------------------------------------------------------ */
@@ -5026,7 +6593,7 @@ static const char* shell_commands[] = {
 	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "seq",
 	"setcreator", "settype", "sha1sum", "sha256sum", "sha512sum", "sleep",
 	"ssh", "strings", "tail", "telnet", "touch", "type", "uname",
-	"unix2dos", "unix2mac", "uptime", "wc", "which", "xxd"
+	"unix2dos", "unix2mac", "uptime", "wc", "wget", "which", "xxd"
 };
 #define NUM_SHELL_COMMANDS (sizeof(shell_commands) / sizeof(shell_commands[0]))
 
@@ -5604,6 +7171,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "which") == 0)    cmd_which(idx, argc, argv);
 	else if (strcmp(cmd, "ln") == 0)       cmd_ln(idx, argc, argv);
 	else if (strcmp(cmd, "readlink") == 0) cmd_readlink(idx, argc, argv);
+	else if (strcmp(cmd, "wget") == 0)     cmd_wget(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
@@ -5823,6 +7391,30 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 			vt_write(session_idx, "\r\n(cancelled)\r\n");
 			shell_prompt(session_idx);
 			return;
+		}
+		return;
+	}
+
+	/* Reap completed local worker threads before handling new key input. */
+	if (s->type == SESSION_LOCAL &&
+		s->recv_buffer == NULL &&
+		s->thread_state == DONE &&
+		s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(session_idx, 0);
+	}
+
+	/* While a local worker command is active (e.g. wget), suppress line
+	   editing and only allow Ctrl+C to request cancellation. */
+	if (local_shell_worker_active(s))
+	{
+		if ((c == 3 && ((modifiers & controlKey) || vkeycode != 0x4C)) ||
+			(modifiers & controlKey && c == 'c'))
+		{
+			s->thread_command = EXIT;
+			if (s->endpoint != kOTInvalidEndpointRef)
+				OTCancelSynchronousCalls(s->endpoint, kOTCanceledErr);
+			vt_write(session_idx, "^C\r\n");
 		}
 		return;
 	}
@@ -6065,8 +7657,9 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 			s->shell_cursor_pos = 0;
 			s->shell_line[0] = '\0';
 			s->shell_history_pos = -1;
-			/* suppress prompt if nc inline is active (thread running) */
-			if (!(s->recv_buffer != NULL && s->type == SESSION_LOCAL))
+			/* suppress prompt if a local worker thread is active */
+			if (!(s->recv_buffer != NULL && s->type == SESSION_LOCAL) &&
+				!local_shell_worker_active(s))
 				shell_prompt(session_idx);
 		}
 		return;

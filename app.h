@@ -102,6 +102,8 @@ struct session
 	int shell_history_pos;   // current browse position (-1 = editing new line)
 	char shell_saved_line[256]; // saved line when browsing history
 	int shell_saved_len;
+	char wget_url[512]; // last/active wget URL for local wget worker
+	unsigned char wget_no_progress; // wget -n disables live progress redraw
 
 	// scrollback buffer (ring buffer of compact rows)
 	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];

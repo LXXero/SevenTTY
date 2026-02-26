@@ -1716,6 +1716,32 @@ void scroll_down(struct window_context* wc)
 	wc->needs_redraw = 1;
 }
 
+void scroll_up_line(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+
+	if (s->scroll_offset < s->sb_count)
+		s->scroll_offset++;
+
+	SetPort(wc->win);
+	InvalRect(&wc->win->portRect);
+	wc->needs_redraw = 1;
+}
+
+void scroll_down_line(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+
+	if (s->scroll_offset > 0)
+		s->scroll_offset--;
+
+	SetPort(wc->win);
+	InvalRect(&wc->win->portRect);
+	wc->needs_redraw = 1;
+}
+
 void scroll_reset(struct window_context* wc)
 {
 	int sid = wc->session_ids[wc->active_session_idx];
