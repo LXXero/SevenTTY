@@ -23,6 +23,11 @@
 #include <TextUtils.h>
 #include <Threads.h>
 
+#include <mbedtls/md5.h>
+#include <mbedtls/sha1.h>
+#include <mbedtls/sha256.h>
+#include <mbedtls/sha512.h>
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -2468,6 +2473,2414 @@ static void cmd_colors(int idx, int argc, char* argv[])
 	vt_write(idx, "\r\n");
 }
 
+/* ------------------------------------------------------------------ */
+/* CRC32 (standard, same polynomial as zlib/cksfv)                    */
+/* ------------------------------------------------------------------ */
+
+static unsigned long crc32_table[256];
+static int crc32_table_ready = 0;
+
+static void crc32_init_table(void)
+{
+	unsigned long poly = 0xEDB88320UL;
+	int i, j;
+	for (i = 0; i < 256; i++)
+	{
+		unsigned long c = (unsigned long)i;
+		for (j = 0; j < 8; j++)
+		{
+			if (c & 1)
+				c = poly ^ (c >> 1);
+			else
+				c = c >> 1;
+		}
+		crc32_table[i] = c;
+	}
+	crc32_table_ready = 1;
+}
+
+static unsigned long crc32_update(unsigned long crc, const unsigned char* buf, long len)
+{
+	long i;
+	if (!crc32_table_ready) crc32_init_table();
+	for (i = 0; i < len; i++)
+		crc = crc32_table[(crc ^ buf[i]) & 0xFF] ^ (crc >> 8);
+	return crc;
+}
+
+/* ------------------------------------------------------------------ */
+/* hash commands: md5sum, sha1sum, sha256sum, sha512sum, crc32        */
+/* ------------------------------------------------------------------ */
+
+enum hash_type { HASH_MD5, HASH_SHA1, HASH_SHA256, HASH_SHA512, HASH_CRC32 };
+
+static void cmd_hash(int idx, int argc, char** argv, enum hash_type type)
+{
+	const char* name;
+	unsigned char digest[64];
+	int digest_len;
+	mbedtls_md5_context md5_ctx;
+	mbedtls_sha1_context sha1_ctx;
+	mbedtls_sha256_context sha256_ctx;
+	mbedtls_sha512_context sha512_ctx;
+	unsigned long crc;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	char hex[129];
+	int i;
+
+	switch (type)
+	{
+		case HASH_MD5:    name = "md5sum"; break;
+		case HASH_SHA1:   name = "sha1sum"; break;
+		case HASH_SHA256: name = "sha256sum"; break;
+		case HASH_SHA512: name = "sha512sum"; break;
+		case HASH_CRC32:  name = "crc32"; break;
+		default:          name = "hash"; break;
+	}
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: ");
+		vt_write(idx, name);
+		vt_write(idx, " <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, name);
+		vt_write(idx, ": file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, name);
+		vt_write(idx, ": cannot open file\r\n");
+		return;
+	}
+
+	/* init */
+	switch (type)
+	{
+		case HASH_MD5:    mbedtls_md5_init(&md5_ctx);     mbedtls_md5_starts(&md5_ctx);       break;
+		case HASH_SHA1:   mbedtls_sha1_init(&sha1_ctx);   mbedtls_sha1_starts(&sha1_ctx);     break;
+		case HASH_SHA256: mbedtls_sha256_init(&sha256_ctx); mbedtls_sha256_starts(&sha256_ctx, 0); break;
+		case HASH_SHA512: mbedtls_sha512_init(&sha512_ctx); mbedtls_sha512_starts(&sha512_ctx, 0); break;
+		case HASH_CRC32:  crc = 0xFFFFFFFFUL; break;
+	}
+
+	/* read and update */
+	while (1)
+	{
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		if (count > 0)
+		{
+			switch (type)
+			{
+				case HASH_MD5:    mbedtls_md5_update(&md5_ctx, buf, count);       break;
+				case HASH_SHA1:   mbedtls_sha1_update(&sha1_ctx, buf, count);     break;
+				case HASH_SHA256: mbedtls_sha256_update(&sha256_ctx, buf, count); break;
+				case HASH_SHA512: mbedtls_sha512_update(&sha512_ctx, buf, count); break;
+				case HASH_CRC32:  crc = crc32_update(crc, buf, count);            break;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	FSClose(refNum);
+
+	/* finish */
+	switch (type)
+	{
+		case HASH_MD5:
+			mbedtls_md5_finish(&md5_ctx, digest);
+			mbedtls_md5_free(&md5_ctx);
+			digest_len = 16;
+			break;
+		case HASH_SHA1:
+			mbedtls_sha1_finish(&sha1_ctx, digest);
+			mbedtls_sha1_free(&sha1_ctx);
+			digest_len = 20;
+			break;
+		case HASH_SHA256:
+			mbedtls_sha256_finish(&sha256_ctx, digest);
+			mbedtls_sha256_free(&sha256_ctx);
+			digest_len = 32;
+			break;
+		case HASH_SHA512:
+			mbedtls_sha512_finish(&sha512_ctx, digest);
+			mbedtls_sha512_free(&sha512_ctx);
+			digest_len = 64;
+			break;
+		case HASH_CRC32:
+			crc ^= 0xFFFFFFFFUL;
+			digest[0] = (unsigned char)(crc >> 24);
+			digest[1] = (unsigned char)(crc >> 16);
+			digest[2] = (unsigned char)(crc >> 8);
+			digest[3] = (unsigned char)(crc);
+			digest_len = 4;
+			break;
+		default:
+			digest_len = 0;
+			break;
+	}
+
+	/* format hex string */
+	for (i = 0; i < digest_len; i++)
+	{
+		static const char hx[] = "0123456789abcdef";
+		hex[i * 2]     = hx[(digest[i] >> 4) & 0x0F];
+		hex[i * 2 + 1] = hx[digest[i] & 0x0F];
+	}
+	hex[digest_len * 2] = '\0';
+
+	vt_write(idx, hex);
+	vt_write(idx, "  ");
+	vt_write(idx, argv[1]);
+	vt_write(idx, "\r\n");
+}
+
+static void cmd_md5sum(int idx, int argc, char** argv)    { cmd_hash(idx, argc, argv, HASH_MD5); }
+static void cmd_sha1sum(int idx, int argc, char** argv)   { cmd_hash(idx, argc, argv, HASH_SHA1); }
+static void cmd_sha256sum(int idx, int argc, char** argv) { cmd_hash(idx, argc, argv, HASH_SHA256); }
+static void cmd_sha512sum(int idx, int argc, char** argv) { cmd_hash(idx, argc, argv, HASH_SHA512); }
+static void cmd_crc32(int idx, int argc, char** argv)     { cmd_hash(idx, argc, argv, HASH_CRC32); }
+
+/* ------------------------------------------------------------------ */
+/* wc - line/word/byte count                                          */
+/* ------------------------------------------------------------------ */
+
+static void cmd_wc(int idx, int argc, char** argv)
+{
+	int show_lines = 0, show_words = 0, show_bytes = 0;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	long lines = 0, words = 0, bytes = 0;
+	int in_word = 0;
+	int prev_cr = 0;
+	long i;
+	char num[16];
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] == '-' && argv[argi][1] != '\0')
+		{
+			const char* f = &argv[argi][1];
+			while (*f)
+			{
+				if (*f == 'l') show_lines = 1;
+				else if (*f == 'w') show_words = 1;
+				else if (*f == 'c') show_bytes = 1;
+				f++;
+			}
+		}
+		else
+		{
+			filename = argv[argi];
+		}
+	}
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: wc [-lwc] <file>\r\n");
+		return;
+	}
+
+	/* no flags = show all */
+	if (!show_lines && !show_words && !show_bytes)
+	{
+		show_lines = 1;
+		show_words = 1;
+		show_bytes = 1;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "wc: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "wc: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		if (count > 0)
+		{
+			bytes += count;
+			for (i = 0; i < count; i++)
+			{
+				unsigned char c = buf[i];
+
+				/* count lines: \n, or \r not followed by \n */
+				if (c == '\n')
+				{
+					lines++;
+					prev_cr = 0;
+				}
+				else
+				{
+					if (prev_cr) lines++;
+					prev_cr = (c == '\r');
+				}
+
+				/* count words: transitions from whitespace to non-whitespace */
+				if (c == ' ' || c == '\t' || c == '\r' || c == '\n')
+					in_word = 0;
+				else if (!in_word)
+				{
+					words++;
+					in_word = 1;
+				}
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* trailing CR counts as a line */
+	if (prev_cr) lines++;
+
+	FSClose(refNum);
+
+	if (show_lines)
+	{
+		snprintf(num, sizeof(num), "%7ld", lines);
+		vt_write(idx, num);
+	}
+	if (show_words)
+	{
+		snprintf(num, sizeof(num), "%8ld", words);
+		vt_write(idx, num);
+	}
+	if (show_bytes)
+	{
+		snprintf(num, sizeof(num), "%8ld", bytes);
+		vt_write(idx, num);
+	}
+	vt_write(idx, " ");
+	vt_write(idx, filename);
+	vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* rot13 - ROT13 encode/decode file                                   */
+/* ------------------------------------------------------------------ */
+
+static void cmd_rot13(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	char buf[512];
+	long count, i;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: rot13 <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "rot13: file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "rot13: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		if (count > 0)
+		{
+			for (i = 0; i < count; i++)
+			{
+				char c = buf[i];
+				if (c >= 'A' && c <= 'Z')
+					c = 'A' + ((c - 'A' + 13) % 26);
+				else if (c >= 'a' && c <= 'z')
+					c = 'a' + ((c - 'a' + 13) % 26);
+
+				if (c == '\r')
+					vt_write(idx, "\r\n");
+				else if (c == '\n')
+					; /* skip bare LF (CR already handled) */
+				else
+					vt_char(idx, c);
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	FSClose(refNum);
+	vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* grep - fixed-string search in files                                */
+/* ------------------------------------------------------------------ */
+
+/* case-insensitive strstr */
+static const char* stristr(const char* haystack, const char* needle)
+{
+	size_t nlen;
+	if (!*needle) return haystack;
+	nlen = strlen(needle);
+	while (*haystack)
+	{
+		size_t i;
+		int match = 1;
+		for (i = 0; i < nlen; i++)
+		{
+			if (haystack[i] == '\0') return NULL;
+			if (tolower((unsigned char)haystack[i]) != tolower((unsigned char)needle[i]))
+			{
+				match = 0;
+				break;
+			}
+		}
+		if (match) return haystack;
+		haystack++;
+	}
+	return NULL;
+}
+
+static void cmd_grep(int idx, int argc, char** argv)
+{
+	int opt_i = 0, opt_v = 0, opt_n = 0, opt_c = 0;
+	const char* pattern = NULL;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	/* line assembly buffer */
+	char line[1024];
+	int line_len = 0;
+	long line_num = 0;
+	long match_count = 0;
+	char num[16];
+
+	/* parse flags */
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] == '-' && argv[argi][1] != '\0')
+		{
+			const char* f = &argv[argi][1];
+			while (*f)
+			{
+				if (*f == 'i') opt_i = 1;
+				else if (*f == 'v') opt_v = 1;
+				else if (*f == 'n') opt_n = 1;
+				else if (*f == 'c') opt_c = 1;
+				f++;
+			}
+		}
+		else if (!pattern)
+			pattern = argv[argi];
+		else if (!filename)
+			filename = argv[argi];
+	}
+
+	if (!pattern || !filename)
+	{
+		vt_write(idx, "usage: grep [-ivnc] <pattern> <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "grep: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "grep: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+
+			/* end of line? (\r, \n, or \r\n) */
+			if (c == '\r' || c == '\n')
+			{
+				const char* found;
+				int matched;
+
+				/* skip \n after \r */
+				if (c == '\r' && i + 1 < count && buf[i + 1] == '\n')
+					i++;
+
+				line[line_len] = '\0';
+				line_num++;
+
+				found = opt_i ? stristr(line, pattern) : strstr(line, pattern);
+				matched = found ? 1 : 0;
+				if (opt_v) matched = !matched;
+
+				if (matched)
+				{
+					match_count++;
+					if (!opt_c)
+					{
+						if (opt_n)
+						{
+							snprintf(num, sizeof(num), "%ld:", line_num);
+							vt_write(idx, num);
+						}
+						vt_write(idx, line);
+						vt_write(idx, "\r\n");
+					}
+				}
+
+				line_len = 0;
+			}
+			else
+			{
+				if (line_len < (int)sizeof(line) - 1)
+					line[line_len++] = c;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* handle last line without trailing newline */
+	if (line_len > 0)
+	{
+		const char* found;
+		int matched;
+		line[line_len] = '\0';
+		line_num++;
+
+		found = opt_i ? stristr(line, pattern) : strstr(line, pattern);
+		matched = found ? 1 : 0;
+		if (opt_v) matched = !matched;
+
+		if (matched)
+		{
+			match_count++;
+			if (!opt_c)
+			{
+				if (opt_n)
+				{
+					snprintf(num, sizeof(num), "%ld:", line_num);
+					vt_write(idx, num);
+				}
+				vt_write(idx, line);
+				vt_write(idx, "\r\n");
+			}
+		}
+	}
+
+	if (opt_c)
+	{
+		snprintf(num, sizeof(num), "%ld", match_count);
+		vt_write(idx, num);
+		vt_write(idx, "\r\n");
+	}
+
+	FSClose(refNum);
+}
+
+/* ------------------------------------------------------------------ */
+/* head / tail - show first/last N lines of a file                    */
+/* ------------------------------------------------------------------ */
+
+static void cmd_head(int idx, int argc, char** argv)
+{
+	int num_lines = 10;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	int cur_line = 0;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] == '-' && argv[argi][1] >= '0' && argv[argi][1] <= '9')
+			num_lines = atoi(&argv[argi][1]);
+		else if (strcmp(argv[argi], "-n") == 0 && argi + 1 < argc)
+			num_lines = atoi(argv[++argi]);
+		else
+			filename = argv[argi];
+	}
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: head [-n N] <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "head: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "head: cannot open file\r\n");
+		return;
+	}
+
+	while (cur_line < num_lines)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count && cur_line < num_lines; i++)
+		{
+			unsigned char c = buf[i];
+			if (c == '\r')
+			{
+				vt_write(idx, "\r\n");
+				cur_line++;
+				/* skip \n after \r */
+				if (i + 1 < count && buf[i + 1] == '\n')
+					i++;
+			}
+			else if (c == '\n')
+			{
+				vt_write(idx, "\r\n");
+				cur_line++;
+			}
+			else
+			{
+				vt_char(idx, c);
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	FSClose(refNum);
+}
+
+static void cmd_tail(int idx, int argc, char** argv)
+{
+	int num_lines = 10;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	/* ring buffer of line start offsets */
+	#define TAIL_MAX 256
+	long offsets[TAIL_MAX + 1]; /* stores start-of-line file offsets */
+	int off_head = 0; /* next write slot */
+	int off_count = 0;
+	long file_pos = 0;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] == '-' && argv[argi][1] >= '0' && argv[argi][1] <= '9')
+			num_lines = atoi(&argv[argi][1]);
+		else if (strcmp(argv[argi], "-n") == 0 && argi + 1 < argc)
+			num_lines = atoi(argv[++argi]);
+		else
+			filename = argv[argi];
+	}
+
+	if (num_lines > TAIL_MAX) num_lines = TAIL_MAX;
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: tail [-n N] <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "tail: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "tail: cannot open file\r\n");
+		return;
+	}
+
+	/* first pass: record line-start offsets in a ring buffer */
+	offsets[0] = 0; /* file starts at a line */
+	off_count = 1;
+	off_head = 1;
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+			file_pos++;
+			if (c == '\r')
+			{
+				/* skip \n after \r */
+				if (i + 1 < count && buf[i + 1] == '\n')
+				{
+					i++;
+					file_pos++;
+				}
+				offsets[off_head] = file_pos;
+				off_head = (off_head + 1) % (TAIL_MAX + 1);
+				if (off_count < TAIL_MAX + 1) off_count++;
+			}
+			else if (c == '\n')
+			{
+				offsets[off_head] = file_pos;
+				off_head = (off_head + 1) % (TAIL_MAX + 1);
+				if (off_count < TAIL_MAX + 1) off_count++;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* seek to the right line and output */
+	{
+		long seek_off;
+		int start_idx;
+
+		if (off_count <= num_lines)
+			seek_off = 0;
+		else
+		{
+			start_idx = (off_head - num_lines + (TAIL_MAX + 1)) % (TAIL_MAX + 1);
+			seek_off = offsets[start_idx];
+		}
+
+		SetFPos(refNum, fsFromStart, seek_off);
+
+		while (1)
+		{
+			long i;
+			count = sizeof(buf);
+			e = FSRead(refNum, &count, buf);
+			for (i = 0; i < count; i++)
+			{
+				unsigned char c = buf[i];
+				if (c == '\r')
+				{
+					vt_write(idx, "\r\n");
+					if (i + 1 < count && buf[i + 1] == '\n')
+						i++;
+				}
+				else if (c == '\n')
+				{
+					vt_write(idx, "\r\n");
+				}
+				else
+				{
+					vt_char(idx, c);
+				}
+			}
+			if (e == eofErr || e != noErr) break;
+		}
+	}
+
+	FSClose(refNum);
+	#undef TAIL_MAX
+}
+
+/* ------------------------------------------------------------------ */
+/* hexdump - hex + ASCII dump of a file                               */
+/* ------------------------------------------------------------------ */
+
+static void cmd_hexdump(int idx, int argc, char** argv)
+{
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[16];
+	long count;
+	long offset = 0;
+	char hex[8];
+	int i;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] != '-')
+		{
+			filename = argv[argi];
+			break;
+		}
+	}
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: hexdump <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "hexdump: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "hexdump: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		count = 16;
+		e = FSRead(refNum, &count, buf);
+		if (count <= 0) break;
+
+		/* offset */
+		snprintf(hex, sizeof(hex), "%07lx", offset);
+		vt_write(idx, hex);
+		vt_write(idx, "  ");
+
+		/* hex bytes */
+		for (i = 0; i < 16; i++)
+		{
+			if (i < count)
+			{
+				static const char hx[] = "0123456789abcdef";
+				char h[3];
+				h[0] = hx[(buf[i] >> 4) & 0x0F];
+				h[1] = hx[buf[i] & 0x0F];
+				h[2] = '\0';
+				vt_write(idx, h);
+			}
+			else
+			{
+				vt_write(idx, "  ");
+			}
+			if (i == 7)
+				vt_write(idx, "  ");
+			else
+				vt_write(idx, " ");
+		}
+
+		vt_write(idx, " |");
+
+		/* ASCII */
+		for (i = 0; i < count; i++)
+		{
+			if (buf[i] >= 0x20 && buf[i] <= 0x7E)
+				vt_char(idx, buf[i]);
+			else
+				vt_char(idx, '.');
+		}
+
+		vt_write(idx, "|\r\n");
+		offset += count;
+
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* final offset line (like hexdump -C) */
+	snprintf(hex, sizeof(hex), "%07lx", offset);
+	vt_write(idx, hex);
+	vt_write(idx, "\r\n");
+
+	FSClose(refNum);
+}
+
+/* ------------------------------------------------------------------ */
+/* strings - extract printable strings from a file                    */
+/* ------------------------------------------------------------------ */
+
+static void cmd_strings(int idx, int argc, char** argv)
+{
+	int min_len = 4;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	char cur[256];
+	int cur_len = 0;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (argv[argi][0] == '-' && argv[argi][1] == 'n' && argi + 1 < argc)
+			min_len = atoi(argv[++argi]);
+		else if (argv[argi][0] == '-' && argv[argi][1] >= '0' && argv[argi][1] <= '9')
+			min_len = atoi(&argv[argi][1]);
+		else
+			filename = argv[argi];
+	}
+
+	if (min_len < 1) min_len = 1;
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: strings [-n N] <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "strings: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "strings: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+			if (c >= 0x20 && c <= 0x7E)
+			{
+				if (cur_len < (int)sizeof(cur) - 1)
+					cur[cur_len++] = c;
+			}
+			else
+			{
+				if (cur_len >= min_len)
+				{
+					cur[cur_len] = '\0';
+					vt_write(idx, cur);
+					vt_write(idx, "\r\n");
+				}
+				cur_len = 0;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* flush last string */
+	if (cur_len >= min_len)
+	{
+		cur[cur_len] = '\0';
+		vt_write(idx, cur);
+		vt_write(idx, "\r\n");
+	}
+
+	FSClose(refNum);
+}
+
+/* ------------------------------------------------------------------ */
+/* uptime - show time since boot                                      */
+/* ------------------------------------------------------------------ */
+
+static void cmd_uptime(int idx, int argc, char** argv)
+{
+	unsigned long ticks = TickCount();
+	unsigned long secs = ticks / 60;
+	unsigned long days = secs / 86400;
+	unsigned long hours = (secs % 86400) / 3600;
+	unsigned long mins = (secs % 3600) / 60;
+	char buf[64];
+
+	(void)argc;
+	(void)argv;
+
+	if (days > 0)
+		snprintf(buf, sizeof(buf), "up %lu day%s, %lu:%02lu\r\n",
+		         days, days == 1 ? "" : "s", hours, mins);
+	else
+		snprintf(buf, sizeof(buf), "up %lu:%02lu\r\n", hours, mins);
+	vt_write(idx, buf);
+}
+
+/* ------------------------------------------------------------------ */
+/* cal - display calendar for current month                           */
+/* ------------------------------------------------------------------ */
+
+static void cmd_cal(int idx, int argc, char** argv)
+{
+	unsigned long secs;
+	DateTimeRec dt;
+	int year, month;
+	int dow_first, days_in_month;
+	int day;
+	char buf[32];
+	static const char* month_names[] = {
+		"", "January", "February", "March", "April",
+		"May", "June", "July", "August", "September",
+		"October", "November", "December"
+	};
+	static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+
+	(void)argc;
+	(void)argv;
+
+	GetDateTime(&secs);
+	SecondsToDate(secs, &dt);
+	year = dt.year;
+	month = dt.month;
+
+	/* days in this month */
+	days_in_month = mdays[month];
+	if (month == 2 && ((year % 4 == 0 && year % 100 != 0) || year % 400 == 0))
+		days_in_month = 29;
+
+	/* day of week for the 1st (Zeller's congruence) */
+	{
+		int y = year, m = month;
+		if (m < 3) { m += 12; y--; }
+		dow_first = (1 + (13 * (m + 1)) / 5 + y + y / 4 - y / 100 + y / 400) % 7;
+		/* Zeller: 0=Sat, 1=Sun, ..., 6=Fri -> convert to 0=Sun */
+		dow_first = (dow_first + 6) % 7;
+	}
+
+	/* header */
+	snprintf(buf, sizeof(buf), "   %s %d", month_names[month], year);
+	vt_write(idx, buf);
+	vt_write(idx, "\r\n");
+	vt_write(idx, "Su Mo Tu We Th Fr Sa\r\n");
+
+	/* leading spaces */
+	{
+		int s;
+		for (s = 0; s < dow_first; s++)
+			vt_write(idx, "   ");
+	}
+
+	for (day = 1; day <= days_in_month; day++)
+	{
+		if (day == dt.day)
+		{
+			snprintf(buf, sizeof(buf), "\033[7m%2d\033[0m", day);
+			vt_write(idx, buf);
+		}
+		else
+		{
+			snprintf(buf, sizeof(buf), "%2d", day);
+			vt_write(idx, buf);
+		}
+
+		if ((dow_first + day) % 7 == 0)
+			vt_write(idx, "\r\n");
+		else
+			vt_write(idx, " ");
+	}
+
+	/* trailing newline if row didn't end on Saturday */
+	if ((dow_first + days_in_month) % 7 != 0)
+		vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* history - show shell command history                                */
+/* ------------------------------------------------------------------ */
+
+static void cmd_history(int idx, int argc, char** argv)
+{
+	struct session* s = &sessions[idx];
+	int total = s->shell_history_count;
+	int avail = total < SHELL_HISTORY_SIZE ? total : SHELL_HISTORY_SIZE;
+	int start = total - avail;
+	int i;
+	char num[16];
+
+	(void)argc;
+	(void)argv;
+
+	for (i = 0; i < avail; i++)
+	{
+		int hi = (start + i) % SHELL_HISTORY_SIZE;
+		snprintf(num, sizeof(num), "%4d  ", start + i + 1);
+		vt_write(idx, num);
+		vt_write(idx, s->shell_history[hi]);
+		vt_write(idx, "\r\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* basename / dirname - path component extraction                     */
+/* ------------------------------------------------------------------ */
+
+static void cmd_basename(int idx, int argc, char** argv)
+{
+	const char* p;
+	const char* last;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: basename <path>\r\n");
+		return;
+	}
+
+	/* find last separator (/ or :) */
+	p = argv[1];
+	last = p;
+	while (*p)
+	{
+		if (*p == '/' || *p == ':')
+			last = p + 1;
+		p++;
+	}
+	vt_write(idx, last);
+	vt_write(idx, "\r\n");
+}
+
+static void cmd_dirname(int idx, int argc, char** argv)
+{
+	const char* p;
+	int last_sep = -1;
+	int i;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: dirname <path>\r\n");
+		return;
+	}
+
+	p = argv[1];
+	for (i = 0; p[i]; i++)
+	{
+		if (p[i] == '/' || p[i] == ':')
+			last_sep = i;
+	}
+
+	if (last_sep < 0)
+		vt_write(idx, ".");
+	else if (last_sep == 0)
+		vt_char(idx, p[0]);
+	else
+		vt_write_n(idx, p, last_sep);
+
+	vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* sleep - wait N seconds                                             */
+/* ------------------------------------------------------------------ */
+
+static void cmd_sleep(int idx, int argc, char** argv)
+{
+	long secs;
+	unsigned long dummy;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: sleep <seconds>\r\n");
+		return;
+	}
+
+	secs = atol(argv[1]);
+	if (secs > 0)
+		Delay(secs * 60, &dummy);
+}
+
+/* ------------------------------------------------------------------ */
+/* nl - number lines                                                  */
+/* ------------------------------------------------------------------ */
+
+static void cmd_nl(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	long line_num = 1;
+	int at_start = 1;
+	char num[16];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: nl <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "nl: file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "nl: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+
+			if (at_start)
+			{
+				snprintf(num, sizeof(num), "%6ld\t", line_num);
+				vt_write(idx, num);
+				at_start = 0;
+			}
+
+			if (c == '\r')
+			{
+				vt_write(idx, "\r\n");
+				line_num++;
+				at_start = 1;
+				if (i + 1 < count && buf[i + 1] == '\n')
+					i++;
+			}
+			else if (c == '\n')
+			{
+				vt_write(idx, "\r\n");
+				line_num++;
+				at_start = 1;
+			}
+			else
+			{
+				vt_char(idx, c);
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	FSClose(refNum);
+	if (!at_start)
+		vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* cmp - compare two files byte-by-byte                               */
+/* ------------------------------------------------------------------ */
+
+static void cmd_cmp(int idx, int argc, char** argv)
+{
+	FSSpec spec1, spec2;
+	OSErr e1, e2;
+	short ref1, ref2;
+	unsigned char buf1[512], buf2[512];
+	long c1, c2, count;
+	long offset = 0;
+	long line = 1;
+
+	if (argc < 3)
+	{
+		vt_write(idx, "usage: cmp <file1> <file2>\r\n");
+		return;
+	}
+
+	e1 = resolve_path(idx, argv[1], &spec1);
+	if (e1 != noErr)
+	{
+		vt_write(idx, "cmp: file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e2 = resolve_path(idx, argv[2], &spec2);
+	if (e2 != noErr)
+	{
+		vt_write(idx, "cmp: file not found: ");
+		vt_write(idx, argv[2]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e1 = FSpOpenDF(&spec1, fsRdPerm, &ref1);
+	if (e1 != noErr)
+	{
+		vt_write(idx, "cmp: cannot open ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e2 = FSpOpenDF(&spec2, fsRdPerm, &ref2);
+	if (e2 != noErr)
+	{
+		FSClose(ref1);
+		vt_write(idx, "cmp: cannot open ");
+		vt_write(idx, argv[2]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		c1 = sizeof(buf1);
+		c2 = sizeof(buf2);
+		e1 = FSRead(ref1, &c1, buf1);
+		e2 = FSRead(ref2, &c2, buf2);
+		count = c1 < c2 ? c1 : c2;
+
+		for (i = 0; i < count; i++)
+		{
+			if (buf1[i] != buf2[i])
+			{
+				char msg[80];
+				snprintf(msg, sizeof(msg),
+				         "%s %s differ: byte %ld, line %ld\r\n",
+				         argv[1], argv[2], offset + i + 1, line);
+				vt_write(idx, msg);
+				FSClose(ref1);
+				FSClose(ref2);
+				return;
+			}
+			if (buf1[i] == '\n' || buf1[i] == '\r')
+				line++;
+			offset++;
+		}
+
+		if (c1 != c2)
+		{
+			vt_write(idx, "cmp: EOF on ");
+			vt_write(idx, c1 < c2 ? argv[1] : argv[2]);
+			vt_write(idx, "\r\n");
+			break;
+		}
+
+		if ((e1 == eofErr || e1 != noErr) && (e2 == eofErr || e2 != noErr))
+			break;
+	}
+
+	FSClose(ref1);
+	FSClose(ref2);
+}
+
+/* ------------------------------------------------------------------ */
+/* seq - print number sequence                                        */
+/* ------------------------------------------------------------------ */
+
+static void cmd_seq(int idx, int argc, char** argv)
+{
+	long first = 1, inc = 1, last;
+	long i;
+	char num[16];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: seq [first [inc]] last\r\n");
+		return;
+	}
+
+	if (argc == 2)
+	{
+		last = atol(argv[1]);
+	}
+	else if (argc == 3)
+	{
+		first = atol(argv[1]);
+		last = atol(argv[2]);
+	}
+	else
+	{
+		first = atol(argv[1]);
+		inc = atol(argv[2]);
+		last = atol(argv[3]);
+	}
+
+	if (inc == 0) { vt_write(idx, "seq: zero increment\r\n"); return; }
+
+	if (inc > 0)
+	{
+		for (i = first; i <= last; i += inc)
+		{
+			snprintf(num, sizeof(num), "%ld", i);
+			vt_write(idx, num);
+			vt_write(idx, "\r\n");
+		}
+	}
+	else
+	{
+		for (i = first; i >= last; i += inc)
+		{
+			snprintf(num, sizeof(num), "%ld", i);
+			vt_write(idx, num);
+			vt_write(idx, "\r\n");
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* rev - reverse each line of a file                                  */
+/* ------------------------------------------------------------------ */
+
+static void cmd_rev(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	char line[1024];
+	int line_len = 0;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: rev <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "rev: file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "rev: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+			if (c == '\r' || c == '\n')
+			{
+				int j;
+				if (c == '\r' && i + 1 < count && buf[i + 1] == '\n')
+					i++;
+				for (j = line_len - 1; j >= 0; j--)
+					vt_char(idx, line[j]);
+				vt_write(idx, "\r\n");
+				line_len = 0;
+			}
+			else
+			{
+				if (line_len < (int)sizeof(line) - 1)
+					line[line_len++] = c;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* flush last line */
+	if (line_len > 0)
+	{
+		int j;
+		for (j = line_len - 1; j >= 0; j--)
+			vt_char(idx, line[j]);
+		vt_write(idx, "\r\n");
+	}
+
+	FSClose(refNum);
+}
+
+/* ------------------------------------------------------------------ */
+/* line ending converters: dos2unix, unix2dos, mac2unix, unix2mac     */
+/* ------------------------------------------------------------------ */
+
+enum lineconv_mode { LC_DOS2UNIX, LC_UNIX2DOS, LC_MAC2UNIX, LC_UNIX2MAC };
+
+static void cmd_lineconv(int idx, int argc, char** argv, enum lineconv_mode mode)
+{
+	const char* name;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	long fsize, wpos;
+	unsigned char* data;
+	unsigned char* out;
+	long out_len = 0;
+	long i;
+
+	switch (mode)
+	{
+		case LC_DOS2UNIX: name = "dos2unix"; break;
+		case LC_UNIX2DOS: name = "unix2dos"; break;
+		case LC_MAC2UNIX: name = "mac2unix"; break;
+		case LC_UNIX2MAC: name = "unix2mac"; break;
+		default:          name = "lineconv"; break;
+	}
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: ");
+		vt_write(idx, name);
+		vt_write(idx, " <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, name);
+		vt_write(idx, ": file not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdWrPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, name);
+		vt_write(idx, ": cannot open file\r\n");
+		return;
+	}
+
+	/* get file size */
+	GetEOF(refNum, &fsize);
+	if (fsize == 0 || fsize > 262144L)
+	{
+		if (fsize > 262144L)
+		{
+			vt_write(idx, name);
+			vt_write(idx, ": file too large (256K max)\r\n");
+		}
+		FSClose(refNum);
+		return;
+	}
+
+	data = (unsigned char*)NewPtr(fsize);
+	if (!data)
+	{
+		vt_write(idx, name);
+		vt_write(idx, ": out of memory\r\n");
+		FSClose(refNum);
+		return;
+	}
+
+	/* worst case: every byte becomes 2 (LF→CRLF) */
+	out = (unsigned char*)NewPtr(fsize * 2);
+	if (!out)
+	{
+		DisposePtr((Ptr)data);
+		vt_write(idx, name);
+		vt_write(idx, ": out of memory\r\n");
+		FSClose(refNum);
+		return;
+	}
+
+	/* read entire file */
+	{
+		long rcount = fsize;
+		FSRead(refNum, &rcount, data);
+	}
+
+	/* convert */
+	for (i = 0; i < fsize; i++)
+	{
+		switch (mode)
+		{
+			case LC_DOS2UNIX:
+				/* CRLF → LF (strip CR before LF) */
+				if (data[i] == '\r' && i + 1 < fsize && data[i + 1] == '\n')
+					; /* skip CR, the LF will be written next iteration */
+				else
+					out[out_len++] = data[i];
+				break;
+
+			case LC_UNIX2DOS:
+				/* LF → CRLF (add CR before LF, skip if already CRLF) */
+				if (data[i] == '\n' && (i == 0 || data[i - 1] != '\r'))
+				{
+					out[out_len++] = '\r';
+					out[out_len++] = '\n';
+				}
+				else
+					out[out_len++] = data[i];
+				break;
+
+			case LC_MAC2UNIX:
+				/* CR → LF (but not CR that's part of CRLF) */
+				if (data[i] == '\r')
+				{
+					if (i + 1 < fsize && data[i + 1] == '\n')
+						out[out_len++] = data[i]; /* keep CR in CRLF */
+					else
+						out[out_len++] = '\n';
+				}
+				else
+					out[out_len++] = data[i];
+				break;
+
+			case LC_UNIX2MAC:
+				/* LF → CR (but not LF that's part of CRLF) */
+				if (data[i] == '\n')
+				{
+					if (i > 0 && data[i - 1] == '\r')
+						out[out_len++] = data[i]; /* keep LF in CRLF */
+					else
+						out[out_len++] = '\r';
+				}
+				else
+					out[out_len++] = data[i];
+				break;
+		}
+	}
+
+	/* write back */
+	SetFPos(refNum, fsFromStart, 0);
+	wpos = out_len;
+	FSWrite(refNum, &wpos, out);
+	SetEOF(refNum, out_len);
+
+	FSClose(refNum);
+	DisposePtr((Ptr)data);
+	DisposePtr((Ptr)out);
+}
+
+static void cmd_dos2unix(int idx, int argc, char** argv) { cmd_lineconv(idx, argc, argv, LC_DOS2UNIX); }
+static void cmd_unix2dos(int idx, int argc, char** argv) { cmd_lineconv(idx, argc, argv, LC_UNIX2DOS); }
+static void cmd_mac2unix(int idx, int argc, char** argv) { cmd_lineconv(idx, argc, argv, LC_MAC2UNIX); }
+static void cmd_unix2mac(int idx, int argc, char** argv) { cmd_lineconv(idx, argc, argv, LC_UNIX2MAC); }
+
+/* ------------------------------------------------------------------ */
+/* fold - wrap lines to a given width                                 */
+/* ------------------------------------------------------------------ */
+
+static void cmd_fold(int idx, int argc, char** argv)
+{
+	int width = 80;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	int col = 0;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (strcmp(argv[argi], "-w") == 0 && argi + 1 < argc)
+			width = atoi(argv[++argi]);
+		else if (argv[argi][0] == '-' && argv[argi][1] == 'w')
+			width = atoi(&argv[argi][2]);
+		else
+			filename = argv[argi];
+	}
+
+	if (width < 1) width = 80;
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: fold [-w N] <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "fold: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "fold: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+			if (c == '\r')
+			{
+				vt_write(idx, "\r\n");
+				col = 0;
+				if (i + 1 < count && buf[i + 1] == '\n')
+					i++;
+			}
+			else if (c == '\n')
+			{
+				vt_write(idx, "\r\n");
+				col = 0;
+			}
+			else
+			{
+				if (col >= width)
+				{
+					vt_write(idx, "\r\n");
+					col = 0;
+				}
+				vt_char(idx, c);
+				col++;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	FSClose(refNum);
+	if (col > 0) vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* xxd - hex dump with optional reverse mode                          */
+/* ------------------------------------------------------------------ */
+
+static void cmd_xxd(int idx, int argc, char** argv)
+{
+	int reverse = 0;
+	const char* filename = NULL;
+	int argi;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (strcmp(argv[argi], "-r") == 0)
+			reverse = 1;
+		else
+			filename = argv[argi];
+	}
+
+	if (!filename)
+	{
+		vt_write(idx, "usage: xxd [-r] <file>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "xxd: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	if (!reverse)
+	{
+		/* forward: xxd-style hex dump */
+		unsigned char buf[16];
+		long count;
+		long offset = 0;
+		char hex[12];
+		int i;
+
+		e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+		if (e != noErr) { vt_write(idx, "xxd: cannot open file\r\n"); return; }
+
+		while (1)
+		{
+			count = 16;
+			e = FSRead(refNum, &count, buf);
+			if (count <= 0) break;
+
+			snprintf(hex, sizeof(hex), "%08lx: ", offset);
+			vt_write(idx, hex);
+
+			for (i = 0; i < 16; i++)
+			{
+				if (i < count)
+				{
+					static const char hx[] = "0123456789abcdef";
+					char h[3];
+					h[0] = hx[(buf[i] >> 4) & 0x0F];
+					h[1] = hx[buf[i] & 0x0F];
+					h[2] = '\0';
+					vt_write(idx, h);
+				}
+				else
+					vt_write(idx, "  ");
+
+				if (i % 2 == 1) vt_write(idx, " ");
+			}
+
+			vt_write(idx, " ");
+
+			for (i = 0; i < count; i++)
+			{
+				if (buf[i] >= 0x20 && buf[i] <= 0x7E)
+					vt_char(idx, buf[i]);
+				else
+					vt_char(idx, '.');
+			}
+
+			vt_write(idx, "\r\n");
+			offset += count;
+
+			if (e == eofErr || e != noErr) break;
+		}
+
+		FSClose(refNum);
+	}
+	else
+	{
+		/* reverse: parse xxd output back to binary */
+		/* read xxd text, write binary to <file>.bin */
+		unsigned char buf[512];
+		long count;
+		FSSpec out_spec;
+		short out_ref;
+		Str255 out_name;
+
+		e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+		if (e != noErr) { vt_write(idx, "xxd: cannot open file\r\n"); return; }
+
+		/* build output filename: <name>.bin */
+		{
+			int slen;
+			memcpy(out_name, spec.name, spec.name[0] + 1);
+			slen = out_name[0];
+			if (slen + 4 <= 31)
+			{
+				out_name[slen + 1] = '.';
+				out_name[slen + 2] = 'b';
+				out_name[slen + 3] = 'i';
+				out_name[slen + 4] = 'n';
+				out_name[0] = slen + 4;
+			}
+		}
+
+		e = FSMakeFSSpec(spec.vRefNum, spec.parID, out_name, &out_spec);
+		if (e == fnfErr)
+			HCreate(spec.vRefNum, spec.parID, out_name, '????', '????');
+
+		e = FSpOpenDF(&out_spec, fsRdWrPerm, &out_ref);
+		if (e != noErr)
+		{
+			FSClose(refNum);
+			vt_write(idx, "xxd: cannot create output file\r\n");
+			return;
+		}
+		SetEOF(out_ref, 0);
+
+		/* parse line by line */
+		{
+			char line[256];
+			int line_len = 0;
+
+			while (1)
+			{
+				long i;
+				count = sizeof(buf);
+				e = FSRead(refNum, &count, buf);
+				for (i = 0; i < count; i++)
+				{
+					if (buf[i] == '\r' || buf[i] == '\n')
+					{
+						if (buf[i] == '\r' && i + 1 < count && buf[i + 1] == '\n')
+							i++;
+
+						/* parse hex after the colon */
+						if (line_len > 0)
+						{
+							char* p = line;
+							char* colon;
+							unsigned char outbuf[16];
+							long out_count = 0;
+
+							line[line_len] = '\0';
+							colon = strchr(p, ':');
+							if (colon) p = colon + 1;
+
+							while (*p)
+							{
+								int hi, lo;
+								while (*p == ' ') p++;
+								if (*p == '\0' || *p == ' ') break;
+								/* stop at ASCII column (two spaces before it) */
+								if (p[0] == ' ' && p[1] == ' ') break;
+
+								hi = -1; lo = -1;
+								if (*p >= '0' && *p <= '9') hi = *p - '0';
+								else if (*p >= 'a' && *p <= 'f') hi = *p - 'a' + 10;
+								else if (*p >= 'A' && *p <= 'F') hi = *p - 'A' + 10;
+								else break;
+								p++;
+
+								if (*p >= '0' && *p <= '9') lo = *p - '0';
+								else if (*p >= 'a' && *p <= 'f') lo = *p - 'a' + 10;
+								else if (*p >= 'A' && *p <= 'F') lo = *p - 'A' + 10;
+								else break;
+								p++;
+
+								if (hi >= 0 && lo >= 0)
+									outbuf[out_count++] = (unsigned char)((hi << 4) | lo);
+							}
+
+							if (out_count > 0)
+								FSWrite(out_ref, &out_count, outbuf);
+						}
+						line_len = 0;
+					}
+					else
+					{
+						if (line_len < (int)sizeof(line) - 1)
+							line[line_len++] = buf[i];
+					}
+				}
+				if (e == eofErr || e != noErr) break;
+			}
+		}
+
+		FSClose(out_ref);
+		FSClose(refNum);
+
+		/* print output filename */
+		{
+			char name_buf[32];
+			int ni;
+			for (ni = 0; ni < out_name[0]; ni++)
+				name_buf[ni] = out_name[ni + 1];
+			name_buf[out_name[0]] = '\0';
+			vt_write(idx, "wrote: ");
+			vt_write(idx, name_buf);
+			vt_write(idx, "\r\n");
+		}
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* cut - extract fields from lines                                    */
+/* ------------------------------------------------------------------ */
+
+static void cmd_cut(int idx, int argc, char** argv)
+{
+	char delim = '\t';
+	const char* field_spec = NULL;
+	const char* filename = NULL;
+	int argi;
+	/* parse field spec into a bitmask (fields 1-32) */
+	unsigned long field_mask = 0;
+	FSSpec spec;
+	OSErr e;
+	short refNum;
+	unsigned char buf[512];
+	long count;
+	char line[1024];
+	int line_len = 0;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (strcmp(argv[argi], "-d") == 0 && argi + 1 < argc)
+		{
+			delim = argv[++argi][0];
+		}
+		else if (argv[argi][0] == '-' && argv[argi][1] == 'd')
+		{
+			delim = argv[argi][2];
+		}
+		else if (strcmp(argv[argi], "-f") == 0 && argi + 1 < argc)
+		{
+			field_spec = argv[++argi];
+		}
+		else if (argv[argi][0] == '-' && argv[argi][1] == 'f')
+		{
+			field_spec = &argv[argi][2];
+		}
+		else
+		{
+			filename = argv[argi];
+		}
+	}
+
+	if (!field_spec || !filename)
+	{
+		vt_write(idx, "usage: cut -d<delim> -f<fields> <file>\r\n");
+		vt_write(idx, "  fields: 1,3,5-7\r\n");
+		return;
+	}
+
+	/* parse field spec: comma-separated, supports N-M ranges */
+	{
+		const char* p = field_spec;
+		while (*p)
+		{
+			long a = 0, b = 0;
+			while (*p >= '0' && *p <= '9') { a = a * 10 + (*p - '0'); p++; }
+			if (*p == '-')
+			{
+				p++;
+				while (*p >= '0' && *p <= '9') { b = b * 10 + (*p - '0'); p++; }
+				if (b == 0) b = 32;
+			}
+			else
+			{
+				b = a;
+			}
+			if (a < 1) a = 1;
+			if (b > 32) b = 32;
+			{
+				long f;
+				for (f = a; f <= b; f++)
+					field_mask |= (1UL << (f - 1));
+			}
+			if (*p == ',') p++;
+		}
+	}
+
+	if (field_mask == 0)
+	{
+		vt_write(idx, "cut: invalid field spec\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, filename, &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "cut: file not found: ");
+		vt_write(idx, filename);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	e = FSpOpenDF(&spec, fsRdPerm, &refNum);
+	if (e != noErr)
+	{
+		vt_write(idx, "cut: cannot open file\r\n");
+		return;
+	}
+
+	while (1)
+	{
+		long i;
+		count = sizeof(buf);
+		e = FSRead(refNum, &count, buf);
+		for (i = 0; i < count; i++)
+		{
+			unsigned char c = buf[i];
+			if (c == '\r' || c == '\n')
+			{
+				if (c == '\r' && i + 1 < count && buf[i + 1] == '\n')
+					i++;
+
+				/* process line */
+				line[line_len] = '\0';
+				{
+					int field_num = 1;
+					int first_out = 1;
+					const char* p = line;
+
+					while (*p || field_num <= 32)
+					{
+						const char* fstart = p;
+						const char* fend;
+						/* find end of field */
+						while (*p && *p != delim) p++;
+						fend = p;
+						if (*p == delim) p++;
+
+						if (field_num <= 32 && (field_mask & (1UL << (field_num - 1))))
+						{
+							if (!first_out)
+								vt_char(idx, delim);
+							vt_write_n(idx, fstart, fend - fstart);
+							first_out = 0;
+						}
+						field_num++;
+						if (*fend == '\0') break;
+					}
+				}
+				vt_write(idx, "\r\n");
+				line_len = 0;
+			}
+			else
+			{
+				if (line_len < (int)sizeof(line) - 1)
+					line[line_len++] = c;
+			}
+		}
+		if (e == eofErr || e != noErr) break;
+	}
+
+	/* handle last line */
+	if (line_len > 0)
+	{
+		line[line_len] = '\0';
+		{
+			int field_num = 1;
+			int first_out = 1;
+			const char* p = line;
+
+			while (*p || field_num <= 32)
+			{
+				const char* fstart = p;
+				const char* fend;
+				while (*p && *p != delim) p++;
+				fend = p;
+				if (*p == delim) p++;
+
+				if (field_num <= 32 && (field_mask & (1UL << (field_num - 1))))
+				{
+					if (!first_out)
+						vt_char(idx, delim);
+					vt_write_n(idx, fstart, fend - fstart);
+					first_out = 0;
+				}
+				field_num++;
+				if (*fend == '\0') break;
+			}
+		}
+		vt_write(idx, "\r\n");
+	}
+
+	FSClose(refNum);
+}
+
+/* ------------------------------------------------------------------ */
+/* realpath - resolve to full absolute path                           */
+/* ------------------------------------------------------------------ */
+
+/* get full colon path for a file FSSpec */
+static void fsspec_to_path(FSSpec* spec, char* out, int maxlen)
+{
+	char dir_path[512];
+	char name[64];
+	int nlen;
+
+	get_full_path(spec->vRefNum, spec->parID, dir_path, sizeof(dir_path));
+
+	nlen = spec->name[0];
+	if (nlen > 63) nlen = 63;
+	memcpy(name, spec->name + 1, nlen);
+	name[nlen] = '\0';
+
+	if (strlen(dir_path) + strlen(name) < (size_t)maxlen)
+	{
+		strcpy(out, dir_path);
+		strcat(out, name);
+	}
+	else
+	{
+		strncpy(out, "???", maxlen);
+	}
+}
+
+static void cmd_realpath(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	OSErr e;
+	char path[512];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: realpath <path>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "realpath: not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	fsspec_to_path(&spec, path, sizeof(path));
+	vt_write(idx, path);
+	vt_write(idx, "\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* hostname - show Mac computer name from Sharing Setup               */
+/* ------------------------------------------------------------------ */
+
+static void cmd_hostname(int idx, int argc, char** argv)
+{
+	StringHandle h;
+
+	(void)argc;
+	(void)argv;
+
+	h = GetString(-16413);
+	if (h && *h && (*h)[0] > 0)
+	{
+		char name[256];
+		int len = (*h)[0];
+		memcpy(name, *h + 1, len);
+		name[len] = '\0';
+		vt_write(idx, name);
+		vt_write(idx, "\r\n");
+	}
+	else
+	{
+		vt_write(idx, "(no name set)\r\n");
+	}
+}
+
+/* ------------------------------------------------------------------ */
+/* which - find an application by name                                */
+/* ------------------------------------------------------------------ */
+
+static void cmd_which(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	FInfo finfo;
+	OSErr e;
+	char path[512];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: which <command>\r\n");
+		return;
+	}
+
+	/* try to resolve the argument as a path */
+	e = resolve_path(idx, argv[1], &spec);
+	if (e == noErr && FSpGetFInfo(&spec, &finfo) == noErr && finfo.fdType == 'APPL')
+	{
+		fsspec_to_path(&spec, path, sizeof(path));
+		vt_write(idx, path);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	vt_write(idx, argv[1]);
+	vt_write(idx, ": not found\r\n");
+}
+
+/* ------------------------------------------------------------------ */
+/* ln -s / readlink - Mac alias creation and resolution               */
+/* ------------------------------------------------------------------ */
+
+#include <Aliases.h>
+#include <Resources.h>
+
+static void cmd_ln(int idx, int argc, char** argv)
+{
+	int sym = 0;
+	const char* target_path = NULL;
+	const char* link_path = NULL;
+	int argi;
+	FSSpec target_spec, link_spec;
+	AliasHandle alias;
+	OSErr e;
+	FInfo finfo;
+	short res_ref;
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (strcmp(argv[argi], "-s") == 0)
+			sym = 1;
+		else if (!target_path)
+			target_path = argv[argi];
+		else
+			link_path = argv[argi];
+	}
+
+	if (!target_path || !link_path)
+	{
+		vt_write(idx, "usage: ln -s <target> <alias>\r\n");
+		return;
+	}
+
+	if (!sym)
+	{
+		vt_write(idx, "ln: only symbolic links (aliases) supported, use -s\r\n");
+		return;
+	}
+
+	/* resolve target */
+	e = resolve_path(idx, target_path, &target_spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "ln: target not found: ");
+		vt_write(idx, target_path);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	/* create alias record */
+	e = NewAliasMinimal(&target_spec, &alias);
+	if (e != noErr)
+	{
+		vt_write(idx, "ln: cannot create alias record\r\n");
+		return;
+	}
+
+	/* create the alias file */
+	{
+		struct session* s = &sessions[idx];
+		Str255 pname;
+		int len = strlen(link_path);
+		if (len > 31) len = 31;
+		pname[0] = len;
+		memcpy(pname + 1, link_path, len);
+
+		/* try to resolve link_path; if it doesn't exist, create in cwd */
+		e = resolve_path(idx, link_path, &link_spec);
+		if (e == noErr)
+		{
+			/* file already exists */
+			DisposeHandle((Handle)alias);
+			vt_write(idx, "ln: file exists: ");
+			vt_write(idx, link_path);
+			vt_write(idx, "\r\n");
+			return;
+		}
+
+		/* create the file */
+		e = HCreate(s->shell_vRefNum, s->shell_dirID, pname, 'adrp', 'MACS');
+		if (e != noErr)
+		{
+			DisposeHandle((Handle)alias);
+			vt_write(idx, "ln: cannot create file\r\n");
+			return;
+		}
+
+		e = FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &link_spec);
+	}
+
+	/* set kIsAlias flag */
+	e = FSpGetFInfo(&link_spec, &finfo);
+	if (e == noErr)
+	{
+		finfo.fdFlags |= kIsAlias;
+		FSpSetFInfo(&link_spec, &finfo);
+	}
+
+	/* write alias record to resource fork */
+	HCreateResFile(link_spec.vRefNum, link_spec.parID, link_spec.name);
+	res_ref = FSpOpenResFile(&link_spec, fsRdWrPerm);
+	if (res_ref != -1)
+	{
+		AddResource((Handle)alias, 'alis', 0, "\p");
+		WriteResource((Handle)alias);
+		CloseResFile(res_ref);
+	}
+	else
+	{
+		DisposeHandle((Handle)alias);
+		vt_write(idx, "ln: cannot write alias resource\r\n");
+	}
+}
+
+static void cmd_readlink(int idx, int argc, char** argv)
+{
+	FSSpec spec;
+	OSErr e;
+	Boolean isFolder, wasAlias;
+	char path[512];
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: readlink <alias>\r\n");
+		return;
+	}
+
+	e = resolve_path(idx, argv[1], &spec);
+	if (e != noErr)
+	{
+		vt_write(idx, "readlink: not found: ");
+		vt_write(idx, argv[1]);
+		vt_write(idx, "\r\n");
+		return;
+	}
+
+	/* check if it's actually an alias */
+	{
+		FInfo finfo;
+		e = FSpGetFInfo(&spec, &finfo);
+		if (e != noErr || !(finfo.fdFlags & kIsAlias))
+		{
+			vt_write(idx, "readlink: not an alias: ");
+			vt_write(idx, argv[1]);
+			vt_write(idx, "\r\n");
+			return;
+		}
+	}
+
+	e = ResolveAliasFile(&spec, true, &isFolder, &wasAlias);
+	if (e != noErr)
+	{
+		vt_write(idx, "readlink: cannot resolve alias\r\n");
+		return;
+	}
+
+	fsspec_to_path(&spec, path, sizeof(path));
+	vt_write(idx, path);
+	vt_write(idx, "\r\n");
+}
+
 static void cmd_help(int idx, int argc, char* argv[])
 {
 	vt_write(idx, "SevenTTY local shell - commands:\r\n");
@@ -2477,12 +4890,41 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    cd [path]          change directory\r\n");
 	vt_write(idx, "    pwd                print working directory\r\n");
 	vt_write(idx, "    cat <file>         show file contents\r\n");
+	vt_write(idx, "    head [-n N] <file> show first N lines\r\n");
+	vt_write(idx, "    tail [-n N] <file> show last N lines\r\n");
+	vt_write(idx, "    grep [-ivnc] s f   search for string in file\r\n");
+	vt_write(idx, "    hexdump <file>     hex + ASCII dump\r\n");
+	vt_write(idx, "    strings [-n N] f   printable strings in file\r\n");
+	vt_write(idx, "    hexdump and xxd are different formats:\r\n");
+	vt_write(idx, "    xxd [-r] <file>    xxd-style dump (-r=reverse)\r\n");
+	vt_write(idx, "    nl <file>          cat with line numbers\r\n");
+	vt_write(idx, "    cut -d. -f1,3 f    extract delimited fields\r\n");
+	vt_write(idx, "    fold [-w N] <file> wrap lines to N columns\r\n");
+	vt_write(idx, "    rev <file>         reverse each line\r\n");
+	vt_write(idx, "    cmp <f1> <f2>      compare two files\r\n");
 	vt_write(idx, "    cp <src> <dst>     copy file (both forks)\r\n");
 	vt_write(idx, "    mv <old> <new>     rename file\r\n");
 	vt_write(idx, "    rm <file>          delete file\r\n");
 	vt_write(idx, "    mkdir <name>       create directory\r\n");
 	vt_write(idx, "    rmdir <dir>        remove empty directory\r\n");
 	vt_write(idx, "    touch <file>       create or update timestamp\r\n");
+	vt_write(idx, "    ln -s <tgt> <lnk>  create Mac alias\r\n");
+	vt_write(idx, "    readlink <alias>   show alias target\r\n");
+	vt_write(idx, "    realpath <path>    full absolute path\r\n");
+	vt_write(idx, "    which <command>    find application path\r\n");
+	vt_write(idx, "    wc [-lwc] <file>   line/word/byte count\r\n");
+	vt_write(idx, "    rot13 <file>       ROT13 encode/decode\r\n");
+	vt_write(idx, "    dos2unix <file>    CRLF to LF (in-place)\r\n");
+	vt_write(idx, "    unix2dos <file>    LF to CRLF (in-place)\r\n");
+	vt_write(idx, "    mac2unix <file>    CR to LF (in-place)\r\n");
+	vt_write(idx, "    unix2mac <file>    LF to CR (in-place)\r\n");
+	vt_write(idx, "\r\n");
+	vt_write(idx, "  \033[1mChecksums:\033[0m\r\n");
+	vt_write(idx, "    md5sum <file>      MD5 hash\r\n");
+	vt_write(idx, "    sha1sum <file>     SHA-1 hash\r\n");
+	vt_write(idx, "    sha256sum <file>   SHA-256 hash\r\n");
+	vt_write(idx, "    sha512sum <file>   SHA-512 hash\r\n");
+	vt_write(idx, "    crc32 <file>       CRC32 checksum\r\n");
 	vt_write(idx, "\r\n");
 	vt_write(idx, "  \033[1mMac-specific:\033[0m\r\n");
 	vt_write(idx, "    getinfo <file>     show full file info\r\n");
@@ -2494,13 +4936,21 @@ static void cmd_help(int idx, int argc, char* argv[])
 	vt_write(idx, "    label <0-7> f      set Finder label color\r\n");
 	vt_write(idx, "\r\n");
 	vt_write(idx, "  \033[1mSystem:\033[0m\r\n");
+	vt_write(idx, "    basename <path>    filename part of path\r\n");
+	vt_write(idx, "    dirname <path>     directory part of path\r\n");
+	vt_write(idx, "    seq [first] last   print number sequence\r\n");
+	vt_write(idx, "    sleep <seconds>    wait N seconds\r\n");
 	vt_write(idx, "    echo [text...]     print text\r\n");
 	vt_write(idx, "    clear              clear screen\r\n");
 	vt_write(idx, "    df [-m|-h]         show disk usage\r\n");
 	vt_write(idx, "    date               show date/time\r\n");
+	vt_write(idx, "    uptime             time since boot\r\n");
+	vt_write(idx, "    cal                calendar for this month\r\n");
 	vt_write(idx, "    uname              show system info\r\n");
+	vt_write(idx, "    hostname           computer name\r\n");
 	vt_write(idx, "    free [-m|-h]       show memory usage\r\n");
 	vt_write(idx, "    ps                 list running processes\r\n");
+	vt_write(idx, "    history            command history\r\n");
 	vt_write(idx, "    open <path>        launch application\r\n");
 	vt_write(idx, "    ssh [user@]h[:p]   open SSH tab\r\n");
 	vt_write(idx, "    telnet <h> [port]  open telnet tab\r\n");
@@ -2566,12 +5016,17 @@ static int escape_and_append(char* line, int pos, int max, const char* src, int 
 }
 
 static const char* shell_commands[] = {
-	"cat", "cd", "chattr", "chmod", "chown", "clear", "cls", "colors",
-	"copy", "cp", "date", "del", "delete", "df", "dir", "echo", "exit",
-	"file", "free", "getinfo", "help", "host", "ifconfig", "info",
-	"label", "less", "ls", "md", "mkdir", "more", "mv", "nc", "open",
-	"ping", "ps", "pwd", "quit", "rd", "ren", "rename", "rm", "rmdir",
-	"setcreator", "settype", "ssh", "telnet", "touch", "type", "uname"
+	"basename", "cal", "cat", "cd", "chattr", "chmod", "chown", "clear",
+	"cls", "cmp", "colors", "copy", "cp", "crc32", "cut", "date", "del",
+	"delete", "df", "dir", "dirname", "dos2unix", "echo", "exit", "file",
+	"fold", "free", "getinfo", "grep", "head", "help", "hexdump",
+	"history", "host", "hostname", "ifconfig", "info", "label", "less",
+	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
+	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
+	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "seq",
+	"setcreator", "settype", "sha1sum", "sha256sum", "sha512sum", "sleep",
+	"ssh", "strings", "tail", "telnet", "touch", "type", "uname",
+	"unix2dos", "unix2mac", "uptime", "wc", "which", "xxd"
 };
 #define NUM_SHELL_COMMANDS (sizeof(shell_commands) / sizeof(shell_commands[0]))
 
@@ -3115,6 +5570,40 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "ping") == 0)      cmd_ping(idx, argc, argv);
 	else if (strcmp(cmd, "colors") == 0)    cmd_colors(idx, argc, argv);
 	else if (strcmp(cmd, "open") == 0)      cmd_open(idx, argc, argv);
+	else if (strcmp(cmd, "md5sum") == 0)    cmd_md5sum(idx, argc, argv);
+	else if (strcmp(cmd, "sha1sum") == 0)   cmd_sha1sum(idx, argc, argv);
+	else if (strcmp(cmd, "sha256sum") == 0) cmd_sha256sum(idx, argc, argv);
+	else if (strcmp(cmd, "sha512sum") == 0) cmd_sha512sum(idx, argc, argv);
+	else if (strcmp(cmd, "crc32") == 0)     cmd_crc32(idx, argc, argv);
+	else if (strcmp(cmd, "wc") == 0)        cmd_wc(idx, argc, argv);
+	else if (strcmp(cmd, "rot13") == 0)     cmd_rot13(idx, argc, argv);
+	else if (strcmp(cmd, "grep") == 0)      cmd_grep(idx, argc, argv);
+	else if (strcmp(cmd, "head") == 0)      cmd_head(idx, argc, argv);
+	else if (strcmp(cmd, "tail") == 0)      cmd_tail(idx, argc, argv);
+	else if (strcmp(cmd, "hexdump") == 0)   cmd_hexdump(idx, argc, argv);
+	else if (strcmp(cmd, "strings") == 0)   cmd_strings(idx, argc, argv);
+	else if (strcmp(cmd, "uptime") == 0)    cmd_uptime(idx, argc, argv);
+	else if (strcmp(cmd, "cal") == 0)       cmd_cal(idx, argc, argv);
+	else if (strcmp(cmd, "history") == 0)   cmd_history(idx, argc, argv);
+	else if (strcmp(cmd, "basename") == 0) cmd_basename(idx, argc, argv);
+	else if (strcmp(cmd, "dirname") == 0)  cmd_dirname(idx, argc, argv);
+	else if (strcmp(cmd, "sleep") == 0)    cmd_sleep(idx, argc, argv);
+	else if (strcmp(cmd, "nl") == 0)       cmd_nl(idx, argc, argv);
+	else if (strcmp(cmd, "cmp") == 0)      cmd_cmp(idx, argc, argv);
+	else if (strcmp(cmd, "seq") == 0)      cmd_seq(idx, argc, argv);
+	else if (strcmp(cmd, "rev") == 0)      cmd_rev(idx, argc, argv);
+	else if (strcmp(cmd, "dos2unix") == 0) cmd_dos2unix(idx, argc, argv);
+	else if (strcmp(cmd, "unix2dos") == 0) cmd_unix2dos(idx, argc, argv);
+	else if (strcmp(cmd, "mac2unix") == 0) cmd_mac2unix(idx, argc, argv);
+	else if (strcmp(cmd, "unix2mac") == 0) cmd_unix2mac(idx, argc, argv);
+	else if (strcmp(cmd, "fold") == 0)     cmd_fold(idx, argc, argv);
+	else if (strcmp(cmd, "xxd") == 0)      cmd_xxd(idx, argc, argv);
+	else if (strcmp(cmd, "cut") == 0)      cmd_cut(idx, argc, argv);
+	else if (strcmp(cmd, "realpath") == 0) cmd_realpath(idx, argc, argv);
+	else if (strcmp(cmd, "hostname") == 0) cmd_hostname(idx, argc, argv);
+	else if (strcmp(cmd, "which") == 0)    cmd_which(idx, argc, argv);
+	else if (strcmp(cmd, "ln") == 0)       cmd_ln(idx, argc, argv);
+	else if (strcmp(cmd, "readlink") == 0) cmd_readlink(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
