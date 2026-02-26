@@ -926,6 +926,7 @@ int nc_inline_connect(int session_idx)
 		return 0;
 	}
 	s->thread_id = tid;
+	s->worker_mode = WORKER_NC;
 
 	s->thread_command = READ;
 	return 1;
@@ -979,6 +980,7 @@ void nc_inline_disconnect(int session_idx)
 			OTFreeMem(s->send_buffer);
 			s->send_buffer = NULL;
 		}
+		s->worker_mode = WORKER_NONE;
 		s->thread_state = UNINITIALIZED;
 		s->thread_command = WAIT;
 	}

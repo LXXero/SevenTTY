@@ -297,7 +297,7 @@ char* known_hosts_full_path(int* found)
 	return NULL;
 }
 
-int known_hosts(int session_idx)
+static int known_hosts(int session_idx, const char* host, int port)
 {
 	struct session* s = &sessions[session_idx];
 	int safe_to_connect = 1;
@@ -315,8 +315,6 @@ int known_hosts(int session_idx)
 
 	if (known_hosts_file_exists && known_hosts_file_path != NULL)
 	{
-		// load known hosts file
-
 		int e = libssh2_knownhost_readfile(kh, known_hosts_file_path, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
 		if (e < 0)
 		{
@@ -330,10 +328,32 @@ int known_hosts(int session_idx)
 
 	if (safe_to_connect)
 	{
-		// hostnames need to be either plain or of the format "[host]:port"
-		prefs.hostname[prefs.hostname[0]+1] = '\0';
-		int e = libssh2_knownhost_check(kh, prefs.hostname+1, host_key, key_len, LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW, NULL);
-		prefs.hostname[prefs.hostname[0]+1] = ':';
+		/* port-aware check: checkp uses [host]:port for non-22, bare host for 22 */
+		struct libssh2_knownhost* knownhost = NULL;
+		int e = libssh2_knownhost_checkp(kh, host, port, host_key, key_len,
+			LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW, &knownhost);
+
+		/* legacy migration for non-22 ports: old entries saved as bare hostname */
+		if (e == LIBSSH2_KNOWNHOST_CHECK_NOTFOUND && port != 22)
+		{
+			struct libssh2_knownhost* legacy = NULL;
+			int fb = libssh2_knownhost_check(kh, host, host_key, key_len,
+				LIBSSH2_KNOWNHOST_TYPE_PLAIN | LIBSSH2_KNOWNHOST_KEYENC_RAW, &legacy);
+
+			if (fb == LIBSSH2_KNOWNHOST_CHECK_MATCH)
+			{
+				/* silently upgrade: delete legacy bare-host entry, re-save with port */
+				if (legacy) libssh2_knownhost_del(kh, legacy);
+				e = LIBSSH2_KNOWNHOST_CHECK_NOTFOUND; /* fall through to "new host" dialog to re-add with port */
+				recognized_key = 0;
+			}
+			else if (fb == LIBSSH2_KNOWNHOST_CHECK_MISMATCH)
+			{
+				/* hard-fail: key changed regardless of how it was stored */
+				e = LIBSSH2_KNOWNHOST_CHECK_MISMATCH;
+			}
+			/* fallback NOTFOUND: proceed with normal "new host" dialog */
+		}
 
 		switch (e)
 		{
@@ -345,7 +365,6 @@ int known_hosts(int session_idx)
 				printf_s(session_idx, "No matching host found.\r\n");
 				break;
 			case LIBSSH2_KNOWNHOST_CHECK_MATCH:
-				//printf_s(session_idx, "Host and key match found in known hosts.\r\n");
 				recognized_key = 1;
 				break;
 			case LIBSSH2_KNOWNHOST_CHECK_MISMATCH:
@@ -360,36 +379,29 @@ int known_hosts(int session_idx)
 	}
 
 	hash_string = host_hash(session_idx);
-	//printf_s(session_idx, "Host key hash (SHA256): %s\r\n", hash_string+1);
 
-	// ask the user to confirm if we're seeing a new host+key combo
+	/* ask the user to confirm if we're seeing a new host+key combo */
 	if (safe_to_connect && !recognized_key)
 	{
-		// ask the user if the key is OK
 		DialogPtr dlg = GetNewDialog(DLOG_NEW_HOST, 0, (WindowPtr)-1);
 
 		DialogItemType type;
 		Handle itemH;
 		Rect box;
 
-		// draw default button indicator around the connect button
 		GetDialogItem(dlg, 2, &type, &itemH, &box);
 		SetDialogItem(dlg, 2, type, (Handle)NewUserItemUPP(&ButtonFrameProc), &box);
 
-		// write the hash string into the dialog window
 		ControlHandle hash_text_box;
 		GetDialogItem(dlg, 4, &type, &itemH, &box);
 		hash_text_box = (ControlHandle)itemH;
 		SetDialogItemText((Handle)hash_text_box, (ConstStr255Param)hash_string);
 
-		// let the modalmanager do everything
-		// stop on reject or accept
 		short item;
 		do {
 			ModalDialog(NULL, &item);
 		} while(item != 1 && item != 5);
 
-		// reject if user hit reject
 		if (item == 1)
 		{
 			safe_to_connect = 0;
@@ -402,50 +414,51 @@ int known_hosts(int session_idx)
 
 		printf_s(session_idx, "Saving host and key... ");
 
-		int save_type = 0;
-		save_type |= LIBSSH2_KNOWNHOST_TYPE_PLAIN;
-		save_type |= LIBSSH2_KNOWNHOST_KEYENC_RAW;
-
-		switch (key_type)
 		{
-			default:
-				__attribute__ ((fallthrough));
-			case LIBSSH2_HOSTKEY_TYPE_UNKNOWN:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_UNKNOWN;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_RSA:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_SSHRSA;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_DSS:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_SSHDSS;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_256;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_384;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_521;
-				break;
-			case LIBSSH2_HOSTKEY_TYPE_ED25519:
-				save_type |= LIBSSH2_KNOWNHOST_KEY_ED25519;
-				break;
-		}
+			int save_type = 0;
+			int e;
+			save_type |= LIBSSH2_KNOWNHOST_TYPE_PLAIN;
+			save_type |= LIBSSH2_KNOWNHOST_KEYENC_RAW;
 
-		// hostnames need to be either plain or of the format "[host]:port"
-		prefs.hostname[prefs.hostname[0]+1] = '\0';
-		int e = libssh2_knownhost_addc(kh, prefs.hostname+1, NULL, host_key, key_len, NULL, 0, save_type, NULL);
-		prefs.hostname[prefs.hostname[0]+1] = ':';
+			switch (key_type)
+			{
+				default:
+					__attribute__ ((fallthrough));
+				case LIBSSH2_HOSTKEY_TYPE_UNKNOWN:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_UNKNOWN;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_RSA:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_SSHRSA;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_DSS:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_SSHDSS;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_ECDSA_256:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_256;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_ECDSA_384:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_384;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_ECDSA_521:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_ECDSA_521;
+					break;
+				case LIBSSH2_HOSTKEY_TYPE_ED25519:
+					save_type |= LIBSSH2_KNOWNHOST_KEY_ED25519;
+					break;
+			}
 
-		if (e != 0) printf_s(session_idx, "failed to add to known hosts: %s\r\n", libssh2_error_string(e));
-		else if (known_hosts_file_path == NULL)
-			printf_s(session_idx, "failed to resolve known hosts file path.\r\n");
-		else
-		{
-			e = libssh2_knownhost_writefile(kh, known_hosts_file_path, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
-			if (e != 0) printf_s(session_idx, "failed to save known hosts file: %s\r\n", libssh2_error_string(e));
-			else printf_s(session_idx, "done.\r\n");
+			/* save with port-aware format: checkp/addc use [host]:port for non-22 */
+			e = libssh2_knownhost_addc(kh, host, NULL, host_key, key_len, NULL, 0, save_type, NULL);
+
+			if (e != 0) printf_s(session_idx, "failed to add to known hosts: %s\r\n", libssh2_error_string(e));
+			else if (known_hosts_file_path == NULL)
+				printf_s(session_idx, "failed to resolve known hosts file path.\r\n");
+			else
+			{
+				e = libssh2_knownhost_writefile(kh, known_hosts_file_path, LIBSSH2_KNOWNHOST_FILE_OPENSSH);
+				if (e != 0) printf_s(session_idx, "failed to save known hosts file: %s\r\n", libssh2_error_string(e));
+				else printf_s(session_idx, "done.\r\n");
+			}
 		}
 	}
 
@@ -494,26 +507,26 @@ ssize_t network_send_callback(libssh2_socket_t sock, const void *buffer,
 {
 	int idx = (int)(intptr_t)*abstract;
 	struct session* s = &sessions[idx];
-    int ret = -1;
+	int ret = -1;
 
-    ret = OTSnd(s->endpoint, (void*) buffer, length, 0);
+	ret = OTSnd(s->endpoint, (void*) buffer, length, 0);
 
-    // TODO FIXME handle cases better, i.e. translate error cases
-    if (ret == kOTLookErr)
-    {
-        OTResult lookresult = OTLook(s->endpoint);
-        //printf("kOTLookErr, reason: %ld\n", lookresult);
+	if (ret == kOTLookErr)
+	{
+		OTResult lookresult = OTLook(s->endpoint);
+		(void)lookresult;
+		return -1;
+	}
 
-        switch (lookresult)
-        {
-            default:
-               //printf("what?\n");
-               ret = -1;
-               break;
-        }
-    }
+	/* flow control: send buffer full. yield so OT can drain,
+	   then tell libssh2 to retry (same pattern as recv callback) */
+	if (ret == kOTFlowErr)
+	{
+		YieldToAnyThread();
+		return -EAGAIN;
+	}
 
-    return (ssize_t) ret;
+	return (ssize_t) ret;
 }
 
 void ssh_end_msg_callback(LIBSSH2_SESSION* session, int reason, const char *message,
@@ -598,58 +611,48 @@ int init_connection(int session_idx, char* hostname)
 	return 1;
 }
 
-void* read_thread(void* arg)
+int ssh_connect_and_auth(int session_idx, const struct ssh_auth_params* auth)
 {
-	int session_idx = (int)(intptr_t)arg;
 	struct session* s = &sessions[session_idx];
 	int ok = 1;
 	int rc = LIBSSH2_ERROR_NONE;
 
-	// yield until we're given a command
-	while (s->thread_command == WAIT) YieldToAnyThread();
-
-	if (s->thread_command == EXIT)
-	{
-		s->thread_state = DONE;
-		return 0;
-	}
-
-	// connect
-	printf_s(session_idx, "Connecting to: \"%s\"\r\n", prefs.hostname+1);
-	ok = init_connection(session_idx, prefs.hostname+1);
+	/* TCP + SSH handshake */
+	printf_s(session_idx, "Connecting to: \"%s\"\r\n", auth->hostname);
+	ok = init_connection(session_idx, (char*)auth->hostname);
 
 	if (!ok)
 	{
-		s->thread_state = DONE;
+		end_connection(session_idx);
 		return 0;
 	}
 
 	YieldToAnyThread();
 
-	// check the server pub key vs. known hosts
+	/* check server pub key vs. known hosts */
 	if (ok)
 	{
-		ok = known_hosts(session_idx);
+		ok = known_hosts(session_idx, auth->host_only, auth->port);
 		if (!ok) printf_s(session_idx, "Rejected server public key!\r\n");
 	}
 
-	// actually log in
+	/* authenticate */
 	if (ok)
 	{
 		printf_s(session_idx, "Authenticating... "); YieldToAnyThread();
 
-		if (prefs.auth_type == USE_PASSWORD)
+		if (!auth->use_key)
 		{
-			rc = libssh2_userauth_password(s->ssh_session, prefs.username+1, prefs.password+1);
+			rc = libssh2_userauth_password(s->ssh_session, auth->username, auth->password);
 		}
 		else
 		{
 			rc = libssh2_userauth_publickey_fromfile_ex(s->ssh_session,
-				prefs.username+1,
-				prefs.username[0],
-				prefs.pubkey_path,
-				prefs.privkey_path,
-				prefs.password+1);
+				auth->username,
+				strlen(auth->username),
+				auth->pubkey_path,
+				auth->privkey_path,
+				auth->password);
 		}
 
 		if (rc == LIBSSH2_ERROR_NONE)
@@ -659,25 +662,103 @@ void* read_thread(void* arg)
 		else
 		{
 			printf_s(session_idx, "failed!\r\n");
-			if (rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED && prefs.auth_type == USE_PASSWORD) StopAlert(ALRT_PW_FAIL, nil);
-			else if (rc == LIBSSH2_ERROR_FILE) StopAlert(ALRT_FILE_FAIL, nil);
+			if (rc == LIBSSH2_ERROR_AUTHENTICATION_FAILED && !auth->use_key)
+				printf_s(session_idx, "Wrong password.\r\n");
+			else if (rc == LIBSSH2_ERROR_FILE)
+				printf_s(session_idx, "Could not read key file.\r\n");
 			else if (rc == LIBSSH2_ERROR_PUBLICKEY_UNVERIFIED)
-			{
-				printf_s(session_idx, "Username/public key combination invalid!\r\n"); // TODO: have an alert for this
-				if (prefs.pubkey_path[0] != '\0' || prefs.privkey_path[0] != '\0')
-				{
-					prefs.pubkey_path[0] = '\0';
-					prefs.privkey_path[0] = '\0';
-				}
-			}
-			else printf_s(session_idx, "unexpected failure: %s\r\n", libssh2_error_string(rc));
+				printf_s(session_idx, "Username/public key combination invalid!\r\n");
+			else
+				printf_s(session_idx, "unexpected failure: %s\r\n", libssh2_error_string(rc));
 			ok = 0;
 		}
 	}
 
+	if (!ok)
+	{
+		end_connection(session_idx);
+		return 0;
+	}
+
+	return 1;
+}
+
+void ssh_request_pty_resize(int session_idx, int cols, int rows)
+{
+	struct session* s = &sessions[session_idx];
+	if (s->channel)
+		libssh2_channel_request_pty_size(s->channel, cols, rows);
+}
+
+void* read_thread(void* arg)
+{
+	int session_idx = (int)(intptr_t)arg;
+	struct session* s = &sessions[session_idx];
+	int ok = 1;
+	struct ssh_auth_params auth;
+
+	/* yield until we're given a command */
+	while (s->thread_command == WAIT) YieldToAnyThread();
+
+	if (s->thread_command == EXIT)
+	{
+		s->thread_state = DONE;
+		return 0;
+	}
+
+	/* build auth params from prefs (read_thread runs from main SSH connect flow) */
+	auth.hostname = prefs.hostname + 1;
+	/* extract host-only from "host:port" pascal string */
+	{
+		int i;
+		int hlen = (unsigned char)prefs.hostname[0];
+		static char host_buf[512];
+		for (i = 0; i < hlen && prefs.hostname[1+i] != ':'; i++)
+			host_buf[i] = prefs.hostname[1+i];
+		host_buf[i] = '\0';
+		auth.host_only = host_buf;
+	}
+	{
+		int pval = 22;
+		int i;
+		int hlen = (unsigned char)prefs.hostname[0];
+		for (i = 0; i < hlen; i++)
+		{
+			if (prefs.hostname[1+i] == ':')
+			{
+				pval = atoi(prefs.hostname + 2 + i);
+				break;
+			}
+		}
+		auth.port = pval;
+	}
+	auth.username = prefs.username + 1;
+	auth.password = prefs.password + 1;
+	auth.pubkey_path = prefs.pubkey_path;
+	auth.privkey_path = prefs.privkey_path;
+	auth.use_key = (prefs.auth_type == USE_KEY) ? 1 : 0;
+
+	ok = ssh_connect_and_auth(session_idx, &auth);
+	/* ssh_connect_and_auth already cleaned up on failure */
+	if (!ok)
+	{
+		/* clear invalid key paths on auth failure */
+		if (auth.use_key && prefs.pubkey_path && prefs.privkey_path)
+		{
+			if (prefs.pubkey_path[0] != '\0' || prefs.privkey_path[0] != '\0')
+			{
+				prefs.pubkey_path[0] = '\0';
+				prefs.privkey_path[0] = '\0';
+			}
+		}
+		save_prefs();
+		s->thread_state = DONE;
+		return 0;
+	}
+
 	save_prefs();
 
-	// if we logged in, open and set up the tty
+	/* open channel and set up terminal */
 	if (ok)
 	{
 		s->channel = libssh2_channel_open_session(s->ssh_session);
@@ -694,38 +775,36 @@ void* read_thread(void* arg)
 		YieldToAnyThread();
 	}
 
-	// if we failed, close everything and exit
+	/* if channel/terminal setup failed, close everything and exit */
 	if (!ok || (s->thread_state != OPEN))
 	{
 		end_connection(session_idx);
 		return 0;
 	}
 
-	// if we connected, allow pasting
-	void* menu = GetMenuHandle(MENU_EDIT);
-	EnableItem(menu, 5);
-
-	// read until failure, command to EXIT, or remote EOF
-	while (s->thread_command == READ && s->thread_state == OPEN && libssh2_channel_eof(s->channel) == 0)
+	/* if we connected, allow pasting */
 	{
-		if (check_network_events(session_idx)) ssh_read(session_idx);
-		YieldToAnyThread();
+		void* menu = GetMenuHandle(MENU_EDIT);
+		EnableItem(menu, 5);
+
+		/* read until failure, command to EXIT, or remote EOF */
+		while (s->thread_command == READ && s->thread_state == OPEN && libssh2_channel_eof(s->channel) == 0)
+		{
+			if (check_network_events(session_idx)) ssh_read(session_idx);
+			YieldToAnyThread();
+		}
+
+		if (s->channel && libssh2_channel_eof(s->channel))
+		{
+			printf_s(session_idx, "(disconnected by server)");
+		}
+
+		/* if we still have a connection, close it */
+		if (s->thread_state != DONE) end_connection(session_idx);
+
+		/* disallow pasting after connection is closed */
+		DisableItem(menu, 5);
 	}
-
-	if (s->channel && libssh2_channel_eof(s->channel))
-	{
-		printf_s(session_idx, "(disconnected by server)");
-	}
-
-	// if we still have a connection, close it
-	if (s->thread_state != DONE) end_connection(session_idx);
-
-	// disallow pasting after connection is closed
-	DisableItem(menu, 5);
-
-	// Don't call ssh_disconnect here — close_session or the menu handler
-	// will call it from the main thread.  Calling it from the read thread
-	// causes a race condition with close_session freeing the vterm.
 
 	return 0;
 }

@@ -990,6 +990,7 @@ void init_session(struct session* s)
 	s->thread_command = WAIT;
 	s->thread_state = UNINITIALIZED;
 	s->thread_id = kNoThreadID;
+	s->worker_mode = WORKER_NONE;
 	s->shell_vRefNum = 0;
 	s->shell_dirID = 0;
 	s->shell_line[0] = '\0';
@@ -997,6 +998,18 @@ void init_session(struct session* s)
 	s->shell_cursor_pos = 0;
 	s->wget_url[0] = '\0';
 	s->wget_no_progress = 0;
+	s->scp_user[0] = '\0';
+	s->scp_host[0] = '\0';
+	s->scp_port[0] = '\0';
+	s->scp_remote_path[0] = '\0';
+	s->scp_local_path[0] = '\0';
+	s->scp_direction = 0;
+	s->scp_no_progress = 0;
+	s->scp_local_file_size = 0;
+	s->scp_password[0] = '\0';
+	s->scp_pubkey_path[0] = '\0';
+	s->scp_privkey_path[0] = '\0';
+	s->scp_use_key = 0;
 	s->window_id = -1;
 }
 
@@ -1020,6 +1033,7 @@ int session_reap_thread(int session_idx, int force_stop)
 	if (err == threadNotFoundErr)
 	{
 		s->thread_id = kNoThreadID;
+		s->worker_mode = WORKER_NONE;
 		if (s->thread_state != UNINITIALIZED)
 			s->thread_state = DONE;
 		return 1;
@@ -1041,6 +1055,7 @@ int session_reap_thread(int session_idx, int force_stop)
 	if (err == noErr || err == threadNotFoundErr)
 	{
 		s->thread_id = kNoThreadID;
+		s->worker_mode = WORKER_NONE;
 		if (s->thread_state != UNINITIALIZED)
 			s->thread_state = DONE;
 		return 1;
@@ -1097,9 +1112,8 @@ static void adjust_window_for_tabs(struct window_context* wc, int tabs_appeared)
 			if (sessions[sid].in_use && sessions[sid].vterm)
 			{
 				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
-				if (sessions[sid].type == SESSION_SSH && sessions[sid].channel)
-					libssh2_channel_request_pty_size(sessions[sid].channel,
-						wc->size_x, wc->size_y);
+				if (sessions[sid].type == SESSION_SSH)
+					ssh_request_pty_resize(sid, wc->size_x, wc->size_y);
 			}
 		}
 	}
@@ -1197,13 +1211,13 @@ void close_session(int idx)
 		struct session* s = &sessions[idx];
 
 		/* nc inline mode has its own disconnect lifecycle. */
-		if (s->recv_buffer != NULL)
+		if (s->worker_mode == WORKER_NC)
 		{
 			nc_inline_disconnect(idx);
 		}
 		else
 		{
-			/* local worker commands (e.g. wget) share thread state fields. */
+			/* local worker commands (e.g. wget, scp) share thread state fields. */
 			if (s->thread_state == DONE && s->thread_id != kNoThreadID)
 				session_reap_thread(idx, 0);
 			else if (s->thread_id != kNoThreadID)
@@ -1218,6 +1232,9 @@ void close_session(int idx)
 				if (s->thread_id != kNoThreadID)
 					printf_s(idx, "Warning: local worker thread could not be reclaimed.\r\n");
 			}
+			/* plain local shell (no worker thread) — mark DONE so slot is reusable */
+			if (s->thread_id == kNoThreadID)
+				s->thread_state = DONE;
 		}
 	}
 
@@ -1414,13 +1431,13 @@ void close_window(int wid)
 			struct session* s = &sessions[sid];
 
 			/* nc inline mode has its own disconnect lifecycle. */
-			if (s->recv_buffer != NULL)
+			if (s->worker_mode == WORKER_NC)
 			{
 				nc_inline_disconnect(sid);
 			}
 			else
 			{
-				/* local worker commands (e.g. wget) share thread state fields. */
+				/* local worker commands (e.g. wget, scp) share thread state fields. */
 				if (s->thread_state == DONE && s->thread_id != kNoThreadID)
 					session_reap_thread(sid, 0);
 				else if (s->thread_id != kNoThreadID)
@@ -1436,6 +1453,9 @@ void close_window(int wid)
 						printf_s(sid, "Warning: local worker thread could not be reclaimed.\r\n");
 				}
 			}
+			/* plain local shell (no worker thread) — mark DONE so slot is reusable */
+			if (s->thread_id == kNoThreadID)
+				s->thread_state = DONE;
 		}
 
 		// null out vterm callbacks to prevent use during teardown
@@ -1583,8 +1603,8 @@ void resize_con_window(struct window_context* wc, EventRecord event)
 			if (sessions[sid].in_use && sessions[sid].vterm)
 			{
 				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
-				if (sessions[sid].type == SESSION_SSH && sessions[sid].channel)
-					libssh2_channel_request_pty_size(sessions[sid].channel, wc->size_x, wc->size_y);
+				if (sessions[sid].type == SESSION_SSH)
+					ssh_request_pty_resize(sid, wc->size_x, wc->size_y);
 				if (sessions[sid].type == SESSION_TELNET)
 					telnet_send_naws(sid);
 			}
@@ -1833,6 +1853,7 @@ static void reap_detached_sessions(void)
 
 		if (s->thread_state == DONE && s->thread_id == kNoThreadID)
 		{
+			s->worker_mode = WORKER_NONE;
 			if (s->recv_buffer != NULL)
 			{
 				OTFreeMem(s->recv_buffer);
@@ -1862,7 +1883,7 @@ static int has_active_local_worker(void)
 		struct session* s = &sessions[i];
 		if (!s->in_use) continue;
 		if (s->type != SESSION_LOCAL) continue;
-		if (s->recv_buffer != NULL) continue; /* nc inline has separate behavior */
+		if (s->worker_mode == WORKER_NC) continue; /* nc inline has separate behavior */
 		if (s->thread_id == kNoThreadID) continue;
 		if (s->thread_state == DONE || s->thread_state == UNINITIALIZED) continue;
 		return 1;

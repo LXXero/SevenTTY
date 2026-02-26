@@ -92,6 +92,10 @@
 #define DLOG_NEW_HOST 141
 #define DITL_NEW_HOST 141
 
+/* dialog for SCP auth method selection */
+#define DLOG_SCP_AUTH 142
+#define DITL_SCP_AUTH 142
+
 /* controls for preferences dialog */
 #define CNTL_PREF_FG_COLOR  128
 #define CNTL_PREF_BG_COLOR  129

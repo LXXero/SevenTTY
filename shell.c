@@ -11,6 +11,7 @@
 #include "app.h"
 #include "shell.h"
 #include "console.h"
+#include "net.h"
 #include "telnet.h"
 
 #include <Files.h>
@@ -3126,6 +3127,7 @@ static void cmd_grep(int idx, int argc, char** argv)
 	long line_num = 0;
 	long match_count = 0;
 	char num[16];
+	int prev_cr = 0;
 
 	/* parse flags */
 	for (argi = 1; argi < argc; argi++)
@@ -3179,15 +3181,28 @@ static void cmd_grep(int idx, int argc, char** argv)
 		{
 			unsigned char c = buf[i];
 
+			/* skip \n that follows \r from previous buffer */
+			if (prev_cr && c == '\n')
+			{
+				prev_cr = 0;
+				continue;
+			}
+			prev_cr = 0;
+
 			/* end of line? (\r, \n, or \r\n) */
 			if (c == '\r' || c == '\n')
 			{
 				const char* found;
 				int matched;
 
-				/* skip \n after \r */
-				if (c == '\r' && i + 1 < count && buf[i + 1] == '\n')
-					i++;
+				/* skip \n after \r within same buffer */
+				if (c == '\r')
+				{
+					if (i + 1 < count && buf[i + 1] == '\n')
+						i++;
+					else if (i + 1 == count)
+						prev_cr = 1;
+				}
 
 				line[line_len] = '\0';
 				line_num++;
@@ -3367,6 +3382,7 @@ static void cmd_tail(int idx, int argc, char** argv)
 			filename = argv[argi];
 	}
 
+	if (num_lines < 0) num_lines = 0;
 	if (num_lines > TAIL_MAX) num_lines = TAIL_MAX;
 
 	if (!filename)
@@ -3427,7 +3443,24 @@ static void cmd_tail(int idx, int argc, char** argv)
 		if (e == eofErr || e != noErr) break;
 	}
 
+	/* if last recorded offset == file size, it's a phantom empty line after
+	   a trailing newline — remove it so tail -n 1 doesn't show nothing */
+	if (off_count > 1)
+	{
+		int last = (off_head - 1 + (TAIL_MAX + 1)) % (TAIL_MAX + 1);
+		if (offsets[last] == file_pos)
+		{
+			off_head = last;
+			off_count--;
+		}
+	}
+
 	/* seek to the right line and output */
+	if (num_lines == 0)
+	{
+		FSClose(refNum);
+		return;
+	}
 	{
 		long seek_off;
 		int start_idx;
@@ -4774,11 +4807,11 @@ static void cmd_xxd(int idx, int argc, char** argv)
 
 							while (*p)
 							{
-								int hi, lo;
-								while (*p == ' ') p++;
-								if (*p == '\0' || *p == ' ') break;
-								/* stop at ASCII column (two spaces before it) */
-								if (p[0] == ' ' && p[1] == ' ') break;
+								int hi, lo, sp;
+								/* skip spaces; two or more consecutive = ASCII column separator */
+								sp = 0;
+								while (*p == ' ') { p++; sp++; }
+								if (*p == '\0' || sp >= 2) break;
 
 								hi = -1; lo = -1;
 								if (*p >= '0' && *p <= '9') hi = *p - '0';
@@ -5294,15 +5327,17 @@ static long wget_percent(long total_written, long content_length)
 	return (total_written * 100L) / content_length;
 }
 
-static int wget_progress_step(int idx,
-                              long total_written,
-                              long content_length,
-                              long* next_progress_bytes,
-                              int* progress_live,
-                              int show_progress)
+static int transfer_progress_step(int idx,
+                                  long total_written,
+                                  long content_length,
+                                  long* next_progress_bytes,
+                                  int* progress_live,
+                                  int show_progress,
+                                  int uploading)
 {
 	char pbuf[96];
 	const long step = 524288L; /* 512 KB: lower UI overhead, higher throughput */
+	const char* verb = uploading ? "Uploading" : "Downloading";
 
 	if (total_written < *next_progress_bytes)
 		return 0;
@@ -5316,12 +5351,12 @@ static int wget_progress_step(int idx,
 	{
 		long pct = wget_percent(total_written, content_length);
 		snprintf(pbuf, sizeof(pbuf),
-		         "\rDownloaded %ld / %ld bytes (%ld%%)",
-		         total_written, content_length, pct);
+		         "\r%s %ld / %ld bytes (%ld%%)",
+		         verb, total_written, content_length, pct);
 	}
 	else
 	{
-		snprintf(pbuf, sizeof(pbuf), "\rDownloaded %ld bytes", total_written);
+		snprintf(pbuf, sizeof(pbuf), "\r%s %ld bytes", verb, total_written);
 	}
 
 	vt_write(idx, pbuf);
@@ -5902,9 +5937,9 @@ retry_redirect:
 
 						FSWrite(out_ref, &wcount, body_data);
 						total_written += wcount;
-						if (wget_progress_step(idx, total_written, content_length,
+						if (transfer_progress_step(idx, total_written, content_length,
 						                       &next_progress_bytes, &progress_live,
-						                       !no_progress) &&
+						                       !no_progress, 0) &&
 						    TickCount() >= next_progress_yield_tick)
 						{
 							YieldToAnyThread();
@@ -5928,9 +5963,9 @@ retry_redirect:
 
 						FSWrite(out_ref, &wcount, ovf_data);
 						total_written += wcount;
-						if (wget_progress_step(idx, total_written, content_length,
+						if (transfer_progress_step(idx, total_written, content_length,
 						                       &next_progress_bytes, &progress_live,
-						                       !no_progress) &&
+						                       !no_progress, 0) &&
 						    TickCount() >= next_progress_yield_tick)
 						{
 							YieldToAnyThread();
@@ -5957,9 +5992,9 @@ retry_redirect:
 			FSWrite(out_ref, &wcount, buf);
 			total_written += wcount;
 
-			if (wget_progress_step(idx, total_written, content_length,
+			if (transfer_progress_step(idx, total_written, content_length,
 			                       &next_progress_bytes, &progress_live,
-			                       !no_progress) &&
+			                       !no_progress, 0) &&
 			    TickCount() >= next_progress_yield_tick)
 			{
 				YieldToAnyThread();
@@ -6065,7 +6100,7 @@ retry_redirect:
 static int local_shell_worker_active(const struct session* s)
 {
 	return (s->type == SESSION_LOCAL &&
-	        s->recv_buffer == NULL &&
+	        s->worker_mode != WORKER_NC &&
 	        s->thread_id != kNoThreadID &&
 	        s->thread_state != DONE &&
 	        s->thread_state != UNINITIALIZED);
@@ -6078,10 +6113,11 @@ static void* wget_worker_thread(void* arg)
 
 	cmd_wget_run(idx, s->wget_url, s->wget_no_progress ? 1 : 0);
 
+	s->worker_mode = WORKER_NONE;
 	s->thread_state = DONE;
 	s->thread_command = WAIT;
 
-	if (s->in_use && s->type == SESSION_LOCAL && s->recv_buffer == NULL)
+	if (s->in_use && s->type == SESSION_LOCAL && s->worker_mode != WORKER_NC)
 		shell_prompt(idx);
 
 	return 0;
@@ -6120,7 +6156,7 @@ static void cmd_wget(int idx, int argc, char** argv)
 		return;
 	}
 
-	if (s->recv_buffer != NULL)
+	if (s->worker_mode == WORKER_NC)
 	{
 		vt_write(idx, "wget: unavailable while nc session is active\r\n");
 		return;
@@ -6163,6 +6199,786 @@ static void cmd_wget(int idx, int argc, char** argv)
 	}
 
 	s->thread_id = tid;
+	s->worker_mode = WORKER_WGET;
+}
+
+/* ------------------------------------------------------------------ */
+/* scp - SSH file copy (download and upload)                          */
+/* ------------------------------------------------------------------ */
+
+/* parse user@host:/path or user@host:port:/path into components.
+   returns 1 if arg matches remote format, 0 otherwise. */
+static int parse_scp_spec(const char* arg,
+                           char* user, int user_max,
+                           char* host, int host_max,
+                           char* port, int port_max,
+                           char* remote_path, int path_max)
+{
+	const char* at;
+	const char* colon;
+	const char* second_colon;
+	int ulen, hlen;
+
+	at = strchr(arg, '@');
+	if (at == NULL) return 0;
+
+	colon = strchr(at + 1, ':');
+	if (colon == NULL) return 0;
+
+	/* user */
+	ulen = at - arg;
+	if (ulen <= 0 || ulen >= user_max) return 0;
+	memcpy(user, arg, ulen);
+	user[ulen] = '\0';
+
+	/* host */
+	hlen = colon - (at + 1);
+	if (hlen <= 0 || hlen >= host_max) return 0;
+	memcpy(host, at + 1, hlen);
+	host[hlen] = '\0';
+
+	/* check for port: user@host:port:/path */
+	second_colon = strchr(colon + 1, ':');
+	if (second_colon != NULL && second_colon > colon + 1)
+	{
+		/* chars between first colon and second colon should be digits */
+		const char* p;
+		int all_digits = 1;
+		int plen;
+
+		for (p = colon + 1; p < second_colon; p++)
+		{
+			if (*p < '0' || *p > '9') { all_digits = 0; break; }
+		}
+
+		if (all_digits)
+		{
+			plen = second_colon - (colon + 1);
+			if (plen >= port_max) return 0;
+			memcpy(port, colon + 1, plen);
+			port[plen] = '\0';
+			colon = second_colon; /* advance past port */
+		}
+		else
+		{
+			strncpy(port, "22", port_max - 1);
+			port[port_max - 1] = '\0';
+		}
+	}
+	else
+	{
+		strncpy(port, "22", port_max - 1);
+		port[port_max - 1] = '\0';
+	}
+
+	/* remote path: everything after the (final) colon */
+	if (colon[1] == '\0') return 0; /* empty path */
+	strncpy(remote_path, colon + 1, path_max - 1);
+	remote_path[path_max - 1] = '\0';
+
+	return 1;
+}
+
+/* extract basename from a remote path, truncate to 31 chars for HFS */
+static void scp_basename(const char* remote_path, char* out, int out_max)
+{
+	const char* slash;
+	int len;
+
+	slash = strrchr(remote_path, '/');
+	if (slash != NULL && slash[1] != '\0')
+		slash++;
+	else if (slash == NULL)
+		slash = remote_path;
+	else
+		slash = remote_path; /* trailing slash — use whole thing */
+
+	len = strlen(slash);
+	if (len > 31) len = 31; /* HFS limit */
+	if (len >= out_max) len = out_max - 1;
+	memcpy(out, slash, len);
+	out[len] = '\0';
+}
+
+static void scp_download(int idx)
+{
+	struct session* s = &sessions[idx];
+	struct ssh_auth_params auth;
+	char hostname_buf[280]; /* "host:port" */
+	libssh2_struct_stat sb;
+	long total_read = 0;
+	long next_progress_bytes = 0;
+	int progress_live = 0;
+	short out_ref = 0;
+	int file_open = 0;
+	unsigned char first_bytes[128];
+	int first_bytes_len = 0;
+
+	/* build auth params from session's snapshotted fields */
+	snprintf(hostname_buf, sizeof(hostname_buf), "%s:%s", s->scp_host, s->scp_port);
+	auth.hostname = hostname_buf;
+	auth.host_only = s->scp_host;
+	auth.port = atoi(s->scp_port);
+	auth.username = s->scp_user;
+	auth.password = s->scp_password;
+	auth.pubkey_path = s->scp_pubkey_path;
+	auth.privkey_path = s->scp_privkey_path;
+	auth.use_key = s->scp_use_key;
+
+	/* initialize Open Transport (idempotent, required before any OT calls) */
+	if (InitOpenTransport() != noErr)
+	{
+		printf_s(idx, "scp: failed to initialize Open Transport\r\n");
+		return;
+	}
+
+	/* allocate OT buffers for SSH transport */
+	s->recv_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	if (s->recv_buffer == NULL || s->send_buffer == NULL)
+	{
+		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
+		if (s->send_buffer) { OTFreeMem(s->send_buffer); s->send_buffer = NULL; }
+		printf_s(idx, "scp: failed to allocate buffers\r\n");
+		return;
+	}
+
+	/* connect + authenticate */
+	if (!ssh_connect_and_auth(idx, &auth))
+	{
+		/* ssh_connect_and_auth cleaned up on failure */
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+		return;
+	}
+
+	/* disable path quoting so remote shell expands ~ and env vars */
+	libssh2_session_flag(s->ssh_session, LIBSSH2_FLAG_QUOTE_PATHS, 0);
+
+	/* open SCP receive channel */
+	memset(&sb, 0, sizeof(sb));
+	while (1)
+	{
+		s->channel = libssh2_scp_recv2(s->ssh_session, s->scp_remote_path, &sb);
+		if (s->channel != NULL) break;
+		if (libssh2_session_last_errno(s->ssh_session) == LIBSSH2_ERROR_EAGAIN)
+		{
+			YieldToAnyThread();
+			if (s->thread_command == EXIT) break;
+			continue;
+		}
+		printf_s(idx, "scp: failed to open remote file: %s\r\n",
+		         libssh2_error_string(libssh2_session_last_errno(s->ssh_session)));
+		break;
+	}
+
+	if (s->channel == NULL)
+	{
+		end_connection(idx);
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+		return;
+	}
+
+	/* create local file */
+	{
+		Str255 pname;
+		int nlen = strlen(s->scp_local_path);
+		OSErr ferr;
+
+		if (nlen > 31) nlen = 31;
+		pname[0] = nlen;
+		memcpy(pname + 1, s->scp_local_path, nlen);
+
+		ferr = HCreate(s->shell_vRefNum, s->shell_dirID, pname, 'SeT7', 'TEXT');
+		if (ferr == dupFNErr)
+		{
+			/* file exists — overwrite */
+			ferr = noErr;
+		}
+		if (ferr != noErr && ferr != dupFNErr)
+		{
+			printf_s(idx, "scp: failed to create file (err=%d)\r\n", (int)ferr);
+			end_connection(idx);
+			OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+			OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+			return;
+		}
+
+		ferr = HOpenDF(s->shell_vRefNum, s->shell_dirID, pname, fsWrPerm, &out_ref);
+		if (ferr != noErr)
+		{
+			printf_s(idx, "scp: failed to open file for writing (err=%d)\r\n", (int)ferr);
+			end_connection(idx);
+			OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+			OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+			return;
+		}
+		file_open = 1;
+	}
+
+	/* read loop */
+	{
+		long file_size = (long)sb.st_size;
+		long remaining = file_size;
+
+		while (remaining > 0 && s->thread_command != EXIT)
+		{
+			long to_read = SSH_BUFFER_SIZE;
+			ssize_t rc;
+			long wcount;
+
+			if (to_read > remaining) to_read = remaining;
+
+			rc = libssh2_channel_read(s->channel, s->recv_buffer, to_read);
+			if (rc == LIBSSH2_ERROR_EAGAIN)
+			{
+				YieldToAnyThread();
+				continue;
+			}
+			if (rc < 0)
+			{
+				printf_s(idx, "\r\nscp: read error: %s\r\n", libssh2_error_string(rc));
+				break;
+			}
+			if (rc == 0) break;
+
+			/* capture first 128 bytes for type detection */
+			if (first_bytes_len < 128)
+			{
+				int grab = 128 - first_bytes_len;
+				if (grab > rc) grab = rc;
+				memcpy(first_bytes + first_bytes_len, s->recv_buffer, grab);
+				first_bytes_len += grab;
+			}
+
+			wcount = rc;
+			FSWrite(out_ref, &wcount, s->recv_buffer);
+			total_read += rc;
+			remaining -= rc;
+
+			transfer_progress_step(idx, total_read, file_size,
+			                       &next_progress_bytes, &progress_live,
+			                       !s->scp_no_progress, 0);
+			YieldToAnyThread();
+		}
+	}
+
+	/* close local file */
+	if (file_open)
+	{
+		SetEOF(out_ref, total_read);
+		FSClose(out_ref);
+	}
+
+	/* detect file type/creator */
+	if (total_read > 0)
+	{
+		OSType ftype = 'TEXT';
+		OSType fcreator = 'SeT7';
+		Str255 pname;
+		FInfo finfo;
+		int nlen = strlen(s->scp_local_path);
+
+		if (nlen > 31) nlen = 31;
+		pname[0] = nlen;
+		memcpy(pname + 1, s->scp_local_path, nlen);
+
+		{
+			long mb_data_len = 0, mb_rsrc_len = 0;
+			if (!check_macbinary(first_bytes, first_bytes_len, &ftype, &fcreator,
+			                     &mb_data_len, &mb_rsrc_len))
+				lookup_ext_type(s->scp_local_path, &ftype, &fcreator);
+		}
+
+		if (HGetFInfo(s->shell_vRefNum, s->shell_dirID, pname, &finfo) == noErr)
+		{
+			finfo.fdType = ftype;
+			finfo.fdCreator = fcreator;
+			HSetFInfo(s->shell_vRefNum, s->shell_dirID, pname, &finfo);
+		}
+	}
+
+	if (progress_live)
+		vt_write(idx, "\r\n");
+
+	if (s->thread_command == EXIT)
+		printf_s(idx, "scp: cancelled\r\n");
+	else
+		printf_s(idx, "scp: downloaded %ld bytes -> %s\r\n", total_read, s->scp_local_path);
+
+	/* cleanup: caller owns connection after successful auth */
+	end_connection(idx);
+	OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+	OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+}
+
+static void scp_upload(int idx)
+{
+	struct session* s = &sessions[idx];
+	struct ssh_auth_params auth;
+	char hostname_buf[280];
+	short in_ref = 0;
+	long total_written = 0;
+	long next_progress_bytes = 0;
+	int progress_live = 0;
+
+	/* open local file from pre-resolved FSSpec */
+	{
+		OSErr ferr = FSpOpenDF(&s->scp_local_spec, fsRdPerm, &in_ref);
+		if (ferr != noErr)
+		{
+			printf_s(idx, "scp: failed to open local file (err=%d)\r\n", (int)ferr);
+			return;
+		}
+	}
+
+	/* build auth params */
+	snprintf(hostname_buf, sizeof(hostname_buf), "%s:%s", s->scp_host, s->scp_port);
+	auth.hostname = hostname_buf;
+	auth.host_only = s->scp_host;
+	auth.port = atoi(s->scp_port);
+	auth.username = s->scp_user;
+	auth.password = s->scp_password;
+	auth.pubkey_path = s->scp_pubkey_path;
+	auth.privkey_path = s->scp_privkey_path;
+	auth.use_key = s->scp_use_key;
+
+	/* initialize Open Transport (idempotent, required before any OT calls) */
+	if (InitOpenTransport() != noErr)
+	{
+		FSClose(in_ref);
+		printf_s(idx, "scp: failed to initialize Open Transport\r\n");
+		return;
+	}
+
+	/* allocate OT buffers */
+	s->recv_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	if (s->recv_buffer == NULL || s->send_buffer == NULL)
+	{
+		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
+		if (s->send_buffer) { OTFreeMem(s->send_buffer); s->send_buffer = NULL; }
+		FSClose(in_ref);
+		printf_s(idx, "scp: failed to allocate buffers\r\n");
+		return;
+	}
+
+	/* connect + authenticate */
+	if (!ssh_connect_and_auth(idx, &auth))
+	{
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+		FSClose(in_ref);
+		return;
+	}
+
+	/* disable path quoting so remote shell expands ~ and env vars */
+	libssh2_session_flag(s->ssh_session, LIBSSH2_FLAG_QUOTE_PATHS, 0);
+
+	/* open SCP send channel */
+	while (1)
+	{
+		s->channel = libssh2_scp_send_ex(s->ssh_session, s->scp_remote_path,
+		                                  0644, s->scp_local_file_size, 0, 0);
+		if (s->channel != NULL) break;
+		if (libssh2_session_last_errno(s->ssh_session) == LIBSSH2_ERROR_EAGAIN)
+		{
+			YieldToAnyThread();
+			if (s->thread_command == EXIT) break;
+			continue;
+		}
+		printf_s(idx, "scp: failed to open remote path: %s\r\n",
+		         libssh2_error_string(libssh2_session_last_errno(s->ssh_session)));
+		break;
+	}
+
+	if (s->channel == NULL)
+	{
+		end_connection(idx);
+		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+		FSClose(in_ref);
+		return;
+	}
+
+	/* write loop */
+	{
+		long remaining = s->scp_local_file_size;
+
+		while (remaining > 0 && s->thread_command != EXIT)
+		{
+			long to_read = SSH_BUFFER_SIZE;
+			long rcount;
+			char* ptr;
+			long left;
+			OSErr ferr;
+
+			if (to_read > remaining) to_read = remaining;
+			rcount = to_read;
+			ferr = FSRead(in_ref, &rcount, s->send_buffer);
+			if (ferr != noErr && ferr != eofErr)
+			{
+				printf_s(idx, "\r\nscp: local read error (err=%d)\r\n", (int)ferr);
+				break;
+			}
+			if (rcount == 0) break;
+
+			ptr = s->send_buffer;
+			left = rcount;
+			while (left > 0 && s->thread_command != EXIT)
+			{
+				ssize_t rc = libssh2_channel_write(s->channel, ptr, left);
+				if (rc == LIBSSH2_ERROR_EAGAIN)
+				{
+					YieldToAnyThread();
+					continue;
+				}
+				if (rc < 0)
+				{
+					printf_s(idx, "\r\nscp: write error: %s\r\n", libssh2_error_string(rc));
+					goto upload_done;
+				}
+				ptr += rc;
+				left -= rc;
+				total_written += rc;
+				remaining -= rc;
+			}
+
+			transfer_progress_step(idx, total_written, s->scp_local_file_size,
+			                       &next_progress_bytes, &progress_live,
+			                       !s->scp_no_progress, 1);
+			YieldToAnyThread();
+		}
+	}
+
+upload_done:
+	libssh2_channel_send_eof(s->channel);
+	FSClose(in_ref);
+
+	if (progress_live)
+		vt_write(idx, "\r\n");
+
+	if (s->thread_command == EXIT)
+		printf_s(idx, "scp: cancelled\r\n");
+	else
+		printf_s(idx, "scp: uploaded %ld bytes -> %s\r\n", total_written, s->scp_remote_path);
+
+	end_connection(idx);
+	OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
+	OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+}
+
+static void* scp_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
+
+	if (s->scp_direction == 0)
+		scp_download(idx);
+	else
+		scp_upload(idx);
+
+	s->worker_mode = WORKER_NONE;
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	if (s->in_use && s->type == SESSION_LOCAL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+/* show SCP auth dialog: pick password/key, then prompt for credentials.
+   populates s->scp_password, scp_pubkey_path, scp_privkey_path, scp_use_key.
+   returns 1=ok 0=cancel. */
+static int scp_auth_prompt(struct session* s)
+{
+	DialogPtr dlg;
+	DialogItemType type;
+	Handle itemH;
+	Rect box;
+	short item;
+	ControlHandle pw_radio, key_radio;
+	int use_password;
+	Str255 saved_pw;
+	int saved_auth;
+	char* saved_pubkey;
+	char* saved_privkey;
+	int ok;
+	unsigned int plen;
+
+	/* TEInit + InitDialogs may not have been called yet if the user
+	   went straight to local shell without opening any dialog first */
+	TEInit();
+	InitDialogs(NULL);
+	InitCursor();
+
+	/* show auth method chooser */
+	dlg = GetNewDialog(DLOG_SCP_AUTH, 0, (WindowPtr)-1);
+	if (!dlg) return 0;
+
+	/* draw default button indicator */
+	GetDialogItem(dlg, 2, &type, &itemH, &box);
+	SetDialogItem(dlg, 2, type, (Handle)NewUserItemUPP(&ButtonFrameProc), &box);
+
+	/* get radio button handles */
+	GetDialogItem(dlg, 4, &type, &itemH, &box);
+	pw_radio = (ControlHandle)itemH;
+	GetDialogItem(dlg, 5, &type, &itemH, &box);
+	key_radio = (ControlHandle)itemH;
+
+	/* default to password, or key if prefs has keys configured */
+	if (prefs.auth_type == USE_KEY &&
+	    prefs.pubkey_path && prefs.pubkey_path[0] != '\0' &&
+	    prefs.privkey_path && prefs.privkey_path[0] != '\0')
+	{
+		SetControlValue(key_radio, 1);
+		SetControlValue(pw_radio, 0);
+	}
+	else
+	{
+		SetControlValue(pw_radio, 1);
+		SetControlValue(key_radio, 0);
+	}
+
+	do {
+		ModalDialog(NULL, &item);
+		if (item == 4)
+		{
+			SetControlValue(pw_radio, 1);
+			SetControlValue(key_radio, 0);
+		}
+		else if (item == 5)
+		{
+			SetControlValue(pw_radio, 0);
+			SetControlValue(key_radio, 1);
+		}
+	} while (item != 1 && item != 6);
+
+	use_password = GetControlValue(pw_radio);
+	DisposeDialog(dlg);
+	FlushEvents(everyEvent, -1);
+
+	if (item == 6) return 0; /* cancel */
+
+	/* save prefs state — password_dialog/key_dialog mutate prefs */
+	memcpy(saved_pw, prefs.password, sizeof(Str255));
+	saved_auth = prefs.auth_type;
+	saved_pubkey = prefs.pubkey_path;
+	saved_privkey = prefs.privkey_path;
+
+	if (use_password)
+	{
+		/* clear prefs.password so dialog starts empty */
+		prefs.password[0] = 0;
+		ok = password_dialog(DLOG_PASSWORD);
+		if (ok)
+		{
+			plen = (unsigned char)prefs.password[0];
+			if (plen > sizeof(s->scp_password) - 1)
+				plen = sizeof(s->scp_password) - 1;
+			memcpy(s->scp_password, prefs.password + 1, plen);
+			s->scp_password[plen] = '\0';
+		}
+		s->scp_use_key = 0;
+		s->scp_pubkey_path[0] = '\0';
+		s->scp_privkey_path[0] = '\0';
+	}
+	else
+	{
+		/* key_dialog: prompts for key files if not in prefs, then passphrase */
+		ok = key_dialog();
+		if (ok)
+		{
+			/* snapshot password (key passphrase) */
+			plen = (unsigned char)prefs.password[0];
+			if (plen > sizeof(s->scp_password) - 1)
+				plen = sizeof(s->scp_password) - 1;
+			memcpy(s->scp_password, prefs.password + 1, plen);
+			s->scp_password[plen] = '\0';
+			/* snapshot key paths */
+			if (prefs.pubkey_path)
+			{
+				strncpy(s->scp_pubkey_path, prefs.pubkey_path, 1023);
+				s->scp_pubkey_path[1023] = '\0';
+			}
+			if (prefs.privkey_path)
+			{
+				strncpy(s->scp_privkey_path, prefs.privkey_path, 1023);
+				s->scp_privkey_path[1023] = '\0';
+			}
+			s->scp_use_key = 1;
+		}
+	}
+
+	/* restore prefs state */
+	memcpy(prefs.password, saved_pw, sizeof(Str255));
+	prefs.auth_type = saved_auth;
+	prefs.pubkey_path = saved_pubkey;
+	prefs.privkey_path = saved_privkey;
+
+	return ok;
+}
+
+static void cmd_scp(int idx, int argc, char** argv)
+{
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
+	int argi = 1;
+	int no_progress = 0;
+	char user[256], host[256], port[16], remote_path[512];
+	int local_arg = -1;  /* which argv[] is the local file/name */
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: scp [-n] user@host:/path [local]\r\n");
+		vt_write(idx, "       scp [-n] local user@host:/path\r\n");
+		return;
+	}
+
+	/* parse -n flag */
+	if (strcmp(argv[argi], "-n") == 0 || strcmp(argv[argi], "--no-progress") == 0)
+	{
+		no_progress = 1;
+		argi++;
+	}
+
+	if (argi >= argc)
+	{
+		vt_write(idx, "usage: scp [-n] user@host:/path [local]\r\n");
+		return;
+	}
+
+	/* guard: no worker already running */
+	if (s->worker_mode != WORKER_NONE)
+	{
+		vt_write(idx, "scp: another worker is already active\r\n");
+		return;
+	}
+
+	/* reap previous thread if DONE */
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			vt_write(idx, "scp: previous worker thread could not be reclaimed\r\n");
+			return;
+		}
+	}
+
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "scp: another local command is already running\r\n");
+		return;
+	}
+
+	/* detect direction: which arg is the remote spec? */
+	if (parse_scp_spec(argv[argi], user, 256, host, 256, port, 16, remote_path, 512))
+	{
+		/* first non-flag arg is remote -> download */
+		s->scp_direction = 0;
+		if (argi + 1 < argc)
+			local_arg = argi + 1;
+	}
+	else if (argi + 1 < argc &&
+	         parse_scp_spec(argv[argi + 1], user, 256, host, 256, port, 16, remote_path, 512))
+	{
+		/* second arg is remote -> upload */
+		local_arg = argi;
+		s->scp_direction = 1;
+	}
+	else
+	{
+		vt_write(idx, "scp: no valid user@host:/path argument found\r\n");
+		return;
+	}
+
+	/* populate session SCP fields */
+	strncpy(s->scp_user, user, sizeof(s->scp_user) - 1);
+	s->scp_user[sizeof(s->scp_user) - 1] = '\0';
+	strncpy(s->scp_host, host, sizeof(s->scp_host) - 1);
+	s->scp_host[sizeof(s->scp_host) - 1] = '\0';
+	strncpy(s->scp_port, port, sizeof(s->scp_port) - 1);
+	s->scp_port[sizeof(s->scp_port) - 1] = '\0';
+	strncpy(s->scp_remote_path, remote_path, sizeof(s->scp_remote_path) - 1);
+	s->scp_remote_path[sizeof(s->scp_remote_path) - 1] = '\0';
+	s->scp_no_progress = no_progress ? 1 : 0;
+
+	if (s->scp_direction == 0)
+	{
+		/* download: set local filename */
+		if (local_arg >= 0 &&
+		    strcmp(argv[local_arg], ".") != 0 &&
+		    strcmp(argv[local_arg], "./") != 0)
+		{
+			strncpy(s->scp_local_path, argv[local_arg], sizeof(s->scp_local_path) - 1);
+			s->scp_local_path[sizeof(s->scp_local_path) - 1] = '\0';
+			/* truncate to 31 for HFS */
+			if (strlen(s->scp_local_path) > 31)
+				s->scp_local_path[31] = '\0';
+		}
+		else
+		{
+			/* no local name given, or "." — use basename of remote path */
+			scp_basename(remote_path, s->scp_local_path, sizeof(s->scp_local_path));
+		}
+	}
+	else
+	{
+		/* upload: resolve local file */
+		FSSpec spec;
+		short ref;
+		long eof_size;
+		OSErr ferr;
+
+		if (resolve_path(idx, argv[local_arg], &spec) != noErr)
+		{
+			printf_s(idx, "scp: file not found: %s\r\n", argv[local_arg]);
+			return;
+		}
+
+		ferr = FSpOpenDF(&spec, fsRdPerm, &ref);
+		if (ferr != noErr)
+		{
+			printf_s(idx, "scp: cannot open file (err=%d)\r\n", (int)ferr);
+			return;
+		}
+		GetEOF(ref, &eof_size);
+		FSClose(ref);
+
+		s->scp_local_spec = spec;
+		s->scp_local_file_size = eof_size;
+	}
+
+	/* prompt for auth method + credentials (runs on main thread) */
+	if (!scp_auth_prompt(s))
+	{
+		vt_write(idx, "scp: cancelled\r\n");
+		return;
+	}
+
+	/* set up thread state */
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
+
+	err = NewThread(kCooperativeThread, scp_worker_thread,
+	                (void*)(long)idx, 200000,
+	                kCreateIfNeeded, NULL, &tid);
+	if (err != noErr)
+	{
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "scp: failed to create worker thread (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	s->thread_id = tid;
+	s->worker_mode = WORKER_SCP;
 }
 
 /* ------------------------------------------------------------------ */
@@ -6515,6 +7331,8 @@ static void cmd_help(int idx, int argc, char* argv[])
 		"    ssh [user@]h[:p]   open SSH tab",
 		"    telnet <h> [port]  open telnet tab",
 		"    wget [-n] <url>    HTTP download",
+		"    scp [-n] u@h:/p [l]  SCP download",
+		"    scp [-n] l u@h:/p    SCP upload",
 		"    nc <host> <port>   raw TCP connection",
 		"    host <hostname>    DNS lookup",
 		"    ping <host> [port] TCP connect test",
@@ -6590,7 +7408,7 @@ static const char* shell_commands[] = {
 	"history", "host", "hostname", "ifconfig", "info", "label", "less",
 	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
 	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
-	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "seq",
+	"realpath", "ren", "rename", "rev", "rm", "rmdir", "rot13", "scp", "seq",
 	"setcreator", "settype", "sha1sum", "sha256sum", "sha512sum", "sleep",
 	"ssh", "strings", "tail", "telnet", "touch", "type", "uname",
 	"unix2dos", "unix2mac", "uptime", "wc", "wget", "which", "xxd"
@@ -7172,6 +7990,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "ln") == 0)       cmd_ln(idx, argc, argv);
 	else if (strcmp(cmd, "readlink") == 0) cmd_readlink(idx, argc, argv);
 	else if (strcmp(cmd, "wget") == 0)     cmd_wget(idx, argc, argv);
+	else if (strcmp(cmd, "scp") == 0)      cmd_scp(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)
@@ -7319,8 +8138,8 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 {
 	struct session* s = &sessions[session_idx];
 
-	/* nc inline mode: recv_buffer is non-NULL when nc_inline_connect was called */
-	if (s->recv_buffer != NULL && s->type == SESSION_LOCAL)
+	/* nc inline mode: worker_mode is WORKER_NC when nc_inline_connect succeeded */
+	if (s->worker_mode == WORKER_NC)
 	{
 		if (s->thread_state == DONE || s->thread_command == EXIT)
 		{
@@ -7397,7 +8216,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 
 	/* Reap completed local worker threads before handling new key input. */
 	if (s->type == SESSION_LOCAL &&
-		s->recv_buffer == NULL &&
+		s->worker_mode != WORKER_NC &&
 		s->thread_state == DONE &&
 		s->thread_id != kNoThreadID)
 	{
@@ -7658,7 +8477,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 			s->shell_line[0] = '\0';
 			s->shell_history_pos = -1;
 			/* suppress prompt if a local worker thread is active */
-			if (!(s->recv_buffer != NULL && s->type == SESSION_LOCAL) &&
+			if (s->worker_mode != WORKER_NC &&
 				!local_shell_worker_active(s))
 				shell_prompt(session_idx);
 		}

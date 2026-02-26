@@ -42,6 +42,7 @@ enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
+enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP };
 
 // per-session state (terminal + connection + thread)
 struct session
@@ -87,6 +88,7 @@ struct session
 	enum THREAD_COMMAND thread_command;
 	enum THREAD_STATE thread_state;
 	ThreadID thread_id;
+	enum WORKER_MODE worker_mode;
 
 	// local shell state (SESSION_LOCAL only)
 	short shell_vRefNum;
@@ -104,6 +106,23 @@ struct session
 	int shell_saved_len;
 	char wget_url[512]; // last/active wget URL for local wget worker
 	unsigned char wget_no_progress; // wget -n disables live progress redraw
+
+	// SCP state: set by cmd_scp() before worker spawn, read-only by worker
+	char scp_user[256];
+	char scp_host[256];
+	char scp_port[16];              // "22" default, C string
+	char scp_remote_path[512];
+	char scp_local_path[64];        // local filename for download (31 char HFS limit)
+	FSSpec scp_local_spec;          // resolved FSSpec for upload source
+	unsigned char scp_direction;    // 0=download, 1=upload
+	unsigned char scp_no_progress;
+	long scp_local_file_size;       // upload: pre-resolved file size
+
+	// auth snapshot: captured from prefs in cmd_scp() main thread
+	char scp_password[256];
+	char scp_pubkey_path[1024];
+	char scp_privkey_path[1024];
+	unsigned char scp_use_key;
 
 	// scrollback buffer (ring buffer of compact rows)
 	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];
@@ -206,6 +225,9 @@ void set_terminal_string(void);
 OSErr FSpPathFromLocation(FSSpec* spec, int* length, Handle* fullPath);
 
 pascal void ButtonFrameProc(DialogRef dlg, DialogItemIndex itemNo);
+pascal Boolean TwoItemFilter(DialogPtr dlog, EventRecord *event, short *itemHit);
+int password_dialog(int dialog_resource);
+int key_dialog(void);
 
 // session management
 int new_session(struct window_context* wc, enum SESSION_TYPE type);

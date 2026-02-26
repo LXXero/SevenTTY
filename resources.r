@@ -243,6 +243,39 @@ resource 'DITL' (DITL_KEY_PASSWORD) {
 	}
 };
 
+resource 'DLOG' (DLOG_SCP_AUTH) {
+	{ 50, 100, 145, 370 },
+	dBoxProc,
+	visible,
+	noGoAway,
+	0,
+	DITL_SCP_AUTH,
+	"",
+	centerMainScreen
+};
+
+resource 'DITL' (DITL_SCP_AUTH) {
+	{
+		/* 1 */ { 65, 270-10-80, 85, 270-10 },
+		Button { enabled, "OK" };
+
+		/* 2 */ { 65-5, 270-10-80-5, 85+5, 270-10+5 },
+		UserItem { enabled };
+
+		/* 3 */ { 10, 10, 30, 260 },
+		StaticText { enabled, "SCP authentication method:" };
+
+		/* 4 */ { 35, 15, 51, 120 },
+		RadioButton { enabled, "Password" };
+
+		/* 5 */ { 35, 130, 51, 200 },
+		RadioButton { enabled, "Key" };
+
+		/* 6 */ { 65, 10, 85, 90 },
+		Button { enabled, "Cancel" };
+	}
+};
+
 resource 'DITL' (DITL_PW_FAIL) {
 	{
 		{ 50, 260, 70, 340 },
