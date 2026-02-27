@@ -124,6 +124,11 @@ struct session
 	char scp_privkey_path[1024];
 	unsigned char scp_use_key;
 
+	// multi-file SCP upload (glob expansion)
+	char scp_glob_pattern[64];   // glob pattern, "" = single file
+	short scp_glob_vRefNum;      // directory to enumerate
+	long scp_glob_dirID;         // directory to enumerate
+
 	// scrollback buffer (ring buffer of compact rows)
 	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];
 	int sb_head;    // next write position in ring

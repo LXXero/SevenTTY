@@ -11,6 +11,7 @@
 #include "app.h"
 #include "shell.h"
 #include "console.h"
+#include "debug.h"
 #include "net.h"
 #include "telnet.h"
 
@@ -76,6 +77,17 @@ static void vt_write(int idx, const char* s)
 {
 	if (sessions[idx].vterm)
 		vterm_input_write(sessions[idx].vterm, s, strlen(s));
+}
+
+static void copy_cstr_trunc(char* dst, size_t dst_size, const char* src)
+{
+	size_t n;
+	if (dst_size == 0) return;
+	if (src == NULL) { dst[0] = '\0'; return; }
+	n = strlen(src);
+	if (n >= dst_size) n = dst_size - 1;
+	if (n > 0) memcpy(dst, src, n);
+	dst[n] = '\0';
 }
 
 static void vt_write_n(int idx, const char* s, size_t n)
@@ -5695,314 +5707,318 @@ retry_redirect:
 	headers_str[0] = '\0';
 
 	{
-	long next_progress_bytes = 524288L;
-	unsigned long next_progress_yield_tick = TickCount() + 2;
-	unsigned long recv_deadline = TickCount() + 1800; /* 30 sec inactivity timeout */
-	download_start_tick = TickCount();
-	while (1)
-	{
-		int r;
-		char buf[4096];
-		unsigned long now = TickCount();
+		long next_progress_bytes = 524288L;
+		long bytes_since_yield = 0;
+		const long yield_step = 524288L; /* 512KB */
+		unsigned long recv_deadline = TickCount() + 1800; /* 30 sec inactivity timeout */
+		download_start_tick = TickCount();
+		while (1)
+		{
+			int r;
+			char buf[32768];
+			unsigned long now = TickCount();
 
-		if (s->thread_command == EXIT || !s->in_use)
-		{
-			vt_write(idx, "\r\nwget: cancelled\r\n");
-			break;
-		}
-
-		if (now > recv_deadline)
-		{
-			vt_write(idx, "\r\nwget: receive timed out\r\n");
-			break;
-		}
-
-		if (use_tls)
-		{
-			r = mbedtls_ssl_read(&ssl, (unsigned char*)buf, sizeof(buf));
-			if (r == MBEDTLS_ERR_SSL_WANT_READ ||
-			    r == MBEDTLS_ERR_SSL_WANT_WRITE)
-			{ YieldToAnyThread(); continue; }
-			if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || r == 0)
-			{ download_ok = 1; break; }
-			if (r < 0) break;
-		}
-		else
-		{
-			OTResult otr = OTRcv(ep, buf, sizeof(buf), nil);
-			if (otr == kOTNoDataErr) { YieldToAnyThread(); continue; }
-			if (otr == kOTLookErr)
+			if (s->thread_command == EXIT || !s->in_use)
 			{
-				OTResult ev = OTLook(ep);
-				if (ev == T_ORDREL)
-				{
-					OTRcvOrderlyDisconnect(ep);
-					download_ok = 1;
-				}
+				vt_write(idx, "\r\nwget: cancelled\r\n");
 				break;
 			}
-			if (otr == 0) { download_ok = 1; break; }
-			if (otr < 0) break;
-			r = (int)otr;
-		}
 
-		recv_deadline = TickCount() + 1800; /* reset on data received */
-
-		if (!header_done)
-		{
-			/* accumulate into resp_buf to find end of headers */
-			int copy = r;
-			int overflow = 0; /* bytes from buf that didn't fit in resp_buf */
-			if (resp_len + copy > (int)sizeof(resp_buf) - 1)
+			if (now > recv_deadline)
 			{
-				copy = (int)sizeof(resp_buf) - 1 - resp_len;
-				overflow = r - copy;
-			}
-			if (copy <= 0)
-			{
-				vt_write(idx, "\r\nwget: response headers too large\r\n");
+				vt_write(idx, "\r\nwget: receive timed out\r\n");
 				break;
 			}
-			memcpy(resp_buf + resp_len, buf, copy);
-			resp_len += copy;
-			resp_buf[resp_len] = '\0';
 
-			/* look for \r\n\r\n */
+			if (use_tls)
 			{
-				char* end = strstr(resp_buf, "\r\n\r\n");
-				if (end)
+				r = mbedtls_ssl_read(&ssl, (unsigned char*)buf, sizeof(buf));
+				if (r == MBEDTLS_ERR_SSL_WANT_READ ||
+				    r == MBEDTLS_ERR_SSL_WANT_WRITE)
+				{ YieldToAnyThread(); continue; }
+				if (r == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY || r == 0)
+				{ download_ok = 1; break; }
+				if (r < 0) break;
+			}
+			else
+			{
+				OTResult otr = OTRcv(ep, buf, sizeof(buf), nil);
+				if (otr == kOTNoDataErr) { YieldToAnyThread(); continue; }
+				if (otr == kOTLookErr)
 				{
-					int header_len = (end - resp_buf) + 4;
-					int body_start = header_len;
-					int body_bytes = resp_len - body_start;
-
-					/* parse status line */
+					OTResult ev = OTLook(ep);
+					if (ev == T_ORDREL)
 					{
-						const char* sp = strchr(resp_buf, ' ');
-						if (sp) status_code = atoi(sp + 1);
+						OTRcvOrderlyDisconnect(ep);
+						download_ok = 1;
 					}
+					break;
+				}
+				if (otr == 0) { download_ok = 1; break; }
+				if (otr < 0) break;
+				r = (int)otr;
+			}
 
-					/* copy headers for later inspection */
-					{
-						int hcopy = header_len;
-						if (hcopy > (int)sizeof(headers_str) - 1)
-							hcopy = (int)sizeof(headers_str) - 1;
-						memcpy(headers_str, resp_buf, hcopy);
-						headers_str[hcopy] = '\0';
-					}
+			recv_deadline = TickCount() + 1800; /* reset on data received */
 
-					/* handle redirects */
-					if (status_code >= 300 && status_code < 400)
+			if (!header_done)
+			{
+				/* accumulate into resp_buf to find end of headers */
+				int copy = r;
+				int overflow = 0; /* bytes from buf that didn't fit in resp_buf */
+				if (resp_len + copy > (int)sizeof(resp_buf) - 1)
+				{
+					copy = (int)sizeof(resp_buf) - 1 - resp_len;
+					overflow = r - copy;
+				}
+				if (copy <= 0)
+				{
+					vt_write(idx, "\r\nwget: response headers too large\r\n");
+					break;
+				}
+				memcpy(resp_buf + resp_len, buf, copy);
+				resp_len += copy;
+				resp_buf[resp_len] = '\0';
+
+				/* look for \r\n\r\n */
+				{
+					char* end = strstr(resp_buf, "\r\n\r\n");
+					if (end)
 					{
-						const char* loc = http_header_find(headers_str, "location");
-						if (loc && redirect_count < 5)
+						int header_len = (end - resp_buf) + 4;
+						int body_start = header_len;
+						int body_bytes = resp_len - body_start;
+
+						/* parse status line */
 						{
-							int li = 0;
-							while (*loc && *loc != '\r' && *loc != '\n' && li < (int)sizeof(redirect_url) - 1)
-								redirect_url[li++] = *loc++;
-							redirect_url[li] = '\0';
-
-							/* handle relative redirects */
-							if (redirect_url[0] == '/' && redirect_url[1] == '/')
-							{
-								/* scheme-relative: //host/path */
-								char abs_url[800];
-								snprintf(abs_url, sizeof(abs_url), "%s%s",
-								         use_tls ? "https:" : "http:",
-								         redirect_url);
-								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
-								redirect_url[sizeof(redirect_url) - 1] = '\0';
-							}
-							else if (redirect_url[0] == '/')
-							{
-								/* absolute path: /path */
-								char abs_url[800];
-								snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s",
-								         use_tls ? "https://" : "http://",
-								         host, (int)port, redirect_url);
-								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
-								redirect_url[sizeof(redirect_url) - 1] = '\0';
-							}
-							else if (strncmp(redirect_url, "http://", 7) != 0 &&
-							         strncmp(redirect_url, "https://", 8) != 0)
-							{
-								/* bare relative: foo/bar -> resolve against current path */
-								char abs_url[800];
-								char base_path[512];
-								char* last_slash;
-								strncpy(base_path, path, sizeof(base_path) - 1);
-								base_path[sizeof(base_path) - 1] = '\0';
-								last_slash = strrchr(base_path, '/');
-								if (last_slash) last_slash[1] = '\0';
-								else strcpy(base_path, "/");
-								snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s%s",
-								         use_tls ? "https://" : "http://",
-								         host, (int)port, base_path, redirect_url);
-								strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
-								redirect_url[sizeof(redirect_url) - 1] = '\0';
-							}
-
-							printf_s(idx, "Redirect %d -> %s\r\n", status_code, redirect_url);
-
-							if (tls_initialized)
-							{
-								mbedtls_ssl_close_notify(&ssl);
-								mbedtls_ssl_free(&ssl);
-								mbedtls_ssl_config_free(&ssl_conf);
-								mbedtls_ctr_drbg_free(&ctr_drbg);
-								mbedtls_entropy_free(&entropy);
-								tls_initialized = 0;
-							}
-
-							OTSndOrderlyDisconnect(ep);
-							OTUnbind(ep);
-							OTCloseProvider(ep);
-							s->endpoint = kOTInvalidEndpointRef;
-
-							url = redirect_url;
-							redirect_count++;
-							resp_len = 0;
-							goto retry_redirect;
-						}
-					}
-
-					if (status_code != 200)
-					{
-						printf_s(idx, "HTTP %d\r\n", status_code);
-						break;
-					}
-
-					/* get content-length */
-					{
-						const char* cl = http_header_find(headers_str, "content-length");
-						if (cl) content_length = atol(cl);
-					}
-
-					/* figure out filename */
-					extract_filename(path, headers_str, filename, sizeof(filename));
-
-					/* truncate to 31 chars for HFS */
-					{
-						int nlen = strlen(filename);
-						if (nlen > 31) nlen = 31;
-						memcpy(local_name, filename, nlen);
-						local_name[nlen] = '\0';
-					}
-
-					printf_s(idx, "Saving to: %s", local_name);
-					if (content_length >= 0)
-						printf_s(idx, " (%ld bytes)", content_length);
-					vt_write(idx, "\r\n");
-
-					/* create output file */
-					{
-						int nlen = strlen(local_name);
-						pname[0] = nlen;
-						memcpy(pname + 1, local_name, nlen);
-					}
-
-					/* delete if exists */
-					{
-						FSSpec tmp;
-						if (FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &tmp) == noErr)
-							HDelete(s->shell_vRefNum, s->shell_dirID, pname);
-					}
-
-					HCreate(s->shell_vRefNum, s->shell_dirID, pname, ftype, fcreator);
-					FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &out_spec);
-
-					err = FSpOpenDF(&out_spec, fsRdWrPerm, &out_ref);
-					if (err != noErr)
-					{
-						vt_write(idx, "wget: cannot create output file\r\n");
-						break;
-					}
-
-					header_done = 1;
-
-					/* write any body data already received */
-					if (body_bytes > 0)
-					{
-						unsigned char* body_data = (unsigned char*)(resp_buf + body_start);
-						long wcount = body_bytes;
-
-						/* save first bytes for MacBinary check */
-						if (first_bytes_len < 128)
-						{
-							int grab = 128 - first_bytes_len;
-							if (grab > body_bytes) grab = body_bytes;
-							memcpy(first_bytes + first_bytes_len, body_data, grab);
-							first_bytes_len += grab;
+							const char* sp = strchr(resp_buf, ' ');
+							if (sp) status_code = atoi(sp + 1);
 						}
 
-						FSWrite(out_ref, &wcount, body_data);
-						total_written += wcount;
-						if (transfer_progress_step(idx, total_written, content_length,
-						                       &next_progress_bytes, &progress_live,
-						                       !no_progress, 0) &&
-						    TickCount() >= next_progress_yield_tick)
+						/* copy headers for later inspection */
 						{
-							YieldToAnyThread();
-							next_progress_yield_tick = TickCount() + 2;
-						}
-					}
-
-					/* write overflow bytes that didn't fit in resp_buf */
-					if (overflow > 0)
-					{
-						unsigned char* ovf_data = (unsigned char*)(buf + copy);
-						long wcount = overflow;
-
-						if (first_bytes_len < 128)
-						{
-							int grab = 128 - first_bytes_len;
-							if (grab > overflow) grab = overflow;
-							memcpy(first_bytes + first_bytes_len, ovf_data, grab);
-							first_bytes_len += grab;
+							int hcopy = header_len;
+							if (hcopy > (int)sizeof(headers_str) - 1)
+								hcopy = (int)sizeof(headers_str) - 1;
+							memcpy(headers_str, resp_buf, hcopy);
+							headers_str[hcopy] = '\0';
 						}
 
-						FSWrite(out_ref, &wcount, ovf_data);
-						total_written += wcount;
-						if (transfer_progress_step(idx, total_written, content_length,
-						                       &next_progress_bytes, &progress_live,
-						                       !no_progress, 0) &&
-						    TickCount() >= next_progress_yield_tick)
+						/* handle redirects */
+						if (status_code >= 300 && status_code < 400)
 						{
-							YieldToAnyThread();
-							next_progress_yield_tick = TickCount() + 2;
+							const char* loc = http_header_find(headers_str, "location");
+							if (loc && redirect_count < 5)
+							{
+								int li = 0;
+								while (*loc && *loc != '\r' && *loc != '\n' && li < (int)sizeof(redirect_url) - 1)
+									redirect_url[li++] = *loc++;
+								redirect_url[li] = '\0';
+
+								/* handle relative redirects */
+								if (redirect_url[0] == '/' && redirect_url[1] == '/')
+								{
+									/* scheme-relative: //host/path */
+									char abs_url[800];
+									snprintf(abs_url, sizeof(abs_url), "%s%s",
+									         use_tls ? "https:" : "http:",
+									         redirect_url);
+									strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+									redirect_url[sizeof(redirect_url) - 1] = '\0';
+								}
+								else if (redirect_url[0] == '/')
+								{
+									/* absolute path: /path */
+									char abs_url[800];
+									snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s",
+									         use_tls ? "https://" : "http://",
+									         host, (int)port, redirect_url);
+									strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+									redirect_url[sizeof(redirect_url) - 1] = '\0';
+								}
+								else if (strncmp(redirect_url, "http://", 7) != 0 &&
+								         strncmp(redirect_url, "https://", 8) != 0)
+								{
+									/* bare relative: foo/bar -> resolve against current path */
+									char abs_url[800];
+									char base_path[512];
+									char* last_slash;
+									strncpy(base_path, path, sizeof(base_path) - 1);
+									base_path[sizeof(base_path) - 1] = '\0';
+									last_slash = strrchr(base_path, '/');
+									if (last_slash) last_slash[1] = '\0';
+									else strcpy(base_path, "/");
+									snprintf(abs_url, sizeof(abs_url), "%s%s:%d%s%s",
+									         use_tls ? "https://" : "http://",
+									         host, (int)port, base_path, redirect_url);
+									strncpy(redirect_url, abs_url, sizeof(redirect_url) - 1);
+									redirect_url[sizeof(redirect_url) - 1] = '\0';
+								}
+
+								printf_s(idx, "Redirect %d -> %s\r\n", status_code, redirect_url);
+
+								if (tls_initialized)
+								{
+									mbedtls_ssl_close_notify(&ssl);
+									mbedtls_ssl_free(&ssl);
+									mbedtls_ssl_config_free(&ssl_conf);
+									mbedtls_ctr_drbg_free(&ctr_drbg);
+									mbedtls_entropy_free(&entropy);
+									tls_initialized = 0;
+								}
+
+								OTSndOrderlyDisconnect(ep);
+								OTUnbind(ep);
+								OTCloseProvider(ep);
+								s->endpoint = kOTInvalidEndpointRef;
+
+								url = redirect_url;
+								redirect_count++;
+								resp_len = 0;
+								goto retry_redirect;
+							}
+						}
+
+						if (status_code != 200)
+						{
+							printf_s(idx, "HTTP %d\r\n", status_code);
+							break;
+						}
+
+						/* get content-length */
+						{
+							const char* cl = http_header_find(headers_str, "content-length");
+							if (cl) content_length = atol(cl);
+						}
+
+						/* figure out filename */
+						extract_filename(path, headers_str, filename, sizeof(filename));
+
+						/* truncate to 31 chars for HFS */
+						{
+							int nlen = strlen(filename);
+							if (nlen > 31) nlen = 31;
+							memcpy(local_name, filename, nlen);
+							local_name[nlen] = '\0';
+						}
+
+						printf_s(idx, "Saving to: %s", local_name);
+						if (content_length >= 0)
+							printf_s(idx, " (%ld bytes)", content_length);
+						vt_write(idx, "\r\n");
+
+						/* create output file */
+						{
+							int nlen = strlen(local_name);
+							pname[0] = nlen;
+							memcpy(pname + 1, local_name, nlen);
+						}
+
+						/* delete if exists */
+						{
+							FSSpec tmp;
+							if (FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &tmp) == noErr)
+								HDelete(s->shell_vRefNum, s->shell_dirID, pname);
+						}
+
+						HCreate(s->shell_vRefNum, s->shell_dirID, pname, ftype, fcreator);
+						FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &out_spec);
+
+						err = FSpOpenDF(&out_spec, fsRdWrPerm, &out_ref);
+						if (err != noErr)
+						{
+							vt_write(idx, "wget: cannot create output file\r\n");
+							break;
+						}
+
+						header_done = 1;
+
+						/* write any body data already received */
+						if (body_bytes > 0)
+						{
+							unsigned char* body_data = (unsigned char*)(resp_buf + body_start);
+							long wcount = body_bytes;
+
+							/* save first bytes for MacBinary check */
+							if (first_bytes_len < 128)
+							{
+								int grab = 128 - first_bytes_len;
+								if (grab > body_bytes) grab = body_bytes;
+								memcpy(first_bytes + first_bytes_len, body_data, grab);
+								first_bytes_len += grab;
+							}
+
+							FSWrite(out_ref, &wcount, body_data);
+							total_written += wcount;
+							bytes_since_yield += wcount;
+							if (transfer_progress_step(idx, total_written, content_length,
+							                           &next_progress_bytes, &progress_live,
+							                           !no_progress, 0) ||
+							    bytes_since_yield >= yield_step)
+							{
+								YieldToAnyThread();
+								bytes_since_yield = 0;
+							}
+						}
+
+						/* write overflow bytes that didn't fit in resp_buf */
+						if (overflow > 0)
+						{
+							unsigned char* ovf_data = (unsigned char*)(buf + copy);
+							long wcount = overflow;
+
+							if (first_bytes_len < 128)
+							{
+								int grab = 128 - first_bytes_len;
+								if (grab > overflow) grab = overflow;
+								memcpy(first_bytes + first_bytes_len, ovf_data, grab);
+								first_bytes_len += grab;
+							}
+
+							FSWrite(out_ref, &wcount, ovf_data);
+							total_written += wcount;
+							bytes_since_yield += wcount;
+							if (transfer_progress_step(idx, total_written, content_length,
+							                           &next_progress_bytes, &progress_live,
+							                           !no_progress, 0) ||
+							    bytes_since_yield >= yield_step)
+							{
+								YieldToAnyThread();
+								bytes_since_yield = 0;
+							}
 						}
 					}
 				}
 			}
-		}
-		else
-		{
-			/* body data */
-			long wcount = r;
-
-			/* save first bytes for MacBinary check */
-			if (first_bytes_len < 128)
+			else
 			{
-				int grab = 128 - first_bytes_len;
-				if (grab > r) grab = r;
-				memcpy(first_bytes + first_bytes_len, buf, grab);
-				first_bytes_len += grab;
-			}
+				/* body data */
+				long wcount = r;
 
-			FSWrite(out_ref, &wcount, buf);
-			total_written += wcount;
+				/* save first bytes for MacBinary check */
+				if (first_bytes_len < 128)
+				{
+					int grab = 128 - first_bytes_len;
+					if (grab > r) grab = r;
+					memcpy(first_bytes + first_bytes_len, buf, grab);
+					first_bytes_len += grab;
+				}
 
-			if (transfer_progress_step(idx, total_written, content_length,
-			                       &next_progress_bytes, &progress_live,
-			                       !no_progress, 0) &&
-			    TickCount() >= next_progress_yield_tick)
-			{
-				YieldToAnyThread();
-				next_progress_yield_tick = TickCount() + 2;
+				FSWrite(out_ref, &wcount, buf);
+				total_written += wcount;
+				bytes_since_yield += wcount;
+
+				if (transfer_progress_step(idx, total_written, content_length,
+				                           &next_progress_bytes, &progress_live,
+				                           !no_progress, 0) ||
+				    bytes_since_yield >= yield_step)
+				{
+					YieldToAnyThread();
+					bytes_since_yield = 0;
+				}
 			}
 		}
-	}
-	download_elapsed_ticks = TickCount() - download_start_tick;
+		download_elapsed_ticks = TickCount() - download_start_tick;
 	} /* recv_deadline scope */
 
 	if (progress_live)
@@ -6187,7 +6203,7 @@ static void cmd_wget(int idx, int argc, char** argv)
 	s->endpoint = kOTInvalidEndpointRef;
 
 	err = NewThread(kCooperativeThread, wget_worker_thread,
-	                (void*)(long)idx, 200000,
+	                (void*)(long)idx, 100000,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
@@ -6300,14 +6316,30 @@ static void scp_basename(const char* remote_path, char* out, int out_max)
 	out[len] = '\0';
 }
 
+/* Normalize remote path so ~ expansion isn't needed by the remote shell.
+   SCP sink (scp -t) runs in the user's home, so ~ = "." and ~/foo = "foo".
+   This lets us keep QUOTE_PATHS enabled for proper space/metachar escaping. */
+static void scp_normalize_remote(char* path)
+{
+	if (path[0] == '~' && path[1] == '/')
+		memmove(path, path + 2, strlen(path + 2) + 1);
+	else if (path[0] == '~' && path[1] == '\0')
+	{
+		path[0] = '.';
+	}
+}
+
 static void scp_download(int idx)
 {
 	struct session* s = &sessions[idx];
 	struct ssh_auth_params auth;
 	char hostname_buf[280]; /* "host:port" */
 	libssh2_struct_stat sb;
+	long io_buf_size = 32768L; /* larger SCP I/O chunks for better throughput */
 	long total_read = 0;
 	long next_progress_bytes = 0;
+	long bytes_since_yield = 0;
+	const long yield_step = 524288L; /* 512KB */
 	int progress_live = 0;
 	short out_ref = 0;
 	int file_open = 0;
@@ -6333,8 +6365,8 @@ static void scp_download(int idx)
 	}
 
 	/* allocate OT buffers for SSH transport */
-	s->recv_buffer = OTAllocMem(SSH_BUFFER_SIZE);
-	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	s->recv_buffer = OTAllocMem(io_buf_size);
+	s->send_buffer = OTAllocMem(io_buf_size);
 	if (s->recv_buffer == NULL || s->send_buffer == NULL)
 	{
 		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
@@ -6352,8 +6384,12 @@ static void scp_download(int idx)
 		return;
 	}
 
-	/* disable path quoting so remote shell expands ~ and env vars */
-	libssh2_session_flag(s->ssh_session, LIBSSH2_FLAG_QUOTE_PATHS, 0);
+	/* non-blocking mode: we handle EAGAIN retries ourselves */
+	libssh2_session_set_blocking(s->ssh_session, 0);
+
+	/* normalize ~ in remote path (SCP sink runs in home dir) so we can
+	   keep QUOTE_PATHS enabled for proper space/metachar escaping */
+	scp_normalize_remote(s->scp_remote_path);
 
 	/* open SCP receive channel */
 	memset(&sb, 0, sizeof(sb));
@@ -6424,7 +6460,7 @@ static void scp_download(int idx)
 
 		while (remaining > 0 && s->thread_command != EXIT)
 		{
-			long to_read = SSH_BUFFER_SIZE;
+			long to_read = io_buf_size;
 			ssize_t rc;
 			long wcount;
 
@@ -6456,11 +6492,16 @@ static void scp_download(int idx)
 			FSWrite(out_ref, &wcount, s->recv_buffer);
 			total_read += rc;
 			remaining -= rc;
+			bytes_since_yield += rc;
 
-			transfer_progress_step(idx, total_read, file_size,
-			                       &next_progress_bytes, &progress_live,
-			                       !s->scp_no_progress, 0);
-			YieldToAnyThread();
+			if (transfer_progress_step(idx, total_read, file_size,
+			                           &next_progress_bytes, &progress_live,
+			                           !s->scp_no_progress, 0) ||
+			    bytes_since_yield >= yield_step)
+			{
+				YieldToAnyThread();
+				bytes_since_yield = 0;
+			}
 		}
 	}
 
@@ -6518,10 +6559,15 @@ static void scp_upload(int idx)
 	struct session* s = &sessions[idx];
 	struct ssh_auth_params auth;
 	char hostname_buf[280];
+	long io_buf_size = 32768L; /* larger SCP I/O chunks for better throughput */
 	short in_ref = 0;
 	long total_written = 0;
+	long remaining = 0;
 	long next_progress_bytes = 0;
+	long bytes_since_yield = 0;
+	const long yield_step = 524288L; /* 512KB */
 	int progress_live = 0;
+	int upload_ok = 1;
 
 	/* open local file from pre-resolved FSSpec */
 	{
@@ -6553,8 +6599,8 @@ static void scp_upload(int idx)
 	}
 
 	/* allocate OT buffers */
-	s->recv_buffer = OTAllocMem(SSH_BUFFER_SIZE);
-	s->send_buffer = OTAllocMem(SSH_BUFFER_SIZE);
+	s->recv_buffer = OTAllocMem(io_buf_size);
+	s->send_buffer = OTAllocMem(io_buf_size);
 	if (s->recv_buffer == NULL || s->send_buffer == NULL)
 	{
 		if (s->recv_buffer) { OTFreeMem(s->recv_buffer); s->recv_buffer = NULL; }
@@ -6573,8 +6619,12 @@ static void scp_upload(int idx)
 		return;
 	}
 
-	/* disable path quoting so remote shell expands ~ and env vars */
-	libssh2_session_flag(s->ssh_session, LIBSSH2_FLAG_QUOTE_PATHS, 0);
+	/* non-blocking mode: we handle EAGAIN retries ourselves */
+	libssh2_session_set_blocking(s->ssh_session, 0);
+
+	/* normalize ~ in remote path (SCP sink runs in home dir) so we can
+	   keep QUOTE_PATHS enabled for proper space/metachar escaping */
+	scp_normalize_remote(s->scp_remote_path);
 
 	/* open SCP send channel */
 	while (1)
@@ -6603,57 +6653,76 @@ static void scp_upload(int idx)
 	}
 
 	/* write loop */
+	remaining = s->scp_local_file_size;
+	while (remaining > 0 && s->thread_command != EXIT)
 	{
-		long remaining = s->scp_local_file_size;
+		long to_read = io_buf_size;
+		long rcount;
+		char* ptr;
+		long left;
+		OSErr ferr;
 
-		while (remaining > 0 && s->thread_command != EXIT)
+		if (to_read > remaining) to_read = remaining;
+		rcount = to_read;
+		ferr = FSRead(in_ref, &rcount, s->send_buffer);
+		if (ferr != noErr && ferr != eofErr)
 		{
-			long to_read = SSH_BUFFER_SIZE;
-			long rcount;
-			char* ptr;
-			long left;
-			OSErr ferr;
+			printf_s(idx, "\r\nscp: local read error (err=%d)\r\n", (int)ferr);
+			upload_ok = 0;
+			break;
+		}
+		if (rcount == 0)
+		{
+			upload_ok = 0;
+			break;
+		}
 
-			if (to_read > remaining) to_read = remaining;
-			rcount = to_read;
-			ferr = FSRead(in_ref, &rcount, s->send_buffer);
-			if (ferr != noErr && ferr != eofErr)
+		ptr = s->send_buffer;
+		left = rcount;
+		while (left > 0 && s->thread_command != EXIT)
+		{
+			ssize_t rc = libssh2_channel_write(s->channel, ptr, left);
+			if (rc == LIBSSH2_ERROR_EAGAIN || rc == 0)
 			{
-				printf_s(idx, "\r\nscp: local read error (err=%d)\r\n", (int)ferr);
-				break;
+				YieldToAnyThread();
+				continue;
 			}
-			if (rcount == 0) break;
-
-			ptr = s->send_buffer;
-			left = rcount;
-			while (left > 0 && s->thread_command != EXIT)
+			if (rc < 0)
 			{
-				ssize_t rc = libssh2_channel_write(s->channel, ptr, left);
-				if (rc == LIBSSH2_ERROR_EAGAIN)
-				{
-					YieldToAnyThread();
-					continue;
-				}
-				if (rc < 0)
-				{
-					printf_s(idx, "\r\nscp: write error: %s\r\n", libssh2_error_string(rc));
-					goto upload_done;
-				}
-				ptr += rc;
-				left -= rc;
-				total_written += rc;
-				remaining -= rc;
+				printf_s(idx, "\r\nscp: write error: %s\r\n", libssh2_error_string(rc));
+				upload_ok = 0;
+				goto upload_done;
 			}
+			ptr += rc;
+			left -= rc;
+			total_written += rc;
+			remaining -= rc;
+			bytes_since_yield += rc;
 
-			transfer_progress_step(idx, total_written, s->scp_local_file_size,
-			                       &next_progress_bytes, &progress_live,
-			                       !s->scp_no_progress, 1);
+			if (bytes_since_yield >= yield_step)
+			{
+				YieldToAnyThread();
+				bytes_since_yield = 0;
+			}
+		}
+
+		if (transfer_progress_step(idx, total_written, s->scp_local_file_size,
+		                           &next_progress_bytes, &progress_live,
+		                           !s->scp_no_progress, 1))
+		{
 			YieldToAnyThread();
+			bytes_since_yield = 0;
 		}
 	}
 
 upload_done:
-	libssh2_channel_send_eof(s->channel);
+	{
+		int eof_rc;
+		do {
+			eof_rc = libssh2_channel_send_eof(s->channel);
+			if (eof_rc == LIBSSH2_ERROR_EAGAIN) YieldToAnyThread();
+		} while (eof_rc == LIBSSH2_ERROR_EAGAIN);
+	}
 	FSClose(in_ref);
 
 	if (progress_live)
@@ -6661,12 +6730,96 @@ upload_done:
 
 	if (s->thread_command == EXIT)
 		printf_s(idx, "scp: cancelled\r\n");
+	else if (!upload_ok || remaining > 0)
+		printf_s(idx, "scp: upload incomplete (%ld bytes sent)\r\n", total_written);
 	else
 		printf_s(idx, "scp: uploaded %ld bytes -> %s\r\n", total_written, s->scp_remote_path);
 
 	end_connection(idx);
 	OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
 	OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+}
+
+static void scp_upload_glob(int idx)
+{
+	struct session* s = &sessions[idx];
+	CInfoPBRec pb;
+	Str255 name;
+	short gi;
+	int count = 0;
+	int fail_count = 0;
+	char base_remote[512];
+
+	copy_cstr_trunc(base_remote, sizeof(base_remote), s->scp_remote_path);
+
+	for (gi = 1; s->thread_command != EXIT; gi++)
+	{
+		char name_c[256];
+		int nl;
+		FSSpec spec;
+		short ref;
+		long eof_size;
+		OSErr ferr;
+		int rlen;
+
+		memset(&pb, 0, sizeof(pb));
+		pb.hFileInfo.ioNamePtr = name;
+		pb.hFileInfo.ioVRefNum = s->scp_glob_vRefNum;
+		pb.hFileInfo.ioDirID = s->scp_glob_dirID;
+		pb.hFileInfo.ioFDirIndex = gi;
+		if (PBGetCatInfoSync(&pb) != noErr) break;
+
+		/* skip directories */
+		if (pb.hFileInfo.ioFlAttrib & ioDirMask) continue;
+
+		nl = name[0];
+		if (nl > 255) nl = 255;
+		memcpy(name_c, name + 1, nl);
+		name_c[nl] = '\0';
+
+		if (!glob_match(s->scp_glob_pattern, name_c)) continue;
+
+		/* resolve file size */
+		spec.vRefNum = s->scp_glob_vRefNum;
+		spec.parID = s->scp_glob_dirID;
+		spec.name[0] = name[0];
+		memcpy(spec.name + 1, name + 1, name[0]);
+
+		ferr = FSpOpenDF(&spec, fsRdPerm, &ref);
+		if (ferr != noErr)
+		{
+			printf_s(idx, "scp: cannot open %s (err=%d)\r\n", name_c, (int)ferr);
+			fail_count++;
+			continue;
+		}
+		GetEOF(ref, &eof_size);
+		FSClose(ref);
+
+		s->scp_local_spec = spec;
+		s->scp_local_file_size = eof_size;
+
+		/* construct remote path: base + "/" + filename */
+		copy_cstr_trunc(s->scp_remote_path, sizeof(s->scp_remote_path), base_remote);
+		rlen = strlen(s->scp_remote_path);
+		if (rlen > 0 && s->scp_remote_path[rlen - 1] != '/')
+		{
+			s->scp_remote_path[rlen++] = '/';
+			s->scp_remote_path[rlen] = '\0';
+		}
+		copy_cstr_trunc(s->scp_remote_path + rlen,
+		                sizeof(s->scp_remote_path) - rlen, name_c);
+
+		printf_s(idx, "scp: [%d] %s (%ld bytes)\r\n", count + 1, name_c, eof_size);
+		scp_upload(idx);
+		count++;
+	}
+
+	if (s->thread_command == EXIT)
+		printf_s(idx, "scp: cancelled after %d file(s)\r\n", count);
+	else if (count == 0)
+		printf_s(idx, "scp: no matching files\r\n");
+	else
+		printf_s(idx, "scp: %d file(s) uploaded (%d failed)\r\n", count, fail_count);
 }
 
 static void* scp_worker_thread(void* arg)
@@ -6676,6 +6829,8 @@ static void* scp_worker_thread(void* arg)
 
 	if (s->scp_direction == 0)
 		scp_download(idx);
+	else if (s->scp_glob_pattern[0] != '\0')
+		scp_upload_glob(idx);
 	else
 		scp_upload(idx);
 
@@ -6797,26 +6952,32 @@ static int scp_auth_prompt(struct session* s)
 				plen = sizeof(s->scp_password) - 1;
 			memcpy(s->scp_password, prefs.password + 1, plen);
 			s->scp_password[plen] = '\0';
-			/* snapshot key paths */
-			if (prefs.pubkey_path)
-			{
-				strncpy(s->scp_pubkey_path, prefs.pubkey_path, 1023);
-				s->scp_pubkey_path[1023] = '\0';
-			}
-			if (prefs.privkey_path)
-			{
-				strncpy(s->scp_privkey_path, prefs.privkey_path, 1023);
-				s->scp_privkey_path[1023] = '\0';
-			}
+				/* snapshot key paths */
+				if (prefs.pubkey_path)
+				{
+					copy_cstr_trunc(s->scp_pubkey_path, sizeof(s->scp_pubkey_path), prefs.pubkey_path);
+				}
+				if (prefs.privkey_path)
+				{
+					copy_cstr_trunc(s->scp_privkey_path, sizeof(s->scp_privkey_path), prefs.privkey_path);
+				}
 			s->scp_use_key = 1;
 		}
 	}
 
-	/* restore prefs state */
+	/* restore prefs state, freeing any new allocations from key_dialog */
 	memcpy(prefs.password, saved_pw, sizeof(Str255));
 	prefs.auth_type = saved_auth;
-	prefs.pubkey_path = saved_pubkey;
-	prefs.privkey_path = saved_privkey;
+	if (prefs.pubkey_path != saved_pubkey)
+	{
+		free(prefs.pubkey_path);
+		prefs.pubkey_path = saved_pubkey;
+	}
+	if (prefs.privkey_path != saved_privkey)
+	{
+		free(prefs.privkey_path);
+		prefs.privkey_path = saved_privkey;
+	}
 
 	return ok;
 }
@@ -6897,14 +7058,10 @@ static void cmd_scp(int idx, int argc, char** argv)
 	}
 
 	/* populate session SCP fields */
-	strncpy(s->scp_user, user, sizeof(s->scp_user) - 1);
-	s->scp_user[sizeof(s->scp_user) - 1] = '\0';
-	strncpy(s->scp_host, host, sizeof(s->scp_host) - 1);
-	s->scp_host[sizeof(s->scp_host) - 1] = '\0';
-	strncpy(s->scp_port, port, sizeof(s->scp_port) - 1);
-	s->scp_port[sizeof(s->scp_port) - 1] = '\0';
-	strncpy(s->scp_remote_path, remote_path, sizeof(s->scp_remote_path) - 1);
-	s->scp_remote_path[sizeof(s->scp_remote_path) - 1] = '\0';
+	copy_cstr_trunc(s->scp_user, sizeof(s->scp_user), user);
+	copy_cstr_trunc(s->scp_host, sizeof(s->scp_host), host);
+	copy_cstr_trunc(s->scp_port, sizeof(s->scp_port), port);
+	copy_cstr_trunc(s->scp_remote_path, sizeof(s->scp_remote_path), remote_path);
 	s->scp_no_progress = no_progress ? 1 : 0;
 
 	if (s->scp_direction == 0)
@@ -6914,8 +7071,7 @@ static void cmd_scp(int idx, int argc, char** argv)
 		    strcmp(argv[local_arg], ".") != 0 &&
 		    strcmp(argv[local_arg], "./") != 0)
 		{
-			strncpy(s->scp_local_path, argv[local_arg], sizeof(s->scp_local_path) - 1);
-			s->scp_local_path[sizeof(s->scp_local_path) - 1] = '\0';
+			copy_cstr_trunc(s->scp_local_path, sizeof(s->scp_local_path), argv[local_arg]);
 			/* truncate to 31 for HFS */
 			if (strlen(s->scp_local_path) > 31)
 				s->scp_local_path[31] = '\0';
@@ -6926,13 +7082,63 @@ static void cmd_scp(int idx, int argc, char** argv)
 			scp_basename(remote_path, s->scp_local_path, sizeof(s->scp_local_path));
 		}
 	}
+	else if (is_glob(argv[local_arg]))
+	{
+		/* upload with glob: expand pattern, worker will iterate files */
+		short gvRef;
+		long gdID;
+		const char* gpat;
+		CInfoPBRec gpb;
+		Str255 gname;
+		short gi;
+		int match_count = 0;
+
+		if (glob_resolve_dir(idx, argv[local_arg], &gvRef, &gdID, &gpat) != 0)
+		{
+			printf_s(idx, "scp: invalid path: %s\r\n", argv[local_arg]);
+			return;
+		}
+
+		/* count matches (files only) */
+		for (gi = 1; ; gi++)
+		{
+			char nc[256];
+			int nl;
+			memset(&gpb, 0, sizeof(gpb));
+			gpb.hFileInfo.ioNamePtr = gname;
+			gpb.hFileInfo.ioVRefNum = gvRef;
+			gpb.hFileInfo.ioDirID = gdID;
+			gpb.hFileInfo.ioFDirIndex = gi;
+			if (PBGetCatInfoSync(&gpb) != noErr) break;
+			if (gpb.hFileInfo.ioFlAttrib & ioDirMask) continue;
+			nl = gname[0];
+			if (nl > 255) nl = 255;
+			memcpy(nc, gname + 1, nl);
+			nc[nl] = '\0';
+			if (glob_match(gpat, nc)) match_count++;
+		}
+
+		if (match_count == 0)
+		{
+			printf_s(idx, "scp: no files matching '%s'\r\n", argv[local_arg]);
+			return;
+		}
+
+		copy_cstr_trunc(s->scp_glob_pattern, sizeof(s->scp_glob_pattern), gpat);
+		s->scp_glob_vRefNum = gvRef;
+		s->scp_glob_dirID = gdID;
+
+		printf_s(idx, "scp: %d file(s) matching '%s'\r\n", match_count, gpat);
+	}
 	else
 	{
-		/* upload: resolve local file */
+		/* upload: resolve single file */
 		FSSpec spec;
 		short ref;
 		long eof_size;
 		OSErr ferr;
+
+		s->scp_glob_pattern[0] = '\0';
 
 		if (resolve_path(idx, argv[local_arg], &spec) != noErr)
 		{
@@ -6951,6 +7157,38 @@ static void cmd_scp(int idx, int argc, char** argv)
 
 		s->scp_local_spec = spec;
 		s->scp_local_file_size = eof_size;
+
+		/* If remote path looks like a directory, append local filename.
+		   libssh2 uses basename(remote_path) for the SCP C header filename,
+		   so "~" alone would create a file literally named "~". */
+		{
+			const char* rp = s->scp_remote_path;
+			int rlen = strlen(rp);
+			int is_dir = 0;
+
+			if (rlen == 0 || rp[rlen - 1] == '/')
+				is_dir = 1;
+			else if (strcmp(rp, "~") == 0 || strcmp(rp, ".") == 0 || strcmp(rp, "..") == 0)
+				is_dir = 1;
+			else if (rp[0] == '~' && rp[1] == '/' && rp[rlen - 1] == '/')
+				is_dir = 1;
+
+			if (is_dir)
+			{
+				int space = sizeof(s->scp_remote_path) - rlen - 1;
+				if (rlen > 0 && rp[rlen - 1] != '/')
+				{
+					s->scp_remote_path[rlen++] = '/';
+					s->scp_remote_path[rlen] = '\0';
+					space--;
+				}
+				if (space > 0)
+				{
+					copy_cstr_trunc(s->scp_remote_path + rlen, space,
+					                argv[local_arg]);
+				}
+			}
+		}
 	}
 
 	/* prompt for auth method + credentials (runs on main thread) */
@@ -6966,7 +7204,7 @@ static void cmd_scp(int idx, int argc, char** argv)
 	s->endpoint = kOTInvalidEndpointRef;
 
 	err = NewThread(kCooperativeThread, scp_worker_thread,
-	                (void*)(long)idx, 200000,
+	                (void*)(long)idx, 100000,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{

@@ -1010,6 +1010,9 @@ void init_session(struct session* s)
 	s->scp_pubkey_path[0] = '\0';
 	s->scp_privkey_path[0] = '\0';
 	s->scp_use_key = 0;
+	s->scp_glob_pattern[0] = '\0';
+	s->scp_glob_vRefNum = 0;
+	s->scp_glob_dirID = 0;
 	s->window_id = -1;
 }
 

@@ -11,6 +11,7 @@
 #include "debug.h"
 
 #include <errno.h>
+#include <stdio.h>
 #include <Script.h>
 #include <Threads.h>
 
@@ -447,8 +448,16 @@ static int known_hosts(int session_idx, const char* host, int port)
 					break;
 			}
 
-			/* save with port-aware format: checkp/addc use [host]:port for non-22 */
-			e = libssh2_knownhost_addc(kh, host, NULL, host_key, key_len, NULL, 0, save_type, NULL);
+			/* save with port-aware format: [host]:port for non-22, bare host for 22 */
+			{
+				char addc_host[280];
+				if (port != 22)
+					snprintf(addc_host, sizeof(addc_host), "[%s]:%d", host, port);
+				else
+					strncpy(addc_host, host, sizeof(addc_host) - 1);
+				addc_host[sizeof(addc_host) - 1] = '\0';
+				e = libssh2_knownhost_addc(kh, addc_host, NULL, host_key, key_len, NULL, 0, save_type, NULL);
+			}
 
 			if (e != 0) printf_s(session_idx, "failed to add to known hosts: %s\r\n", libssh2_error_string(e));
 			else if (known_hosts_file_path == NULL)
