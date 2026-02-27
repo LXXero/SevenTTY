@@ -384,6 +384,8 @@ static void format_date(unsigned long secs, char* out, int maxlen)
 /* type/creator helper                                                */
 /* ------------------------------------------------------------------ */
 
+static int lookup_ext_type(const char* filename, OSType* type, OSType* creator);
+
 static void ostype_to_str(OSType t, char* out)
 {
 	out[0] = (t >> 24) & 0xFF;
@@ -1797,6 +1799,118 @@ static void cmd_settype(int idx, int argc, char* argv[])
 
 	finfo.fdType = str_to_ostype(argv[1]);
 	FSpSetFInfo(&spec, &finfo);
+}
+
+static void cmd_fixtype(int idx, int argc, char* argv[])
+{
+	struct session* s = &sessions[idx];
+	int argi, fixed = 0, skipped = 0;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: fixtype <file ...>\r\n");
+		vt_write(idx, "  sets type/creator from extension\r\n");
+		return;
+	}
+
+	for (argi = 1; argi < argc; argi++)
+	{
+		if (is_glob(argv[argi]))
+		{
+			CInfoPBRec pb;
+			Str255 name;
+			short gi;
+
+			for (gi = 1; ; gi++)
+			{
+				char name_c[256];
+				int nl;
+				OSType ftype, fcreator;
+				FSSpec fspec;
+				FInfo finfo;
+
+				memset(&pb, 0, sizeof(pb));
+				pb.hFileInfo.ioNamePtr = name;
+				pb.hFileInfo.ioVRefNum = s->shell_vRefNum;
+				pb.hFileInfo.ioDirID = s->shell_dirID;
+				pb.hFileInfo.ioFDirIndex = gi;
+
+				if (PBGetCatInfoSync(&pb) != noErr) break;
+
+				nl = name[0];
+				if (nl > 255) nl = 255;
+				memcpy(name_c, name + 1, nl);
+				name_c[nl] = '\0';
+
+				if (pb.hFileInfo.ioFlAttrib & ioDirMask) continue;
+				if (!glob_match(argv[argi], name_c)) continue;
+
+				if (!lookup_ext_type(name_c, &ftype, &fcreator))
+				{
+					skipped++;
+					continue;
+				}
+
+				fspec.vRefNum = s->shell_vRefNum;
+				fspec.parID = s->shell_dirID;
+				fspec.name[0] = name[0];
+				memcpy(fspec.name + 1, name + 1, name[0]);
+
+				if (FSpGetFInfo(&fspec, &finfo) != noErr) { skipped++; continue; }
+				finfo.fdType = ftype;
+				finfo.fdCreator = fcreator;
+				if (FSpSetFInfo(&fspec, &finfo) == noErr)
+				{
+					char tb[5], cb[5];
+					ostype_to_str(ftype, tb);
+					ostype_to_str(fcreator, cb);
+					printf_s(idx, "  %s -> '%s'/'%s'\r\n", name_c, tb, cb);
+					fixed++;
+				}
+				else
+					skipped++;
+			}
+		}
+		else
+		{
+			FSSpec spec;
+			FInfo finfo;
+			OSType ftype, fcreator;
+
+			if (resolve_path(idx, argv[argi], &spec) != noErr)
+			{
+				printf_s(idx, "fixtype: %s: not found\r\n", argv[argi]);
+				skipped++;
+				continue;
+			}
+
+			if (!lookup_ext_type(argv[argi], &ftype, &fcreator))
+			{
+				printf_s(idx, "fixtype: %s: unknown extension\r\n", argv[argi]);
+				skipped++;
+				continue;
+			}
+
+			if (FSpGetFInfo(&spec, &finfo) != noErr) { skipped++; continue; }
+			finfo.fdType = ftype;
+			finfo.fdCreator = fcreator;
+			if (FSpSetFInfo(&spec, &finfo) == noErr)
+			{
+				char tb[5], cb[5];
+				ostype_to_str(ftype, tb);
+				ostype_to_str(fcreator, cb);
+				printf_s(idx, "  %s -> '%s'/'%s'\r\n", argv[argi], tb, cb);
+				fixed++;
+			}
+			else
+				skipped++;
+		}
+	}
+
+	printf_s(idx, "%d fixed", fixed);
+	if (skipped > 0)
+		printf_s(idx, ", %d skipped", skipped);
+	vt_write(idx, "\r\n");
 }
 
 static void cmd_setcreator(int idx, int argc, char* argv[])
@@ -7650,7 +7764,7 @@ static const char* shell_commands[] = {
 	"basename", "cal", "cat", "cd", "chattr", "chmod", "chown", "clear",
 	"cls", "cmp", "colors", "copy", "cp", "crc32", "cut", "date", "del",
 	"delete", "df", "dir", "dirname", "dos2unix", "echo", "exit", "file",
-	"fold", "free", "getinfo", "grep", "head", "help", "hexdump",
+	"fixtype", "fold", "free", "getinfo", "grep", "head", "help", "hexdump",
 	"history", "host", "hostname", "ifconfig", "info", "label", "less",
 	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
 	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
@@ -8185,6 +8299,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "chown") == 0)      cmd_chown(idx, argc, argv);
 	else if (strcmp(cmd, "settype") == 0)    cmd_settype(idx, argc, argv);
 	else if (strcmp(cmd, "setcreator") == 0) cmd_setcreator(idx, argc, argv);
+	else if (strcmp(cmd, "fixtype") == 0)   cmd_fixtype(idx, argc, argv);
 	else if (strcmp(cmd, "chmod") == 0)      cmd_chmod(idx, argc, argv);
 	else if (strcmp(cmd, "chattr") == 0)     cmd_chattr(idx, argc, argv);
 	else if (strcmp(cmd, "label") == 0)      cmd_label(idx, argc, argv);
