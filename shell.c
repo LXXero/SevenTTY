@@ -6554,7 +6554,7 @@ static void scp_download(int idx)
 	OTFreeMem(s->send_buffer); s->send_buffer = NULL;
 }
 
-static void scp_upload(int idx)
+static int scp_upload(int idx)
 {
 	struct session* s = &sessions[idx];
 	struct ssh_auth_params auth;
@@ -6575,7 +6575,7 @@ static void scp_upload(int idx)
 		if (ferr != noErr)
 		{
 			printf_s(idx, "scp: failed to open local file (err=%d)\r\n", (int)ferr);
-			return;
+			return 0;
 		}
 	}
 
@@ -6595,7 +6595,7 @@ static void scp_upload(int idx)
 	{
 		FSClose(in_ref);
 		printf_s(idx, "scp: failed to initialize Open Transport\r\n");
-		return;
+		return 0;
 	}
 
 	/* allocate OT buffers */
@@ -6607,7 +6607,7 @@ static void scp_upload(int idx)
 		if (s->send_buffer) { OTFreeMem(s->send_buffer); s->send_buffer = NULL; }
 		FSClose(in_ref);
 		printf_s(idx, "scp: failed to allocate buffers\r\n");
-		return;
+		return 0;
 	}
 
 	/* connect + authenticate */
@@ -6616,7 +6616,7 @@ static void scp_upload(int idx)
 		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
 		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
 		FSClose(in_ref);
-		return;
+		return 0;
 	}
 
 	/* non-blocking mode: we handle EAGAIN retries ourselves */
@@ -6649,7 +6649,7 @@ static void scp_upload(int idx)
 		OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
 		OTFreeMem(s->send_buffer); s->send_buffer = NULL;
 		FSClose(in_ref);
-		return;
+		return 0;
 	}
 
 	/* write loop */
@@ -6738,6 +6738,8 @@ upload_done:
 	end_connection(idx);
 	OTFreeMem(s->recv_buffer); s->recv_buffer = NULL;
 	OTFreeMem(s->send_buffer); s->send_buffer = NULL;
+
+	return (upload_ok && remaining == 0 && s->thread_command != EXIT);
 }
 
 static void scp_upload_glob(int idx)
@@ -6801,7 +6803,8 @@ static void scp_upload_glob(int idx)
 		/* construct remote path: base + "/" + filename */
 		copy_cstr_trunc(s->scp_remote_path, sizeof(s->scp_remote_path), base_remote);
 		rlen = strlen(s->scp_remote_path);
-		if (rlen > 0 && s->scp_remote_path[rlen - 1] != '/')
+		if (rlen > 0 && rlen < (int)sizeof(s->scp_remote_path) - 2
+		    && s->scp_remote_path[rlen - 1] != '/')
 		{
 			s->scp_remote_path[rlen++] = '/';
 			s->scp_remote_path[rlen] = '\0';
@@ -6809,9 +6812,11 @@ static void scp_upload_glob(int idx)
 		copy_cstr_trunc(s->scp_remote_path + rlen,
 		                sizeof(s->scp_remote_path) - rlen, name_c);
 
-		printf_s(idx, "scp: [%d] %s (%ld bytes)\r\n", count + 1, name_c, eof_size);
-		scp_upload(idx);
-		count++;
+		printf_s(idx, "scp: [%d] %s (%ld bytes)\r\n", count + fail_count + 1, name_c, eof_size);
+		if (scp_upload(idx))
+			count++;
+		else
+			fail_count++;
 	}
 
 	if (s->thread_command == EXIT)
@@ -7175,17 +7180,20 @@ static void cmd_scp(int idx, int argc, char** argv)
 
 			if (is_dir)
 			{
+				const char* base;
 				int space = sizeof(s->scp_remote_path) - rlen - 1;
-				if (rlen > 0 && rp[rlen - 1] != '/')
+				if (rlen > 0 && space > 0 && rp[rlen - 1] != '/')
 				{
 					s->scp_remote_path[rlen++] = '/';
 					s->scp_remote_path[rlen] = '\0';
 					space--;
 				}
+				/* extract basename from local arg (strip Mac path prefix) */
+				base = strrchr(argv[local_arg], ':');
+				base = base ? base + 1 : argv[local_arg];
 				if (space > 0)
 				{
-					copy_cstr_trunc(s->scp_remote_path + rlen, space,
-					                argv[local_arg]);
+					copy_cstr_trunc(s->scp_remote_path + rlen, space, base);
 				}
 			}
 		}
