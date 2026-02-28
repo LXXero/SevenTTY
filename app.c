@@ -1013,6 +1013,18 @@ void init_session(struct session* s)
 	s->scp_glob_pattern[0] = '\0';
 	s->scp_glob_vRefNum = 0;
 	s->scp_glob_dirID = 0;
+	s->ftp_host[0] = '\0';
+	s->ftp_user[0] = '\0';
+	s->ftp_password[0] = '\0';
+	s->ftp_port = 21;
+	s->ftp_remote_path[0] = '\0';
+	s->ftp_local_path[0] = '\0';
+	s->ftp_local_file_size = 0;
+	s->ftp_direction = 0;
+	s->ftp_no_progress = 0;
+	s->ftp_glob_pattern[0] = '\0';
+	s->ftp_glob_vRefNum = 0;
+	s->ftp_glob_dirID = 0;
 	s->window_id = -1;
 }
 

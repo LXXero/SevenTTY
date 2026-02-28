@@ -26,8 +26,8 @@ MONACO_METRICS = [
 ]
 
 # Resource IDs
-FOND_ID = 200
-NFNT_BASE_ID = 200  # 200-206 for sizes 9,10,12,14,18,24,36
+FOND_ID = 29183
+NFNT_BASE_ID = 29183  # 29183-29189 for sizes 9,10,12,14,18,24,36
 
 # Font character range
 FIRST_CHAR = 0x20

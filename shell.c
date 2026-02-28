@@ -68,6 +68,7 @@ static void shell_execute(int idx, char* line);
 static void shell_complete(int idx);
 static void ls_show_file(int idx, FSSpec* tspec, int long_fmt);
 static void ls_show_dir(int idx, short vRef, long dID, int long_fmt, int show_all);
+static int local_shell_worker_active(const struct session* s);
 
 /* ------------------------------------------------------------------ */
 /* utility: write a C string into the session's vterm                 */
@@ -6227,6 +6228,1552 @@ retry_redirect:
 
 }
 
+/* ------------------------------------------------------------------ */
+/* FTP client support                                                 */
+/* ------------------------------------------------------------------ */
+
+/* TCP connect helper: create, bind, connect an OT TCP endpoint.
+   Returns endpoint or kOTInvalidEndpointRef on failure. */
+static EndpointRef ftp_tcp_connect(int idx, const char* host,
+                                   unsigned short port)
+{
+	EndpointRef ep;
+	OSStatus err;
+	TCall sndCall;
+	DNSAddress hostDNSAddress;
+	char hostport[280];
+
+	if (InitOpenTransport() != noErr)
+	{
+		vt_write(idx, "ftp: Open Transport not available\r\n");
+		return kOTInvalidEndpointRef;
+	}
+
+	ep = OTOpenEndpoint(OTCreateConfiguration(kTCPName), 0, nil, &err);
+	if (err != noErr)
+	{
+		printf_s(idx, "ftp: failed to open endpoint (err=%d)\r\n", (int)err);
+		return kOTInvalidEndpointRef;
+	}
+
+	OTSetSynchronous(ep);
+	OTSetBlocking(ep);
+	OTInstallNotifier(ep, shell_ot_timeout_notifier, nil);
+	OTUseSyncIdleEvents(ep, true);
+
+	err = OTBind(ep, nil, nil);
+	if (err != noErr)
+	{
+		printf_s(idx, "ftp: bind failed (err=%d)\r\n", (int)err);
+		OTCloseProvider(ep);
+		return kOTInvalidEndpointRef;
+	}
+
+	snprintf(hostport, sizeof(hostport), "%s:%d", host, (int)port);
+
+	OTMemzero(&sndCall, sizeof(TCall));
+	sndCall.addr.buf = (UInt8*)&hostDNSAddress;
+	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, hostport);
+
+	ot_timeout_provider = ep;
+	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+
+	err = OTConnect(ep, &sndCall, nil);
+
+	ot_timeout_deadline = 0;
+	ot_timeout_provider = nil;
+
+	if (err != noErr)
+	{
+		if (err == kOTCanceledErr)
+			vt_write(idx, "timed out\r\n");
+		else
+			printf_s(idx, "failed (err=%d)\r\n", (int)err);
+		OTUnbind(ep);
+		OTCloseProvider(ep);
+		return kOTInvalidEndpointRef;
+	}
+
+	/* switch to non-blocking for data I/O */
+	OTSetNonBlocking(ep);
+	OTUseSyncIdleEvents(ep, false);
+
+	return ep;
+}
+
+/* close and invalidate a TCP endpoint */
+static void ftp_tcp_close(EndpointRef ep)
+{
+	if (ep != kOTInvalidEndpointRef)
+	{
+		OTSndOrderlyDisconnect(ep);
+		OTUnbind(ep);
+		OTCloseProvider(ep);
+	}
+}
+
+/* send a string on a non-blocking OT endpoint with yield loop */
+static int ftp_send_str(int idx, EndpointRef ep, const char* str)
+{
+	struct session* s = &sessions[idx];
+	int len = strlen(str);
+	int sent = 0;
+	unsigned long deadline = TickCount() + 1800;
+
+	while (sent < len)
+	{
+		OTResult r;
+		if (s->thread_command == EXIT || !s->in_use) return -1;
+		if (TickCount() > deadline) return -1;
+		r = OTSnd(ep, (void*)(str + sent), len - sent, 0);
+		if (r == kOTFlowErr) { YieldToAnyThread(); continue; }
+		if (r < 0) return -1;
+		sent += r;
+	}
+	return 0;
+}
+
+/* read a line (up to \n) from a non-blocking OT endpoint.
+   accumulates into buf[*buf_pos ..], returns total line length
+   including \n, or -1 on error/timeout/cancel. */
+static int ftp_recv_line(int idx, EndpointRef ep,
+                         char* buf, int buf_size, int* buf_pos)
+{
+	struct session* s = &sessions[idx];
+	unsigned long deadline = TickCount() + 1800;
+
+	while (1)
+	{
+		int i;
+		OTResult r;
+
+		if (s->thread_command == EXIT || !s->in_use) return -1;
+		if (TickCount() > deadline) return -1;
+
+		/* check if we already have a complete line */
+		for (i = 0; i < *buf_pos; i++)
+		{
+			if (buf[i] == '\n')
+				return i + 1;
+		}
+
+		if (*buf_pos >= buf_size - 1)
+			return -1; /* overflow */
+
+		r = OTRcv(ep, buf + *buf_pos, buf_size - 1 - *buf_pos, nil);
+		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
+		if (r == kOTLookErr)
+		{
+			OTResult ev = OTLook(ep);
+			if (ev == T_ORDREL) OTRcvOrderlyDisconnect(ep);
+			return -1;
+		}
+		if (r <= 0) return -1;
+		*buf_pos += r;
+		deadline = TickCount() + 1800;
+	}
+}
+
+/* send an FTP command and read the response.
+   if cmd is NULL, just read the greeting/response.
+   returns the 3-digit response code, or -1 on error.
+   resp_buf receives the full (possibly multiline) response text. */
+static int ftp_command(int idx, EndpointRef ctrl_ep,
+                       const char* cmd,
+                       char* resp_buf, int resp_buf_size)
+{
+	char line_buf[512];
+	int line_pos = 0;
+	int first_code = -1;
+	int resp_total = 0;
+
+	resp_buf[0] = '\0';
+
+	/* send command */
+	if (cmd != NULL)
+	{
+		char cmd_line[600];
+		snprintf(cmd_line, sizeof(cmd_line), "%s\r\n", cmd);
+		if (ftp_send_str(idx, ctrl_ep, cmd_line) < 0)
+			return -1;
+	}
+
+	/* read response lines */
+	line_pos = 0;
+	while (1)
+	{
+		int line_len;
+		int code;
+		char* line_start;
+
+		line_len = ftp_recv_line(idx, ctrl_ep, line_buf, sizeof(line_buf), &line_pos);
+		if (line_len < 0) return -1;
+
+		/* null-terminate the line */
+		line_buf[line_len] = '\0';
+
+		/* copy to response buffer */
+		if (resp_total + line_len < resp_buf_size - 1)
+		{
+			memcpy(resp_buf + resp_total, line_buf, line_len);
+			resp_total += line_len;
+			resp_buf[resp_total] = '\0';
+		}
+
+		/* shift remaining data in line_buf */
+		if (line_len < line_pos)
+		{
+			memmove(line_buf, line_buf + line_len, line_pos - line_len);
+			line_pos -= line_len;
+		}
+		else
+		{
+			line_pos = 0;
+		}
+
+		/* parse 3-digit code */
+		line_start = resp_buf + resp_total - line_len;
+		if (line_len >= 4 && line_start[0] >= '1' && line_start[0] <= '5' &&
+		    line_start[1] >= '0' && line_start[1] <= '9' &&
+		    line_start[2] >= '0' && line_start[2] <= '9')
+		{
+			code = (line_start[0] - '0') * 100 +
+			       (line_start[1] - '0') * 10 +
+			       (line_start[2] - '0');
+
+			if (first_code == -1)
+			{
+				first_code = code;
+				/* multiline: "NNN-" means keep reading */
+				if (line_start[3] != '-')
+					return first_code; /* single-line response */
+			}
+			else if (code == first_code && line_start[3] == ' ')
+			{
+				/* terminating line of multiline response */
+				return first_code;
+			}
+			/* else: continuation line of multiline, keep reading */
+		}
+		else if (first_code == -1)
+		{
+			/* no valid code on first line */
+			return -1;
+		}
+		/* else: text-only continuation line in multiline, keep reading */
+	}
+}
+
+/* parse PASV response: "227 Entering Passive Mode (h1,h2,h3,h4,p1,p2)"
+   extracts IP and port. returns 1 on success, 0 on parse failure. */
+static int ftp_parse_pasv(const char* resp,
+                          char* ip_out, unsigned short* port_out)
+{
+	const char* p;
+	int h1, h2, h3, h4, p1, p2;
+	int n;
+
+	/* find the opening paren */
+	p = strchr(resp, '(');
+	if (!p) return 0;
+	p++;
+
+	n = sscanf(p, "%d,%d,%d,%d,%d,%d", &h1, &h2, &h3, &h4, &p1, &p2);
+	if (n != 6) return 0;
+
+	if (h1 < 0 || h1 > 255 || h2 < 0 || h2 > 255 ||
+	    h3 < 0 || h3 > 255 || h4 < 0 || h4 > 255 ||
+	    p1 < 0 || p1 > 255 || p2 < 0 || p2 > 255) return 0;
+
+	snprintf(ip_out, 64, "%d.%d.%d.%d", h1, h2, h3, h4);
+	*port_out = (unsigned short)(p1 * 256 + p2);
+	return 1;
+}
+
+/* log in to FTP server. returns 1 on success, 0 on failure. */
+static int ftp_login(int idx, EndpointRef ctrl_ep,
+                     const char* user, const char* pass)
+{
+	char cmd[300];
+	char resp[512];
+	int code;
+
+	snprintf(cmd, sizeof(cmd), "USER %s", user);
+	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+	if (code < 0) return 0;
+
+	if (code == 230) return 1; /* logged in without password */
+
+	if (code == 331)
+	{
+		/* password required */
+		snprintf(cmd, sizeof(cmd), "PASS %s", pass);
+		code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+		if (code == 230) return 1;
+		vt_write(idx, "ftp: login failed\r\n");
+		return 0;
+	}
+
+	printf_s(idx, "ftp: USER rejected (%d)\r\n", code);
+	return 0;
+}
+
+/* open a PASV data connection. sends PASV, parses response, connects.
+   uses control_host for the data connection (NAT-safe).
+   returns data endpoint or kOTInvalidEndpointRef. */
+static EndpointRef ftp_open_data(int idx, EndpointRef ctrl_ep,
+                                 const char* control_host)
+{
+	char resp[512];
+	char pasv_ip[64];
+	unsigned short data_port;
+	int code;
+
+	code = ftp_command(idx, ctrl_ep, "PASV", resp, sizeof(resp));
+	if (code != 227)
+	{
+		printf_s(idx, "ftp: PASV failed (%d)\r\n", code);
+		return kOTInvalidEndpointRef;
+	}
+
+	if (!ftp_parse_pasv(resp, pasv_ip, &data_port))
+	{
+		vt_write(idx, "ftp: could not parse PASV response\r\n");
+		return kOTInvalidEndpointRef;
+	}
+
+	/* always use control host (NAT-friendly) */
+	if (strcmp(pasv_ip, control_host) != 0)
+	{
+		printf_s(idx, "ftp: note: PASV IP %s differs from control %s, using control\r\n",
+		         pasv_ip, control_host);
+	}
+
+	return ftp_tcp_connect(idx, control_host, data_port);
+}
+
+/* parse ftp://[user[:pass]@]host[:port]/path
+   returns 1 on success. missing user defaults to "anonymous",
+   missing password left empty (caller decides). */
+static int ftp_parse_url(const char* url,
+                         char* user, int user_max,
+                         char* pass, int pass_max,
+                         char* host, int host_max,
+                         unsigned short* port,
+                         char* path, int path_max)
+{
+	const char* p = url;
+	const char* at;
+	int hi;
+
+	user[0] = '\0';
+	pass[0] = '\0';
+	host[0] = '\0';
+	*port = 21;
+	path[0] = '\0';
+
+	if (strncmp(p, "ftp://", 6) != 0)
+		return 0;
+	p += 6;
+
+	/* check for user[:pass]@ */
+	at = NULL;
+	{
+		const char* scan = p;
+		while (*scan && *scan != '/' && *scan != '@') scan++;
+		if (*scan == '@') at = scan;
+	}
+
+	if (at != NULL)
+	{
+		/* user[:pass] before @ */
+		const char* colon = NULL;
+		const char* scan = p;
+		while (scan < at) { if (*scan == ':') { colon = scan; break; } scan++; }
+
+		if (colon != NULL)
+		{
+			int ulen = colon - p;
+			int plen = at - (colon + 1);
+			if (ulen <= 0 || ulen >= user_max) return 0;
+			if (plen < 0 || plen >= pass_max) return 0;
+			memcpy(user, p, ulen); user[ulen] = '\0';
+			memcpy(pass, colon + 1, plen); pass[plen] = '\0';
+		}
+		else
+		{
+			int ulen = at - p;
+			if (ulen <= 0 || ulen >= user_max) return 0;
+			memcpy(user, p, ulen); user[ulen] = '\0';
+		}
+		p = at + 1;
+	}
+
+	/* host[:port] */
+	hi = 0;
+	while (*p && *p != '/' && *p != ':' && hi < host_max - 1)
+		host[hi++] = *p++;
+	host[hi] = '\0';
+
+	if (*p == ':')
+	{
+		unsigned long pv = 0;
+		int ndigits = 0;
+		p++;
+		while (*p >= '0' && *p <= '9')
+		{
+			pv = pv * 10 + (*p - '0');
+			ndigits++;
+			p++;
+		}
+		if (ndigits == 0 || pv == 0 || pv > 65535) return 0;
+		*port = (unsigned short)pv;
+	}
+
+	/* path */
+	if (*p == '/')
+	{
+		strncpy(path, p, path_max - 1);
+		path[path_max - 1] = '\0';
+	}
+	else
+	{
+		strcpy(path, "/");
+	}
+
+	if (host[0] == '\0') return 0;
+
+	/* default user */
+	if (user[0] == '\0')
+		strncpy(user, "anonymous", user_max - 1);
+
+	return 1;
+}
+
+/* extract basename from a Mac path (strip colon-delimited prefixes)
+   or Unix path (strip slash-delimited prefixes), truncate for HFS. */
+static void ftp_basename(const char* path, char* out, int out_max)
+{
+	const char* p = path;
+	const char* base = path;
+
+	while (*p)
+	{
+		if (*p == ':' || *p == '/') base = p + 1;
+		p++;
+	}
+
+	{
+		int len = strlen(base);
+		if (len > 31) len = 31; /* HFS limit */
+		if (len >= out_max) len = out_max - 1;
+		memcpy(out, base, len);
+		out[len] = '\0';
+	}
+}
+
+/* check if a remote path is "directory-like" (ends with / ~ . ..) */
+static int ftp_is_dir_target(const char* path)
+{
+	int len = strlen(path);
+	if (len == 0) return 1; /* empty = server default dir */
+	if (path[len - 1] == '/') return 1;
+	if (strcmp(path, "~") == 0 || strcmp(path, ".") == 0 ||
+	    strcmp(path, "..") == 0) return 1;
+	if (len >= 2 && strcmp(path + len - 2, "~/") == 0) return 1;
+	return 0;
+}
+
+/* FTP download: RETR a file over a PASV data connection.
+   control endpoint must be logged in and ready.
+   returns 1 on success, 0 on failure. */
+static int ftp_download(int idx, EndpointRef ctrl_ep,
+                        const char* remote_path, int no_progress)
+{
+	struct session* s = &sessions[idx];
+	char resp[512];
+	char cmd[600];
+	int code;
+	EndpointRef data_ep = kOTInvalidEndpointRef;
+	long content_length = -1;
+	long total_written = 0;
+	long next_progress_bytes = 524288L;
+	long bytes_since_yield = 0;
+	const long yield_step = 524288L;
+	int progress_live = 0;
+	int download_ok = 0;
+	unsigned long recv_deadline;
+	unsigned long download_start_tick, download_elapsed_ticks;
+	/* file output */
+	char filename[64];
+	char local_name[32];
+	Str255 pname;
+	FSSpec out_spec;
+	short out_ref = 0;
+	OSType ftype = 'BINA';
+	OSType fcreator = '????';
+	unsigned char first_bytes[128];
+	int first_bytes_len = 0;
+	int checked_macbinary = 0;
+
+	/* set TYPE I (binary) */
+	code = ftp_command(idx, ctrl_ep, "TYPE I", resp, sizeof(resp));
+	if (code != 200)
+	{
+		printf_s(idx, "ftp: TYPE I failed (%d)\r\n", code);
+		return 0;
+	}
+
+	/* try SIZE (optional) */
+	snprintf(cmd, sizeof(cmd), "SIZE %s", remote_path);
+	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+	if (code == 213)
+	{
+		const char* sp = resp + 4; /* skip "213 " */
+		while (*sp == ' ') sp++;
+		content_length = atol(sp);
+		if (content_length < 0) content_length = -1;
+	}
+
+	/* extract filename from remote path */
+	ftp_basename(remote_path, filename, sizeof(filename));
+	if (filename[0] == '\0')
+		strcpy(filename, "download");
+
+	/* truncate to 31 chars for HFS */
+	{
+		int nlen = strlen(filename);
+		if (nlen > 31) nlen = 31;
+		memcpy(local_name, filename, nlen);
+		local_name[nlen] = '\0';
+	}
+
+	printf_s(idx, "Saving to: %s", local_name);
+	if (content_length >= 0)
+		printf_s(idx, " (%ld bytes)", content_length);
+	vt_write(idx, "\r\n");
+
+	/* open data connection */
+	data_ep = ftp_open_data(idx, ctrl_ep, s->ftp_host);
+	if (data_ep == kOTInvalidEndpointRef) return 0;
+
+	/* send RETR */
+	snprintf(cmd, sizeof(cmd), "RETR %s", remote_path);
+	s->endpoint = ctrl_ep; /* for cancellation */
+	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+	if (code != 150 && code != 125)
+	{
+		printf_s(idx, "ftp: RETR failed (%d)\r\n", code);
+		ftp_tcp_close(data_ep);
+		return 0;
+	}
+
+	/* create output file */
+	{
+		int nlen = strlen(local_name);
+		pname[0] = nlen;
+		memcpy(pname + 1, local_name, nlen);
+	}
+
+	/* delete if exists */
+	{
+		FSSpec tmp;
+		if (FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &tmp) == noErr)
+			HDelete(s->shell_vRefNum, s->shell_dirID, pname);
+	}
+
+	HCreate(s->shell_vRefNum, s->shell_dirID, pname, ftype, fcreator);
+	FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, &out_spec);
+
+	{
+		OSStatus ferr = FSpOpenDF(&out_spec, fsRdWrPerm, &out_ref);
+		if (ferr != noErr)
+		{
+			vt_write(idx, "ftp: cannot create output file\r\n");
+			ftp_tcp_close(data_ep);
+			return 0;
+		}
+	}
+
+	/* receive data */
+	s->endpoint = data_ep; /* cancellation targets data channel now */
+	recv_deadline = TickCount() + 1800;
+	download_start_tick = TickCount();
+	download_elapsed_ticks = 0;
+
+	while (1)
+	{
+		OTResult r;
+		char buf[32768];
+
+		if (s->thread_command == EXIT || !s->in_use)
+		{
+			vt_write(idx, "\r\nftp: cancelled\r\n");
+			break;
+		}
+
+		if (TickCount() > recv_deadline)
+		{
+			vt_write(idx, "\r\nftp: receive timed out\r\n");
+			break;
+		}
+
+		r = OTRcv(data_ep, buf, sizeof(buf), nil);
+		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
+		if (r == kOTLookErr)
+		{
+			OTResult ev = OTLook(data_ep);
+			if (ev == T_ORDREL)
+			{
+				OTRcvOrderlyDisconnect(data_ep);
+				download_ok = 1;
+			}
+			break;
+		}
+		if (r == 0) { download_ok = 1; break; }
+		if (r < 0) break;
+
+		recv_deadline = TickCount() + 1800;
+
+		/* save first bytes for MacBinary check */
+		if (first_bytes_len < 128)
+		{
+			int grab = 128 - first_bytes_len;
+			if (grab > r) grab = (int)r;
+			memcpy(first_bytes + first_bytes_len, buf, grab);
+			first_bytes_len += grab;
+		}
+
+		{
+			long wcount = r;
+			FSWrite(out_ref, &wcount, buf);
+			total_written += wcount;
+			bytes_since_yield += wcount;
+		}
+
+		if (transfer_progress_step(idx, total_written, content_length,
+		                           &next_progress_bytes, &progress_live,
+		                           !no_progress, 0) ||
+		    bytes_since_yield >= yield_step)
+		{
+			YieldToAnyThread();
+			bytes_since_yield = 0;
+		}
+	}
+	download_elapsed_ticks = TickCount() - download_start_tick;
+
+	if (progress_live)
+		vt_write(idx, "\r\n");
+
+	/* close data connection */
+	ftp_tcp_close(data_ep);
+	s->endpoint = ctrl_ep; /* restore for further commands / cleanup */
+
+	/* read transfer-complete response (226) */
+	if (download_ok)
+	{
+		code = ftp_command(idx, ctrl_ep, NULL, resp, sizeof(resp));
+		/* 226 = ok, but don't fail the download over missing reply */
+	}
+
+	/* close file */
+	FSClose(out_ref);
+
+	/* detect type/creator */
+	if (first_bytes_len >= 128)
+	{
+		OSType mb_type, mb_creator;
+		long mb_data, mb_rsrc;
+		if (check_macbinary(first_bytes, first_bytes_len,
+		                    &mb_type, &mb_creator, &mb_data, &mb_rsrc))
+		{
+			ftype = mb_type;
+			fcreator = mb_creator;
+			checked_macbinary = 1;
+			{
+				char tb[5], cb[5];
+				memcpy(tb, &mb_type, 4); tb[4] = '\0';
+				memcpy(cb, &mb_creator, 4); cb[4] = '\0';
+				printf_s(idx, "MacBinary detected: type='%s' creator='%s'\r\n",
+				         tb, cb);
+			}
+		}
+	}
+
+	if (!checked_macbinary)
+	{
+		if (lookup_ext_type(filename, &ftype, &fcreator))
+		{
+			char tb[5], cb[5];
+			memcpy(tb, &ftype, 4); tb[4] = '\0';
+			memcpy(cb, &fcreator, 4); cb[4] = '\0';
+			printf_s(idx, "Type from extension: '%s'/'%s'\r\n", tb, cb);
+		}
+	}
+
+	{
+		FInfo finfo;
+		if (FSpGetFInfo(&out_spec, &finfo) == noErr)
+		{
+			finfo.fdType = ftype;
+			finfo.fdCreator = fcreator;
+			FSpSetFInfo(&out_spec, &finfo);
+		}
+	}
+
+	if (download_ok && content_length >= 0 && total_written < content_length)
+		download_ok = 0;
+
+	if (download_ok)
+		printf_s(idx, "%ld bytes saved to %s\r\n", total_written, local_name);
+	else
+		printf_s(idx, "%ld bytes saved to %s (INCOMPLETE)\r\n",
+		         total_written, local_name);
+
+	if (download_elapsed_ticks > 0)
+	{
+		long kb = total_written / 1024L;
+		long kbps = (kb * 60L) / (long)download_elapsed_ticks;
+		printf_s(idx, "Average speed: %ld KB/s\r\n", kbps);
+	}
+
+	return download_ok;
+}
+
+/* FTP upload: STOR a local file over a PASV data connection.
+   returns 1 on success, 0 on failure. */
+static int ftp_upload(int idx, EndpointRef ctrl_ep,
+                      const char* remote_path, FSSpec* local_spec,
+                      long file_size, int no_progress)
+{
+	struct session* s = &sessions[idx];
+	char resp[512];
+	char cmd[600];
+	int code;
+	EndpointRef data_ep = kOTInvalidEndpointRef;
+	short in_ref = 0;
+	long total_sent = 0;
+	long next_progress_bytes = 524288L;
+	long bytes_since_yield = 0;
+	const long yield_step = 524288L;
+	int progress_live = 0;
+	int upload_ok = 0;
+	unsigned long upload_start_tick, upload_elapsed_ticks;
+	OSStatus ferr;
+
+	/* set TYPE I (binary) */
+	code = ftp_command(idx, ctrl_ep, "TYPE I", resp, sizeof(resp));
+	if (code != 200)
+	{
+		printf_s(idx, "ftp: TYPE I failed (%d)\r\n", code);
+		return 0;
+	}
+
+	/* open local file */
+	ferr = FSpOpenDF(local_spec, fsRdPerm, &in_ref);
+	if (ferr != noErr)
+	{
+		printf_s(idx, "ftp: cannot open local file (err=%d)\r\n", (int)ferr);
+		return 0;
+	}
+
+	printf_s(idx, "Uploading %ld bytes to %s\r\n", file_size, remote_path);
+
+	/* open data connection */
+	data_ep = ftp_open_data(idx, ctrl_ep, s->ftp_host);
+	if (data_ep == kOTInvalidEndpointRef)
+	{
+		FSClose(in_ref);
+		return 0;
+	}
+
+	/* send STOR */
+	snprintf(cmd, sizeof(cmd), "STOR %s", remote_path);
+	s->endpoint = ctrl_ep;
+	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+	if (code != 150 && code != 125)
+	{
+		printf_s(idx, "ftp: STOR failed (%d)\r\n", code);
+		ftp_tcp_close(data_ep);
+		FSClose(in_ref);
+		return 0;
+	}
+
+	/* send file data */
+	s->endpoint = data_ep;
+	upload_start_tick = TickCount();
+	upload_elapsed_ticks = 0;
+
+	while (total_sent < file_size)
+	{
+		char buf[32768];
+		long to_read = file_size - total_sent;
+		long count;
+
+		if (s->thread_command == EXIT || !s->in_use)
+		{
+			vt_write(idx, "\r\nftp: cancelled\r\n");
+			break;
+		}
+
+		if (to_read > (long)sizeof(buf)) to_read = (long)sizeof(buf);
+		count = to_read;
+		ferr = FSRead(in_ref, &count, buf);
+		if (ferr != noErr && ferr != eofErr) break;
+		if (count == 0) break;
+
+		/* send to data channel */
+		{
+			int sent = 0;
+			unsigned long send_deadline = TickCount() + 1800;
+			while (sent < count)
+			{
+				OTResult r;
+				if (s->thread_command == EXIT || !s->in_use) goto upload_done;
+				if (TickCount() > send_deadline) goto upload_done;
+				r = OTSnd(data_ep, buf + sent, count - sent, 0);
+				if (r == kOTFlowErr) { YieldToAnyThread(); continue; }
+				if (r < 0) goto upload_done;
+				sent += r;
+				send_deadline = TickCount() + 1800;
+			}
+		}
+
+		total_sent += count;
+		bytes_since_yield += count;
+
+		if (transfer_progress_step(idx, total_sent, file_size,
+		                           &next_progress_bytes, &progress_live,
+		                           !no_progress, 1) ||
+		    bytes_since_yield >= yield_step)
+		{
+			YieldToAnyThread();
+			bytes_since_yield = 0;
+		}
+	}
+
+	if (total_sent >= file_size) upload_ok = 1;
+
+upload_done:
+	upload_elapsed_ticks = TickCount() - upload_start_tick;
+
+	if (progress_live)
+		vt_write(idx, "\r\n");
+
+	/* close data connection (signals end of data to server) */
+	ftp_tcp_close(data_ep);
+	s->endpoint = ctrl_ep;
+
+	/* close local file */
+	FSClose(in_ref);
+
+	/* read transfer-complete response (226) */
+	if (upload_ok)
+	{
+		code = ftp_command(idx, ctrl_ep, NULL, resp, sizeof(resp));
+	}
+
+	if (upload_ok)
+		printf_s(idx, "%ld bytes uploaded\r\n", total_sent);
+	else
+		printf_s(idx, "%ld bytes uploaded (INCOMPLETE)\r\n", total_sent);
+
+	if (upload_elapsed_ticks > 0)
+	{
+		long kb = total_sent / 1024L;
+		long kbps = (kb * 60L) / (long)upload_elapsed_ticks;
+		printf_s(idx, "Average speed: %ld KB/s\r\n", kbps);
+	}
+
+	return upload_ok;
+}
+
+/* FTP directory listing: LIST over PASV.
+   returns 1 on success, 0 on failure. */
+static int ftp_list(int idx, EndpointRef ctrl_ep, const char* remote_path)
+{
+	struct session* s = &sessions[idx];
+	char resp[512];
+	char cmd[600];
+	int code;
+	EndpointRef data_ep = kOTInvalidEndpointRef;
+	unsigned long recv_deadline;
+
+	/* open data connection */
+	data_ep = ftp_open_data(idx, ctrl_ep, s->ftp_host);
+	if (data_ep == kOTInvalidEndpointRef) return 0;
+
+	/* send LIST */
+	if (remote_path[0] != '\0' && strcmp(remote_path, "/") != 0)
+		snprintf(cmd, sizeof(cmd), "LIST %s", remote_path);
+	else
+		strcpy(cmd, "LIST");
+
+	s->endpoint = ctrl_ep;
+	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
+	if (code != 150 && code != 125)
+	{
+		printf_s(idx, "ftp: LIST failed (%d)\r\n", code);
+		ftp_tcp_close(data_ep);
+		return 0;
+	}
+
+	/* receive listing data */
+	s->endpoint = data_ep;
+	recv_deadline = TickCount() + 1800;
+
+	while (1)
+	{
+		OTResult r;
+		char buf[4096];
+
+		if (s->thread_command == EXIT || !s->in_use) break;
+		if (TickCount() > recv_deadline) break;
+
+		r = OTRcv(data_ep, buf, sizeof(buf) - 1, nil);
+		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
+		if (r == kOTLookErr)
+		{
+			OTResult ev = OTLook(data_ep);
+			if (ev == T_ORDREL) OTRcvOrderlyDisconnect(data_ep);
+			break;
+		}
+		if (r <= 0) break;
+
+		recv_deadline = TickCount() + 1800;
+
+		/* output to terminal, converting \n to \r\n */
+		{
+			int i;
+			for (i = 0; i < r; i++)
+			{
+				if (buf[i] == '\n')
+					vt_write(idx, "\r\n");
+				else
+					vt_char(idx, buf[i]);
+			}
+		}
+
+		YieldToAnyThread();
+	}
+
+	ftp_tcp_close(data_ep);
+	s->endpoint = ctrl_ep;
+
+	/* read transfer-complete response (226) */
+	code = ftp_command(idx, ctrl_ep, NULL, resp, sizeof(resp));
+
+	return 1;
+}
+
+/* run a complete FTP download session (for wget ftp:// integration).
+   called inline from wget_worker_thread. */
+static void ftp_wget_download(int idx, const char* url, int no_progress)
+{
+	struct session* s = &sessions[idx];
+	char user[256], pass[256], host[256], path[512];
+	unsigned short port;
+	EndpointRef ctrl_ep = kOTInvalidEndpointRef;
+	char resp[512];
+	int code;
+
+	if (!ftp_parse_url(url, user, sizeof(user), pass, sizeof(pass),
+	                   host, sizeof(host), &port, path, sizeof(path)))
+	{
+		vt_write(idx, "wget: invalid FTP URL\r\n");
+		return;
+	}
+
+	/* save host for PASV data connections */
+	copy_cstr_trunc(s->ftp_host, sizeof(s->ftp_host), host);
+
+	/* credential defaults */
+	if (strcmp(user, "anonymous") == 0 && pass[0] == '\0')
+		strcpy(pass, "seventty@local");
+
+	if (pass[0] != '\0' && strcmp(user, "anonymous") != 0)
+	{
+		/* warn about password in URL */
+		{
+			const char* at = strchr(url + 6, '@');
+			const char* colon = strchr(url + 6, ':');
+			if (colon && at && colon < at)
+				vt_write(idx, "ftp: warning: password visible in URL\r\n");
+		}
+	}
+
+	/* non-anonymous with no password: prompt not supported in wget flow,
+	   error out */
+	if (strcmp(user, "anonymous") != 0 && pass[0] == '\0')
+	{
+		vt_write(idx, "wget: FTP password required but not provided in URL\r\n");
+		vt_write(idx, "  Use: wget ftp://user:pass@host/path\r\n");
+		vt_write(idx, "  Or use the ftp command for prompted auth.\r\n");
+		return;
+	}
+
+	printf_s(idx, "Connecting to %s:%d... ", host, (int)port);
+	ctrl_ep = ftp_tcp_connect(idx, host, port);
+	if (ctrl_ep == kOTInvalidEndpointRef) return;
+	vt_write(idx, "connected.\r\n");
+
+	s->endpoint = ctrl_ep;
+
+	/* read greeting */
+	code = ftp_command(idx, ctrl_ep, NULL, resp, sizeof(resp));
+	if (code != 220)
+	{
+		printf_s(idx, "ftp: unexpected greeting (%d)\r\n", code);
+		ftp_tcp_close(ctrl_ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		return;
+	}
+
+	/* login */
+	printf_s(idx, "Logging in as %s... ", user);
+	if (!ftp_login(idx, ctrl_ep, user, pass))
+	{
+		ftp_command(idx, ctrl_ep, "QUIT", resp, sizeof(resp));
+		ftp_tcp_close(ctrl_ep);
+		s->endpoint = kOTInvalidEndpointRef;
+		return;
+	}
+	vt_write(idx, "ok.\r\n");
+
+	/* download */
+	ftp_download(idx, ctrl_ep, path, no_progress);
+
+	/* logout */
+	ftp_command(idx, ctrl_ep, "QUIT", resp, sizeof(resp));
+	ftp_tcp_close(ctrl_ep);
+	s->endpoint = kOTInvalidEndpointRef;
+}
+
+/* parse user@host[:port]:/path (SCP-like spec) for FTP.
+   returns 1 if matches, 0 otherwise. */
+static int ftp_parse_spec(const char* arg,
+                          char* user, int user_max,
+                          char* host, int host_max,
+                          unsigned short* port,
+                          char* remote_path, int path_max)
+{
+	const char* at;
+	const char* colon;
+	const char* second_colon;
+	int ulen, hlen;
+
+	/* also accept ftp:// URLs */
+	if (strncmp(arg, "ftp://", 6) == 0)
+	{
+		char pass_tmp[256];
+		return ftp_parse_url(arg, user, user_max, pass_tmp, sizeof(pass_tmp),
+		                     host, host_max, port, remote_path, path_max);
+	}
+
+	at = strchr(arg, '@');
+	if (at == NULL) return 0;
+
+	colon = strchr(at + 1, ':');
+	if (colon == NULL) return 0;
+
+	/* user */
+	ulen = at - arg;
+	if (ulen <= 0 || ulen >= user_max) return 0;
+	memcpy(user, arg, ulen);
+	user[ulen] = '\0';
+
+	/* check for port: user@host:port:/path */
+	second_colon = strchr(colon + 1, ':');
+	if (second_colon != NULL && second_colon > colon + 1)
+	{
+		const char* p;
+		int all_digits = 1;
+
+		for (p = colon + 1; p < second_colon; p++)
+		{
+			if (*p < '0' || *p > '9') { all_digits = 0; break; }
+		}
+
+		if (all_digits)
+		{
+			*port = (unsigned short)atoi(colon + 1);
+			colon = second_colon;
+		}
+	}
+
+	/* host */
+	hlen = colon - (at + 1);
+	/* if port was found, hlen was calculated before colon advancement */
+	{
+		const char* host_end = strchr(at + 1, ':');
+		hlen = host_end - (at + 1);
+	}
+	if (hlen <= 0 || hlen >= host_max) return 0;
+	memcpy(host, at + 1, hlen);
+	host[hlen] = '\0';
+
+	/* remote path: everything after the (final) colon */
+	strncpy(remote_path, colon + 1, path_max - 1);
+	remote_path[path_max - 1] = '\0';
+
+	return 1;
+}
+
+/* FTP worker thread: dispatches get/put/ls based on ftp_direction */
+static void* ftp_worker_thread(void* arg)
+{
+	int idx = (int)(long)arg;
+	struct session* s = &sessions[idx];
+	EndpointRef ctrl_ep = kOTInvalidEndpointRef;
+	char resp[512];
+	int code;
+	char pass[256];
+
+	copy_cstr_trunc(pass, sizeof(pass), s->ftp_password);
+
+	/* credential defaults */
+	if (s->ftp_user[0] == '\0')
+		strcpy(s->ftp_user, "anonymous");
+	if (strcmp(s->ftp_user, "anonymous") == 0 && pass[0] == '\0')
+		strcpy(pass, "seventty@local");
+
+	/* connect */
+	printf_s(idx, "Connecting to %s:%d... ", s->ftp_host, (int)s->ftp_port);
+	ctrl_ep = ftp_tcp_connect(idx, s->ftp_host, s->ftp_port);
+	if (ctrl_ep == kOTInvalidEndpointRef) goto ftp_worker_done;
+	vt_write(idx, "connected.\r\n");
+
+	s->endpoint = ctrl_ep;
+
+	/* read greeting */
+	code = ftp_command(idx, ctrl_ep, NULL, resp, sizeof(resp));
+	if (code != 220)
+	{
+		printf_s(idx, "ftp: unexpected greeting (%d)\r\n", code);
+		goto ftp_worker_cleanup;
+	}
+
+	/* login */
+	printf_s(idx, "Logging in as %s... ", s->ftp_user);
+	if (!ftp_login(idx, ctrl_ep, s->ftp_user, pass))
+		goto ftp_worker_cleanup;
+	vt_write(idx, "ok.\r\n");
+
+	/* dispatch */
+	if (s->ftp_direction == 0)
+	{
+		/* get */
+		ftp_download(idx, ctrl_ep, s->ftp_remote_path, s->ftp_no_progress);
+	}
+	else if (s->ftp_direction == 1)
+	{
+		/* put */
+		if (s->ftp_glob_pattern[0] != '\0')
+		{
+			/* glob upload: enumerate matching files */
+			CInfoPBRec pb;
+			Str255 name;
+			int upload_count = 0;
+
+			memset(&pb, 0, sizeof(pb));
+			pb.hFileInfo.ioNamePtr = name;
+			pb.hFileInfo.ioVRefNum = s->ftp_glob_vRefNum;
+			pb.hFileInfo.ioFDirIndex = 1;
+
+			while (1)
+			{
+				char name_c[64];
+				int nlen;
+				char remote_full[600];
+
+				if (s->thread_command == EXIT || !s->in_use) break;
+
+				pb.hFileInfo.ioDirID = s->ftp_glob_dirID;
+
+				if (PBGetCatInfoSync(&pb) != noErr) break;
+
+				nlen = name[0];
+				if (nlen > 63) nlen = 63;
+				memcpy(name_c, name + 1, nlen);
+				name_c[nlen] = '\0';
+
+				/* skip directories */
+				if (pb.hFileInfo.ioFlAttrib & 0x10)
+				{
+					pb.hFileInfo.ioFDirIndex++;
+					continue;
+				}
+
+				/* match glob */
+				if (!glob_match(s->ftp_glob_pattern, name_c))
+				{
+					pb.hFileInfo.ioFDirIndex++;
+					continue;
+				}
+
+				/* build remote path: dir + basename */
+				snprintf(remote_full, sizeof(remote_full), "%s%s",
+				         s->ftp_remote_path, name_c);
+
+				/* resolve local FSSpec */
+				{
+					Str255 pn;
+					FSSpec fspec;
+					long fsize;
+					pn[0] = nlen;
+					memcpy(pn + 1, name_c, nlen);
+					FSMakeFSSpec(s->ftp_glob_vRefNum, s->ftp_glob_dirID,
+					             pn, &fspec);
+					fsize = pb.hFileInfo.ioFlLgLen; /* data fork size */
+
+					printf_s(idx, "\r\n--- %s ---\r\n", name_c);
+					ftp_upload(idx, ctrl_ep, remote_full, &fspec,
+					           fsize, s->ftp_no_progress);
+					upload_count++;
+				}
+
+				pb.hFileInfo.ioFDirIndex++;
+			}
+
+			printf_s(idx, "\r\n%d file(s) uploaded\r\n", upload_count);
+		}
+		else
+		{
+			/* single file upload */
+			ftp_upload(idx, ctrl_ep, s->ftp_remote_path,
+			           &s->ftp_local_spec, s->ftp_local_file_size,
+			           s->ftp_no_progress);
+		}
+	}
+	else if (s->ftp_direction == 2)
+	{
+		/* ls */
+		ftp_list(idx, ctrl_ep, s->ftp_remote_path);
+	}
+
+ftp_worker_cleanup:
+	ftp_command(idx, ctrl_ep, "QUIT", resp, sizeof(resp));
+	ftp_tcp_close(ctrl_ep);
+	s->endpoint = kOTInvalidEndpointRef;
+
+ftp_worker_done:
+	s->worker_mode = WORKER_NONE;
+	s->thread_state = DONE;
+	s->thread_command = WAIT;
+
+	if (s->in_use && s->type == SESSION_LOCAL)
+		shell_prompt(idx);
+
+	return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* ftp command entry point                                            */
+/* ------------------------------------------------------------------ */
+
+static void cmd_ftp(int idx, int argc, char** argv)
+{
+	struct session* s = &sessions[idx];
+	ThreadID tid = kNoThreadID;
+	OSErr err = noErr;
+	int no_progress = 0;
+	int argi = 1;
+	const char* subcmd;
+
+	if (argc < 2)
+	{
+		vt_write(idx, "usage: ftp get|put|ls [-n] <args>\r\n");
+		vt_write(idx, "  ftp get user@host:/path/file.txt\r\n");
+		vt_write(idx, "  ftp put localfile user@host:/path/\r\n");
+		vt_write(idx, "  ftp put *.txt user@host:/dir/\r\n");
+		vt_write(idx, "  ftp ls  user@host:/path/\r\n");
+		return;
+	}
+
+	subcmd = argv[argi++];
+
+	/* parse optional -n */
+	if (argi < argc &&
+	    (strcmp(argv[argi], "-n") == 0 || strcmp(argv[argi], "--no-progress") == 0))
+	{
+		no_progress = 1;
+		argi++;
+	}
+
+	/* check for conflicting workers */
+	if (s->worker_mode == WORKER_NC)
+	{
+		vt_write(idx, "ftp: unavailable while nc session is active\r\n");
+		return;
+	}
+
+	if (s->thread_state == DONE && s->thread_id != kNoThreadID)
+	{
+		session_reap_thread(idx, 0);
+		if (s->thread_id != kNoThreadID)
+		{
+			vt_write(idx, "ftp: previous worker thread could not be reclaimed\r\n");
+			return;
+		}
+	}
+
+	if (local_shell_worker_active(s))
+	{
+		vt_write(idx, "ftp: another local command is already running\r\n");
+		return;
+	}
+
+	/* clear FTP state */
+	s->ftp_host[0] = '\0';
+	s->ftp_user[0] = '\0';
+	s->ftp_password[0] = '\0';
+	s->ftp_port = 21;
+	s->ftp_remote_path[0] = '\0';
+	s->ftp_local_path[0] = '\0';
+	s->ftp_local_file_size = 0;
+	s->ftp_direction = 0;
+	s->ftp_no_progress = no_progress ? 1 : 0;
+	s->ftp_glob_pattern[0] = '\0';
+	s->ftp_glob_vRefNum = 0;
+	s->ftp_glob_dirID = 0;
+
+	if (strcmp(subcmd, "get") == 0)
+	{
+		/* ftp get user@host:/path or ftp get ftp://... */
+		if (argi >= argc)
+		{
+			vt_write(idx, "usage: ftp get [-n] user@host:/path\r\n");
+			return;
+		}
+
+		if (!ftp_parse_spec(argv[argi],
+		                    s->ftp_user, sizeof(s->ftp_user),
+		                    s->ftp_host, sizeof(s->ftp_host),
+		                    &s->ftp_port,
+		                    s->ftp_remote_path, sizeof(s->ftp_remote_path)))
+		{
+			vt_write(idx, "ftp: invalid remote spec\r\n");
+			vt_write(idx, "  Expected: user@host:/path or ftp://...\r\n");
+			return;
+		}
+
+		/* check for password in ftp:// URL */
+		if (strncmp(argv[argi], "ftp://", 6) == 0)
+		{
+			char tmp_pass[256];
+			char tmp_user[256], tmp_host[256], tmp_path[512];
+			unsigned short tmp_port;
+			ftp_parse_url(argv[argi], tmp_user, sizeof(tmp_user),
+			              tmp_pass, sizeof(tmp_pass),
+			              tmp_host, sizeof(tmp_host),
+			              &tmp_port, tmp_path, sizeof(tmp_path));
+			if (tmp_pass[0] != '\0')
+				copy_cstr_trunc(s->ftp_password, sizeof(s->ftp_password), tmp_pass);
+		}
+
+		s->ftp_direction = 0;
+	}
+	else if (strcmp(subcmd, "put") == 0)
+	{
+		/* ftp put localfile user@host:/path
+		   ftp put *.txt user@host:/dir/ */
+		const char* local_arg;
+		const char* remote_arg;
+
+		if (argi + 1 >= argc)
+		{
+			vt_write(idx, "usage: ftp put [-n] <localfile> user@host:/path\r\n");
+			return;
+		}
+
+		local_arg = argv[argi];
+		remote_arg = argv[argi + 1];
+
+		if (!ftp_parse_spec(remote_arg,
+		                    s->ftp_user, sizeof(s->ftp_user),
+		                    s->ftp_host, sizeof(s->ftp_host),
+		                    &s->ftp_port,
+		                    s->ftp_remote_path, sizeof(s->ftp_remote_path)))
+		{
+			vt_write(idx, "ftp: invalid remote spec\r\n");
+			return;
+		}
+
+		if (is_glob(local_arg))
+		{
+			/* glob upload */
+			if (!ftp_is_dir_target(s->ftp_remote_path))
+			{
+				vt_write(idx, "ftp: glob put requires directory-like remote target (ending with /)\r\n");
+				return;
+			}
+
+			copy_cstr_trunc(s->ftp_glob_pattern, sizeof(s->ftp_glob_pattern),
+			                local_arg);
+			s->ftp_glob_vRefNum = s->shell_vRefNum;
+			s->ftp_glob_dirID = s->shell_dirID;
+		}
+		else
+		{
+			/* single file */
+			FSSpec fspec;
+			CInfoPBRec pb;
+			Str255 fname;
+			OSErr ferr;
+
+			ferr = resolve_path(idx, local_arg, &fspec);
+			if (ferr != noErr)
+			{
+				printf_s(idx, "ftp: %s: not found\r\n", local_arg);
+				return;
+			}
+
+			/* get file size */
+			memset(&pb, 0, sizeof(pb));
+			fname[0] = fspec.name[0];
+			memcpy(fname + 1, fspec.name + 1, fspec.name[0]);
+			pb.hFileInfo.ioNamePtr = fname;
+			pb.hFileInfo.ioVRefNum = fspec.vRefNum;
+			pb.hFileInfo.ioDirID = fspec.parID;
+			pb.hFileInfo.ioFDirIndex = 0;
+
+			ferr = PBGetCatInfoSync(&pb);
+			if (ferr != noErr || (pb.hFileInfo.ioFlAttrib & 0x10))
+			{
+				printf_s(idx, "ftp: %s: cannot read file info\r\n", local_arg);
+				return;
+			}
+
+			s->ftp_local_spec = fspec;
+			s->ftp_local_file_size = pb.hFileInfo.ioFlLgLen;
+
+			/* if remote target is directory-like, append basename */
+			if (ftp_is_dir_target(s->ftp_remote_path))
+			{
+				char bname[64];
+				ftp_basename(local_arg, bname, sizeof(bname));
+				/* ensure trailing slash on remote path */
+				{
+					int rlen = strlen(s->ftp_remote_path);
+					if (rlen > 0 && s->ftp_remote_path[rlen - 1] != '/')
+					{
+						if (rlen < (int)sizeof(s->ftp_remote_path) - 1)
+						{
+							s->ftp_remote_path[rlen] = '/';
+							s->ftp_remote_path[rlen + 1] = '\0';
+						}
+					}
+				}
+				{
+					int rlen = strlen(s->ftp_remote_path);
+					int blen = strlen(bname);
+					if (rlen + blen < (int)sizeof(s->ftp_remote_path) - 1)
+					{
+						memcpy(s->ftp_remote_path + rlen, bname, blen);
+						s->ftp_remote_path[rlen + blen] = '\0';
+					}
+				}
+			}
+		}
+
+		/* check for password in ftp:// URL */
+		if (strncmp(remote_arg, "ftp://", 6) == 0)
+		{
+			char tmp_pass[256];
+			char tmp_user[256], tmp_host[256], tmp_path[512];
+			unsigned short tmp_port;
+			ftp_parse_url(remote_arg, tmp_user, sizeof(tmp_user),
+			              tmp_pass, sizeof(tmp_pass),
+			              tmp_host, sizeof(tmp_host),
+			              &tmp_port, tmp_path, sizeof(tmp_path));
+			if (tmp_pass[0] != '\0')
+				copy_cstr_trunc(s->ftp_password, sizeof(s->ftp_password), tmp_pass);
+		}
+
+		s->ftp_direction = 1;
+	}
+	else if (strcmp(subcmd, "ls") == 0)
+	{
+		/* ftp ls user@host:/path/ */
+		if (argi >= argc)
+		{
+			vt_write(idx, "usage: ftp ls user@host:/path/\r\n");
+			return;
+		}
+
+		if (!ftp_parse_spec(argv[argi],
+		                    s->ftp_user, sizeof(s->ftp_user),
+		                    s->ftp_host, sizeof(s->ftp_host),
+		                    &s->ftp_port,
+		                    s->ftp_remote_path, sizeof(s->ftp_remote_path)))
+		{
+			vt_write(idx, "ftp: invalid remote spec\r\n");
+			return;
+		}
+
+		/* check for password in ftp:// URL */
+		if (strncmp(argv[argi], "ftp://", 6) == 0)
+		{
+			char tmp_pass[256];
+			char tmp_user[256], tmp_host[256], tmp_path[512];
+			unsigned short tmp_port;
+			ftp_parse_url(argv[argi], tmp_user, sizeof(tmp_user),
+			              tmp_pass, sizeof(tmp_pass),
+			              tmp_host, sizeof(tmp_host),
+			              &tmp_port, tmp_path, sizeof(tmp_path));
+			if (tmp_pass[0] != '\0')
+				copy_cstr_trunc(s->ftp_password, sizeof(s->ftp_password), tmp_pass);
+		}
+
+		s->ftp_direction = 2;
+	}
+	else
+	{
+		printf_s(idx, "ftp: unknown subcommand '%s'\r\n", subcmd);
+		vt_write(idx, "usage: ftp get|put|ls [-n] <args>\r\n");
+		return;
+	}
+
+	/* prompt for password if needed (non-anonymous, no password yet) */
+	if (strcmp(s->ftp_user, "anonymous") != 0 && s->ftp_password[0] == '\0')
+	{
+		int pw_ok = password_dialog(DLOG_PASSWORD);
+		if (!pw_ok)
+		{
+			vt_write(idx, "ftp: cancelled\r\n");
+			return;
+		}
+		/* password_dialog fills prefs.password as pascal string */
+		{
+			int plen = (unsigned char)prefs.password[0];
+			if (plen > (int)sizeof(s->ftp_password) - 1)
+				plen = (int)sizeof(s->ftp_password) - 1;
+			memcpy(s->ftp_password, prefs.password + 1, plen);
+			s->ftp_password[plen] = '\0';
+		}
+	}
+
+	/* spawn worker thread */
+	s->thread_command = READ;
+	s->thread_state = OPEN;
+	s->endpoint = kOTInvalidEndpointRef;
+
+	err = NewThread(kCooperativeThread, ftp_worker_thread,
+	                (void*)(long)idx, 100000,
+	                kCreateIfNeeded, NULL, &tid);
+	if (err != noErr)
+	{
+		s->thread_command = WAIT;
+		s->thread_state = DONE;
+		s->thread_id = kNoThreadID;
+		printf_s(idx, "ftp: failed to create worker thread (err=%d)\r\n", (int)err);
+		return;
+	}
+
+	s->thread_id = tid;
+	s->worker_mode = WORKER_FTP;
+}
+
 static int local_shell_worker_active(const struct session* s)
 {
 	return (s->type == SESSION_LOCAL &&
@@ -6241,7 +7788,11 @@ static void* wget_worker_thread(void* arg)
 	int idx = (int)(long)arg;
 	struct session* s = &sessions[idx];
 
-	cmd_wget_run(idx, s->wget_url, s->wget_no_progress ? 1 : 0);
+	/* check for ftp:// URL */
+	if (strncmp(s->wget_url, "ftp://", 6) == 0)
+		ftp_wget_download(idx, s->wget_url, s->wget_no_progress ? 1 : 0);
+	else
+		cmd_wget_run(idx, s->wget_url, s->wget_no_progress ? 1 : 0);
 
 	s->worker_mode = WORKER_NONE;
 	s->thread_state = DONE;
@@ -7690,9 +9241,12 @@ static void cmd_help(int idx, int argc, char* argv[])
 		"    open <path>        launch application",
 		"    ssh [user@]h[:p]   open SSH tab",
 		"    telnet <h> [port]  open telnet tab",
-		"    wget [-n] <url>    HTTP download",
+		"    wget [-n] <url>    HTTP/FTP download",
 		"    scp [-n] u@h:/p [l]  SCP download",
 		"    scp [-n] l u@h:/p    SCP upload",
+		"    ftp get u@h:/path    FTP download",
+		"    ftp put f u@h:/path  FTP upload",
+		"    ftp ls u@h:/path/    FTP directory list",
 		"    nc <host> <port>   raw TCP connection",
 		"    host <hostname>    DNS lookup",
 		"    ping <host> [port] TCP connect test",
@@ -7764,7 +9318,7 @@ static const char* shell_commands[] = {
 	"basename", "cal", "cat", "cd", "chattr", "chmod", "chown", "clear",
 	"cls", "cmp", "colors", "copy", "cp", "crc32", "cut", "date", "del",
 	"delete", "df", "dir", "dirname", "dos2unix", "echo", "exit", "file",
-	"fixtype", "fold", "free", "getinfo", "grep", "head", "help", "hexdump",
+	"fixtype", "fold", "free", "ftp", "getinfo", "grep", "head", "help", "hexdump",
 	"history", "host", "hostname", "ifconfig", "info", "label", "less",
 	"ln", "ls", "mac2unix", "md", "md5sum", "mkdir", "more", "mv", "nc",
 	"nl", "open", "ping", "ps", "pwd", "quit", "rd", "readlink",
@@ -8352,6 +9906,7 @@ static void shell_execute(int idx, char* line)
 	else if (strcmp(cmd, "readlink") == 0) cmd_readlink(idx, argc, argv);
 	else if (strcmp(cmd, "wget") == 0)     cmd_wget(idx, argc, argv);
 	else if (strcmp(cmd, "scp") == 0)      cmd_scp(idx, argc, argv);
+	else if (strcmp(cmd, "ftp") == 0)      cmd_ftp(idx, argc, argv);
 	else if (strcmp(cmd, "help") == 0)       cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "?") == 0)          cmd_help(idx, argc, argv);
 	else if (strcmp(cmd, "exit") == 0 || strcmp(cmd, "quit") == 0)

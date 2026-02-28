@@ -42,7 +42,7 @@ enum MOUSE_MODE { CLICK_SEND, CLICK_SELECT };
 enum SESSION_TYPE { SESSION_NONE, SESSION_SSH, SESSION_LOCAL, SESSION_TELNET };
 enum THREAD_COMMAND { WAIT, READ, EXIT };
 enum THREAD_STATE { UNINITIALIZED, OPEN, CLEANUP, DONE };
-enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP };
+enum WORKER_MODE { WORKER_NONE, WORKER_NC, WORKER_WGET, WORKER_SCP, WORKER_FTP };
 
 // per-session state (terminal + connection + thread)
 struct session
@@ -128,6 +128,23 @@ struct session
 	char scp_glob_pattern[64];   // glob pattern, "" = single file
 	short scp_glob_vRefNum;      // directory to enumerate
 	long scp_glob_dirID;         // directory to enumerate
+
+	// FTP state: set by cmd_ftp()/cmd_wget() before worker spawn
+	char ftp_host[256];
+	char ftp_user[256];
+	char ftp_password[256];
+	unsigned short ftp_port;          /* default 21 */
+	char ftp_remote_path[512];
+	char ftp_local_path[64];          /* HFS-friendly local name */
+	FSSpec ftp_local_spec;            /* upload source */
+	long ftp_local_file_size;         /* upload source size */
+	unsigned char ftp_direction;      /* 0=get, 1=put, 2=ls */
+	unsigned char ftp_no_progress;
+
+	// multi-file FTP upload (glob expansion)
+	char ftp_glob_pattern[64];   // glob pattern, "" = single file
+	short ftp_glob_vRefNum;      // directory to enumerate
+	long ftp_glob_dirID;         // directory to enumerate
 
 	// scrollback buffer (ring buffer of compact rows)
 	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];

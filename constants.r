@@ -103,15 +103,15 @@
 #define CNTL_PREF_FONT_SIZE 131
 
 /* symbol font for box drawing / block elements / CP437 */
-#define SYMF_FAMILY_ID  200
-#define SYMF_FOND_ID    200
-#define SYMF_NFNT_9     200
-#define SYMF_NFNT_10    201
-#define SYMF_NFNT_12    202
-#define SYMF_NFNT_14    203
-#define SYMF_NFNT_18    204
-#define SYMF_NFNT_24    205
-#define SYMF_NFNT_36    206
+#define SYMF_FAMILY_ID  29183
+#define SYMF_FOND_ID    29183
+#define SYMF_NFNT_9     29183
+#define SYMF_NFNT_10    29184
+#define SYMF_NFNT_12    29185
+#define SYMF_NFNT_14    29186
+#define SYMF_NFNT_18    29187
+#define SYMF_NFNT_24    29188
+#define SYMF_NFNT_36    29189
 
 /* menus */
 #define MBAR_MAIN      128

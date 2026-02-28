@@ -19,6 +19,9 @@ features
 * **Scrollback**: Shift+Page Up/Down to scroll through history (100 lines per session)
 * **Copy/paste**: mouse text selection with Cmd+C/V
 * **Telnet & raw TCP**: `telnet host [port]` opens in a new tab; `nc host port` for raw TCP inline
+* **FTP client**: `ftp get user@host:/path`, `ftp put user@host:/path file`, `ftp ls user@host:/path` — PASV mode, progress bar, glob uploads
+* **SCP file transfer**: `scp get host:/path`, `scp put host:/path file` — password and key auth
+* **wget**: `wget http://...` and `wget ftp://...` — one-shot file downloads with progress
 * **256-color & true-color**: xterm-256color with RGB support via Color QuickDraw, bold, italic, underline, reverse video
 * **Symbol font**: custom bitmap font for box drawing, block elements, shading, and geometric shapes — seamless rendering at all font sizes
 * **Color themes**: load iTerm2-compatible `.sttheme` files, or use built-in Dark (Tango) and Light palettes
