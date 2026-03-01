@@ -14,6 +14,7 @@
 #include <string.h>
 
 #include <Sound.h>
+#include <Resources.h>
 #include <QDOffscreen.h>
 
 #include <vterm.h>
@@ -79,10 +80,12 @@ static int ensure_row_gworld(int width, int height)
 		bounds.left = 0;
 		bounds.bottom = height;
 		bounds.right = width;
-		/* 32-bit GWorld: fully isolated, own GDevice, no CLUT involvement.
-		   RGB values map directly to pixels — no palette lookup, no color
-		   matching, no depth conversion inside the offscreen buffer. */
-		err = NewGWorld(&g_row_gworld, 32, &bounds, NULL, NULL, 0);
+		/* Depth 0 = match deepest screen. On an 8-bit display this creates
+		   an 8-bit GWorld so CopyBits is a fast byte copy (no depth
+		   conversion). With SetGWorld(gw, screen_gd), Color2Index uses
+		   the screen's CLUT, producing correct pixel values for both
+		   the GWorld and the screen. */
+		err = NewGWorld(&g_row_gworld, 0, &bounds, NULL, NULL, 0);
 		if (err != noErr || g_row_gworld == NULL)
 		{
 			g_row_gworld = NULL;
@@ -1586,7 +1589,24 @@ void draw_screen(struct window_context* wc, Rect* r)
 
 	/* draw scrollbar and grow icon */
 	DrawControls(wc->win);
-	DrawGrowIcon(wc->win);
+
+	/* Clip DrawGrowIcon to the scrollbar column only.
+	   Without clipping, DrawGrowIcon draws a horizontal divider line
+	   across the entire content area (for a nonexistent horizontal
+	   scrollbar), producing a visible black line in the terminal. */
+	{
+		Rect grow_clip;
+		RgnHandle old_clip = NewRgn();
+		GetClip(old_clip);
+		grow_clip.top = wc->win->portRect.top;
+		grow_clip.left = wc->win->portRect.right - 16;
+		grow_clip.bottom = wc->win->portRect.bottom;
+		grow_clip.right = wc->win->portRect.right;
+		ClipRect(&grow_clip);
+		DrawGrowIcon(wc->win);
+		SetClip(old_clip);
+		DisposeRgn(old_clip);
+	}
 }
 
 void sync_scrollbar(struct window_context* wc)
@@ -2188,6 +2208,37 @@ void init_font_metrics(void)
 	con.cell_height = fi.ascent + fi.descent + fi.leading + 1;
 	font_ascent = fi.ascent;
 	con.cell_width = CharWidth(' ');
+
+	/* Pin the symbol font FOND and all NFNT resources in memory.
+	   These are marked purgeable in symbolfont.r, so under memory pressure
+	   the Memory Manager can purge them. When purged, the Font Manager
+	   can't find the font and falls back to system font — rendering block
+	   elements and box drawing chars as wrong glyphs (small diamonds).
+	   Pinning them costs ~25KB but prevents the intermittent glyph bug. */
+	{
+		Handle h;
+		int i;
+		h = GetResource('FOND', SYMF_FAMILY_ID);
+		if (h) HNoPurge(h);
+		for (i = 0; i < 7; i++)
+		{
+			h = GetResource('NFNT', SYMF_FAMILY_ID + i);
+			if (h) HNoPurge(h);
+		}
+	}
+
+	/* Force the Font Manager to fully load and cache the symbol font
+	   strike for the current size. Just pinning the resources isn't
+	   enough — the Font Manager needs to parse the FOND and build its
+	   internal glyph cache. GetFontInfo forces this to happen. Without
+	   this, the first draw on slow machines hits before the cache is
+	   built, producing wrong glyphs. */
+	TextFont(SYMF_FAMILY_ID);
+	TextSize(prefs.font_size);
+	{
+		FontInfo sym_fi;
+		GetFontInfo(&sym_fi);
+	}
 
 	TextFont(save_font);
 	TextSize(save_font_size);
