@@ -24,6 +24,7 @@
 #include <Processes.h>
 #include <TextUtils.h>
 #include <Threads.h>
+#include <Aliases.h>
 
 #include <mbedtls/md5.h>
 #include <mbedtls/sha1.h>
@@ -270,6 +271,18 @@ static OSErr resolve_path(int idx, const char* path, FSSpec* spec)
 	return FSMakeFSSpec(s->shell_vRefNum, s->shell_dirID, pname, spec);
 }
 
+/* Resolve path and follow Finder aliases.  Like resolve_path but also
+   resolves aliases to their targets.  No-op if file is not an alias. */
+static OSErr resolve_path_alias(int idx, const char* path, FSSpec* spec)
+{
+	OSErr err;
+	Boolean isFolder, wasAlias;
+	err = resolve_path(idx, path, spec);
+	if (err != noErr) return err;
+	err = ResolveAliasFile(spec, true, &isFolder, &wasAlias);
+	return err;
+}
+
 /* check if an FSSpec points to a directory */
 static int is_directory(FSSpec* spec)
 {
@@ -475,7 +488,7 @@ static int glob_resolve_dir(int idx, const char* target,
 		dir_path[dlen] = '\0';
 
 		FSSpec dir_spec;
-		OSErr e = resolve_path(idx, dir_path, &dir_spec);
+		OSErr e = resolve_path_alias(idx, dir_path, &dir_spec);
 		if (e != noErr || !is_directory(&dir_spec)) return -1;
 		*out_vRef = dir_spec.vRefNum;
 		*out_dID = get_dir_id(&dir_spec);
@@ -932,7 +945,7 @@ static void cmd_ls(int idx, int argc, char* argv[])
 		else
 		{
 			FSSpec tspec;
-			OSErr e = resolve_path(idx, argv[argi], &tspec);
+			OSErr e = resolve_path_alias(idx, argv[argi], &tspec);
 			if (e != noErr)
 			{
 				vt_write(idx, "ls: cannot access '");
@@ -954,7 +967,7 @@ static void cmd_ls(int idx, int argc, char* argv[])
 		else
 		{
 			FSSpec tspec;
-			OSErr e = resolve_path(idx, argv[argi], &tspec);
+			OSErr e = resolve_path_alias(idx, argv[argi], &tspec);
 			if (e != noErr) continue;
 			if (!is_directory(&tspec))
 				ls_show_file(idx, &tspec, long_fmt);
@@ -973,7 +986,7 @@ static void cmd_ls(int idx, int argc, char* argv[])
 		else
 		{
 			FSSpec tspec;
-			OSErr e = resolve_path(idx, argv[argi], &tspec);
+			OSErr e = resolve_path_alias(idx, argv[argi], &tspec);
 			if (e != noErr) continue;
 			if (is_directory(&tspec))
 			{
@@ -1005,7 +1018,7 @@ static void cmd_cd(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[1], &spec);
+	OSErr e = resolve_path_alias(idx, argv[1], &spec);
 
 	/* fnfErr with parID set means the parent exists but name doesn't,
 	   but for ".." resolve_path returns "::" which FSMakeFSSpec handles */
@@ -1076,7 +1089,7 @@ static void cmd_cat(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[1], &spec);
+	OSErr e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "cat: file not found: ");
@@ -1447,7 +1460,7 @@ static void cmd_touch(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[1], &spec);
+	OSErr e = resolve_path_alias(idx, argv[1], &spec);
 
 	if (e == fnfErr)
 	{
@@ -1518,7 +1531,7 @@ static void cmd_cp(int idx, int argc, char* argv[])
 	}
 
 	FSSpec src_spec, dst_spec;
-	OSErr e = resolve_path(idx, argv[1], &src_spec);
+	OSErr e = resolve_path_alias(idx, argv[1], &src_spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "cp: source not found\r\n");
@@ -1624,7 +1637,7 @@ static void cmd_getinfo(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[1], &spec);
+	OSErr e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "getinfo: not found: ");
@@ -1759,7 +1772,7 @@ static void cmd_chown(int idx, int argc, char* argv[])
 	char* crea_str = colon + 1;
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "chown: file not found\r\n");
@@ -1791,7 +1804,7 @@ static void cmd_settype(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr) { vt_write(idx, "settype: file not found\r\n"); return; }
 
 	FInfo finfo;
@@ -1878,7 +1891,7 @@ static void cmd_fixtype(int idx, int argc, char* argv[])
 			FInfo finfo;
 			OSType ftype, fcreator;
 
-			if (resolve_path(idx, argv[argi], &spec) != noErr)
+			if (resolve_path_alias(idx, argv[argi], &spec) != noErr)
 			{
 				printf_s(idx, "fixtype: %s: not found\r\n", argv[argi]);
 				skipped++;
@@ -1923,7 +1936,7 @@ static void cmd_setcreator(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr) { vt_write(idx, "setcreator: file not found\r\n"); return; }
 
 	FInfo finfo;
@@ -1943,7 +1956,7 @@ static void cmd_chmod(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr) { vt_write(idx, "chmod: file not found\r\n"); return; }
 
 	if (strcmp(argv[1], "-w") == 0)
@@ -1970,7 +1983,7 @@ static void cmd_chattr(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr) { vt_write(idx, "chattr: file not found\r\n"); return; }
 
 	FInfo finfo;
@@ -2022,7 +2035,7 @@ static void cmd_label(int idx, int argc, char* argv[])
 	}
 
 	FSSpec spec;
-	OSErr e = resolve_path(idx, argv[2], &spec);
+	OSErr e = resolve_path_alias(idx, argv[2], &spec);
 	if (e != noErr) { vt_write(idx, "label: file not found\r\n"); return; }
 
 	FInfo finfo;
@@ -2343,7 +2356,7 @@ static void cmd_open(int idx, int argc, char* argv[])
 
 	if (argc < 2) { vt_write(idx, "usage: open <path>\r\n"); return; }
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr) { vt_write(idx, "open: file not found\r\n"); return; }
 
 	e = FSpGetFInfo(&spec, &finfo);
@@ -2909,7 +2922,7 @@ static void cmd_hash(int idx, int argc, char** argv, enum hash_type type)
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, name);
@@ -3068,7 +3081,7 @@ static void cmd_wc(int idx, int argc, char** argv)
 		show_bytes = 1;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "wc: file not found: ");
@@ -3163,7 +3176,7 @@ static void cmd_rot13(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "rot13: file not found: ");
@@ -3283,7 +3296,7 @@ static void cmd_grep(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "grep: file not found: ");
@@ -3434,7 +3447,7 @@ static void cmd_head(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "head: file not found: ");
@@ -3518,7 +3531,7 @@ static void cmd_tail(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "tail: file not found: ");
@@ -3665,7 +3678,7 @@ static void cmd_hexdump(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "hexdump: file not found: ");
@@ -3774,7 +3787,7 @@ static void cmd_strings(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "strings: file not found: ");
@@ -4234,7 +4247,7 @@ static void cmd_nl(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "nl: file not found: ");
@@ -4313,7 +4326,7 @@ static void cmd_cmp(int idx, int argc, char** argv)
 		return;
 	}
 
-	e1 = resolve_path(idx, argv[1], &spec1);
+	e1 = resolve_path_alias(idx, argv[1], &spec1);
 	if (e1 != noErr)
 	{
 		vt_write(idx, "cmp: file not found: ");
@@ -4322,7 +4335,7 @@ static void cmd_cmp(int idx, int argc, char** argv)
 		return;
 	}
 
-	e2 = resolve_path(idx, argv[2], &spec2);
+	e2 = resolve_path_alias(idx, argv[2], &spec2);
 	if (e2 != noErr)
 	{
 		vt_write(idx, "cmp: file not found: ");
@@ -4467,7 +4480,7 @@ static void cmd_rev(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "rev: file not found: ");
@@ -4557,7 +4570,7 @@ static void cmd_lineconv(int idx, int argc, char** argv, enum lineconv_mode mode
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, name);
@@ -4716,7 +4729,7 @@ static void cmd_fold(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "fold: file not found: ");
@@ -4797,7 +4810,7 @@ static void cmd_xxd(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "xxd: file not found: ");
@@ -5074,7 +5087,7 @@ static void cmd_cut(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, filename, &spec);
+	e = resolve_path_alias(idx, filename, &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "cut: file not found: ");
@@ -7621,7 +7634,7 @@ static void cmd_ftp(int idx, int argc, char** argv)
 			Str255 fname;
 			OSErr ferr;
 
-			ferr = resolve_path(idx, local_arg, &fspec);
+			ferr = resolve_path_alias(idx, local_arg, &fspec);
 			if (ferr != noErr)
 			{
 				printf_s(idx, "ftp: %s: not found\r\n", local_arg);
@@ -8810,7 +8823,7 @@ static void cmd_scp(int idx, int argc, char** argv)
 
 		s->scp_glob_pattern[0] = '\0';
 
-		if (resolve_path(idx, argv[local_arg], &spec) != noErr)
+		if (resolve_path_alias(idx, argv[local_arg], &spec) != noErr)
 		{
 			printf_s(idx, "scp: file not found: %s\r\n", argv[local_arg]);
 			return;
@@ -8933,7 +8946,7 @@ static void cmd_realpath(int idx, int argc, char** argv)
 		return;
 	}
 
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e != noErr)
 	{
 		vt_write(idx, "realpath: not found: ");
@@ -8992,7 +9005,7 @@ static void cmd_which(int idx, int argc, char** argv)
 	}
 
 	/* try to resolve the argument as a path */
-	e = resolve_path(idx, argv[1], &spec);
+	e = resolve_path_alias(idx, argv[1], &spec);
 	if (e == noErr && FSpGetFInfo(&spec, &finfo) == noErr && finfo.fdType == 'APPL')
 	{
 		fsspec_to_path(&spec, path, sizeof(path));
@@ -9009,7 +9022,6 @@ static void cmd_which(int idx, int argc, char** argv)
 /* ln -s / readlink - Mac alias creation and resolution               */
 /* ------------------------------------------------------------------ */
 
-#include <Aliases.h>
 #include <Resources.h>
 
 static void cmd_ln(int idx, int argc, char** argv)
@@ -9585,7 +9597,7 @@ static void shell_complete(int idx)
 			dir_part_len = last_sep + 1;
 
 			FSSpec dir_spec;
-			OSErr e = resolve_path(idx, dir_path, &dir_spec);
+			OSErr e = resolve_path_alias(idx, dir_path, &dir_spec);
 			if (e != noErr || !is_directory(&dir_spec)) return;
 			comp_vRef = dir_spec.vRefNum;
 			comp_dID = get_dir_id(&dir_spec);
@@ -9724,7 +9736,7 @@ static void shell_complete(int idx)
 		}
 
 		FSSpec spec;
-		OSErr e = resolve_path(idx, full_match, &spec);
+		OSErr e = resolve_path_alias(idx, full_match, &spec);
 		if (e == noErr && is_directory(&spec))
 		{
 			int cur = s->shell_cursor_pos;
@@ -9927,7 +9939,7 @@ static void shell_execute(int idx, char* line)
 		/* try to resolve as application path */
 		FSSpec spec;
 		FInfo finfo;
-		OSErr e = resolve_path(idx, cmd, &spec);
+		OSErr e = resolve_path_alias(idx, cmd, &spec);
 		if (e == noErr && FSpGetFInfo(&spec, &finfo) == noErr
 			&& finfo.fdType == 'APPL')
 		{
