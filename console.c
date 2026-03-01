@@ -14,11 +14,99 @@
 #include <string.h>
 
 #include <Sound.h>
+#include <QDOffscreen.h>
 
 #include <vterm.h>
 
 #define MAX(x, y) (((x) > (y)) ? (x) : (y))
 #define MIN(x, y) (((x) < (y)) ? (x) : (y))
+
+/* ---- dirty region tracking ---- */
+
+static void mark_dirty(struct session* s, int start_row, int end_row)
+{
+	if (s->dirty_start_row < 0)
+	{
+		s->dirty_start_row = start_row;
+		s->dirty_end_row = end_row;
+	}
+	else
+	{
+		if (start_row < s->dirty_start_row) s->dirty_start_row = start_row;
+		if (end_row > s->dirty_end_row) s->dirty_end_row = end_row;
+	}
+}
+
+static void mark_full_dirty(struct session* s)
+{
+	s->force_full_redraw = 1;
+}
+
+static void clear_dirty(struct session* s)
+{
+	s->dirty_start_row = -1;
+	s->dirty_end_row = -1;
+	s->force_full_redraw = 0;
+}
+
+void console_mark_full_dirty(int session_idx)
+{
+	if (session_idx >= 0 && session_idx < MAX_SESSIONS && sessions[session_idx].in_use)
+		mark_full_dirty(&sessions[session_idx]);
+}
+
+/* ---- GWorld row buffer for flicker-free rendering ---- */
+
+static GWorldPtr g_row_gworld = NULL;
+static int g_row_gw_width = 0;
+static int g_row_gw_height = 0;
+
+static int ensure_row_gworld(int width, int height)
+{
+	if (g_row_gworld != NULL && g_row_gw_width >= width && g_row_gw_height >= height)
+		return 1;
+
+	if (g_row_gworld != NULL)
+	{
+		DisposeGWorld(g_row_gworld);
+		g_row_gworld = NULL;
+	}
+
+	{
+		Rect bounds;
+		QDErr err;
+		bounds.top = 0;
+		bounds.left = 0;
+		bounds.bottom = height;
+		bounds.right = width;
+		/* 32-bit GWorld: fully isolated, own GDevice, no CLUT involvement.
+		   RGB values map directly to pixels — no palette lookup, no color
+		   matching, no depth conversion inside the offscreen buffer. */
+		err = NewGWorld(&g_row_gworld, 32, &bounds, NULL, NULL, 0);
+		if (err != noErr || g_row_gworld == NULL)
+		{
+			g_row_gworld = NULL;
+			g_row_gw_width = 0;
+			g_row_gw_height = 0;
+			return 0;
+		}
+	}
+
+	g_row_gw_width = width;
+	g_row_gw_height = height;
+	return 1;
+}
+
+void cleanup_row_gworld(void)
+{
+	if (g_row_gworld != NULL)
+	{
+		DisposeGWorld(g_row_gworld);
+		g_row_gworld = NULL;
+	}
+	g_row_gw_width = 0;
+	g_row_gw_height = 0;
+}
 
 /* active session for a given window context */
 #define WC_S(wc) sessions[(wc)->session_ids[(wc)->active_session_idx]]
@@ -151,6 +239,18 @@ static void set_draw_bg(int idx)
 	}
 }
 
+/* Fill a rect with a resolved color index using PaintRect.
+   This avoids EraseRect entirely — EraseRect depends on bkColor/bkPat
+   port state which behaves unpredictably in offscreen GWorlds.
+   PaintRect with qd.white pen pattern forces foreground color into
+   every pixel deterministically. */
+static void fill_rect_color(int color_idx, Rect* r)
+{
+	set_draw_fg(color_idx);
+	PenPat(&qd.white);
+	PaintRect(r);
+	PenNormal();
+}
 
 static int symbol_font_lookup(uint32_t cp);
 
@@ -472,8 +572,11 @@ inline void draw_char(struct window_context* wc, int x, int y, Rect* r, char c)
 void toggle_cursor(struct window_context* wc)
 {
 	WC_S(wc).cursor_state = !WC_S(wc).cursor_state;
-	Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
-	InvalRect(&cursor);
+	mark_dirty(&WC_S(wc), WC_S(wc).cursor_y, WC_S(wc).cursor_y + 1);
+	{
+		Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
+		InvalRect(&cursor);
+	}
 	wc->needs_redraw = 1;
 }
 
@@ -509,10 +612,12 @@ void clear_selection(struct window_context* wc)
 
 void damage_selection(struct window_context* wc)
 {
-	// damage all rows that have part of the selection (TODO make this better)
-	Rect topleft = cell_rect(wc, 0, MIN(WC_S(wc).select_start_y, WC_S(wc).select_end_y), (wc->win->portRect));
-	Rect bottomright = cell_rect(wc, wc->size_x, MAX(WC_S(wc).select_start_y, WC_S(wc).select_end_y), (wc->win->portRect));
+	int min_row = MIN(WC_S(wc).select_start_y, WC_S(wc).select_end_y);
+	int max_row = MAX(WC_S(wc).select_start_y, WC_S(wc).select_end_y);
+	Rect topleft = cell_rect(wc, 0, min_row, (wc->win->portRect));
+	Rect bottomright = cell_rect(wc, wc->size_x, max_row, (wc->win->portRect));
 
+	mark_dirty(&WC_S(wc), min_row, max_row + 1);
 	UnionRect(&topleft, &bottomright, &topleft);
 	InvalRect(&topleft);
 	wc->needs_redraw = 1;
@@ -636,8 +741,8 @@ int tab_bar_click(struct window_context* wc, Point p)
 	if (wc->num_sessions <= 1) return 0;
 	if (p.v >= TAB_BAR_HEIGHT) return 0;
 
-	// figure out which tab was clicked
-	int tab_width = (wc->win->portRect.right - wc->win->portRect.left) / wc->num_sessions;
+	/* figure out which tab was clicked (exclude scrollbar area) */
+	int tab_width = (wc->win->portRect.right - wc->win->portRect.left - 16) / wc->num_sessions;
 	int clicked_tab = p.h / tab_width;
 
 	if (clicked_tab >= wc->num_sessions) clicked_tab = wc->num_sessions - 1;
@@ -755,21 +860,11 @@ size_t get_selection(struct window_context* wc, char** selection)
 	return len;
 }
 
-// TODO: find a way to render this once and then just paste it on
+/* draw_resize_corner is now handled by DrawGrowIcon in draw_screen(),
+   no clip hack needed with a real scrollbar present */
 inline void draw_resize_corner(struct window_context* wc)
 {
-	// draw the grow icon in the bottom right corner, but not the scroll bars
-	// yes, this is really awkward
-	MacRegion bottom_right_corner = { 10, wc->win->portRect};
-	MacRegion* brc = &bottom_right_corner;
-	MacRegion** old = wc->win->clipRgn;
-
-	bottom_right_corner.rgnBBox.top = bottom_right_corner.rgnBBox.bottom - 15;
-	bottom_right_corner.rgnBBox.left = bottom_right_corner.rgnBBox.right - 15;
-
-	wc->win->clipRgn = &brc;
-	DrawGrowIcon(wc->win);
-	wc->win->clipRgn = old;
+	/* no-op: grow icon + scrollbar drawn via DrawControls/DrawGrowIcon in draw_screen */
 }
 
 void draw_tab_bar(struct window_context* wc)
@@ -795,7 +890,7 @@ void draw_tab_bar(struct window_context* wc)
 	TextFace(normal);
 
 	Rect portRect = wc->win->portRect;
-	int total_width = portRect.right - portRect.left;
+	int total_width = portRect.right - portRect.left - 16; /* exclude scrollbar */
 	int tab_width = total_width / wc->num_sessions;
 
 	int active_sid = wc->session_ids[wc->active_session_idx];
@@ -807,7 +902,7 @@ void draw_tab_bar(struct window_context* wc)
 
 		Rect tab_rect;
 		tab_rect.left = portRect.left + tab_idx * tab_width;
-		tab_rect.right = (tab_idx == wc->num_sessions - 1) ? portRect.right : tab_rect.left + tab_width;
+		tab_rect.right = (tab_idx == wc->num_sessions - 1) ? (portRect.left + total_width) : tab_rect.left + tab_width;
 		tab_rect.top = portRect.top;
 		tab_rect.bottom = portRect.top + TAB_BAR_HEIGHT;
 
@@ -958,6 +1053,7 @@ static void draw_run_with_symbols(char* text, char* is_sym, int start, int len)
 	}
 }
 
+
 void draw_screen_color(struct window_context* wc, Rect* r)
 {
 	/* save/restore font and color state */
@@ -965,210 +1061,330 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
 	RGBColor save_fg, save_bg;
+	GWorldPtr saved_port;
+	GDHandle saved_gd;
+	PixMapHandle row_pm = NULL;
+	int use_gworld;
+	int row_pixel_width;
+	struct session* cur_s;
+	int draw_start, draw_end;
+
 	GetForeColor(&save_fg);
 	GetBackColor(&save_bg);
 
+	cur_s = &WC_S(wc);
+
+	/* determine dirty row range */
+	if (cur_s->force_full_redraw || cur_s->dirty_start_row < 0)
+	{
+		draw_start = 0;
+		draw_end = wc->size_y;
+	}
+	else
+	{
+		draw_start = cur_s->dirty_start_row;
+		draw_end = cur_s->dirty_end_row;
+		if (draw_start < 0) draw_start = 0;
+		if (draw_end > wc->size_y) draw_end = wc->size_y;
+	}
+	clear_dirty(cur_s);
+
+	/* Save current port + GDevice BEFORE switching to GWorld.
+	   The window's GDevice has gdType=directType on color displays.
+	   We pass this device to SetGWorld so Color QuickDraw uses direct
+	   RGB color mapping (Color2Index truncates RGB components) instead
+	   of the GWorld's own device which may have gdType=clutType and
+	   would use indexed CLUT lookup — producing shifted/wrong colors.
+	   See Apple TN "Realistic Color for Real-World Applications". */
+	GetGWorld(&saved_port, &saved_gd);
+
+	row_pixel_width = wc->size_x * con.cell_width;
+	use_gworld = ensure_row_gworld(row_pixel_width, con.cell_height);
+	if (use_gworld)
+	{
+		row_pm = GetGWorldPixMap(g_row_gworld);
+		if (!LockPixels(row_pm))
+			use_gworld = 0;
+	}
+
+	/* Set up font state on window port (used for fallback and restored after) */
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
 	TextFace(normal);
-	RGBBackColor(&prefs.theme_bg);
-	RGBForeColor(&prefs.theme_fg);
 	TextMode(srcOr);
 
-	int select_start = -1;
-	int select_end = -1;
-	int i = 0;
-
-	// only draw selection if we're not in clicky mode
-	if (WC_S(wc).mouse_mode == CLICK_SELECT)
 	{
-		if (WC_S(wc).mouse_state) update_selection_end(wc);
+		int select_start = -1;
+		int select_end = -1;
+		int i;
 
-		if (WC_S(wc).select_start_x != -1)
+		/* compute selection range */
+		if (WC_S(wc).mouse_mode == CLICK_SELECT)
 		{
-			int a = WC_S(wc).select_start_x + WC_S(wc).select_start_y * wc->size_x;
-			int b = WC_S(wc).select_end_x + WC_S(wc).select_end_y * wc->size_x;
+			if (WC_S(wc).mouse_state) update_selection_end(wc);
 
-			if (a < b)
+			if (WC_S(wc).select_start_x != -1)
 			{
-				select_start = a;
-				select_end = b;
-			}
-			else
-			{
-				select_start = b;
-				select_end = a;
+				int a = WC_S(wc).select_start_x + WC_S(wc).select_start_y * wc->size_x;
+				int b = WC_S(wc).select_end_x + WC_S(wc).select_end_y * wc->size_x;
+
+				if (a < b) { select_start = a; select_end = b; }
+				else { select_start = b; select_end = a; }
 			}
 		}
-	}
 
-	VTermScreenCell vtsc = {0};
-	VTermScreenCell run_start = {0};
-	VTermPos pos = {.row = 0, .col = 0};
-
-	char row_text[wc->size_x];
-	char row_is_symbol[wc->size_x];
-	Rect run_rect;
-	short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	int vertical_offset = r->top + font_ascent + 2 + top_offset;
-	int run_start_col, run_length;
-	short run_face, next_face;
-	int run_inverted;
-	int run_fg, run_bg;
-	int ok = 0;
-
-	for (pos.row = 0; pos.row < wc->size_y; pos.row++)
-	{
-		pos.col = 0;
-		ok = get_cell_scrolled(wc, pos.row, 0, &run_start);
-		run_length = 0;
-		run_start_col = 0;
-
-		run_rect = cell_rect(wc, 0, pos.row, wc->win->portRect);
-
-		run_inverted = run_start.attrs.reverse ^ (i < select_end && i >= select_start);
-
-		run_fg = extract_fg(&run_start);
-		run_bg = extract_bg(&run_start);
-
-		run_face = normal;
-		if (run_start.attrs.bold) run_face |= (condense|bold);
-		if (run_start.attrs.italic) run_face |= (condense|italic);
-		if (run_start.attrs.underline) run_face |= underline;
-
-		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
 		{
-			int cell_fg, cell_bg;
-			int sym_code;
-			ok = get_cell_scrolled(wc, pos.row, pos.col, &vtsc);
+			VTermScreenCell vtsc = {0};
+			VTermScreenCell run_start_cell = {0};
+			VTermPos pos = {.row = 0, .col = 0};
 
-			uint32_t glyph = vtsc.chars[0];
-			uint32_t orig_cp = glyph;
+			char row_text[wc->size_x];
+			char row_is_symbol[wc->size_x];
+			Rect run_rect;
+			short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+			int vertical_offset = r->top + font_ascent + 2 + top_offset + draw_start * con.cell_height;
+			int run_start_col, run_length;
+			short run_face, next_face;
+			int run_inverted;
+			int run_fg, run_bg;
+			int ok = 0;
 
-			if (glyph == 0) glyph = ' ';
+			/* advance i counter to match draw_start */
+			i = draw_start * wc->size_x;
 
-			/* For scrollback cells, strike bit = symbol font flag (we set it).
-			   For live cells, strike = actual strikethrough — ignore it. */
-			if (WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset)
-				row_is_symbol[pos.col] = vtsc.attrs.strike ? 1 : 0;
-			else
-				row_is_symbol[pos.col] = 0;
-
-			// normalize some unicode (only for live cells — scrollback is pre-normalized)
-			if (glyph > 127 && !(WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset))
+			for (pos.row = draw_start; pos.row < draw_end; pos.row++)
 			{
-				/* try symbol font first — handles chars like U+00B7 that
-				   have Mac Roman equivalents but render poorly in Monaco */
-				sym_code = symbol_font_lookup(orig_cp);
-				if (sym_code >= 0)
+				Rect win_row_rect;
+				Rect gw_full;
+
+				/* compute window-space row rect for this row */
 				{
-					glyph = sym_code;
-					row_is_symbol[pos.col] = 1;
+					Rect first_cell = cell_rect(wc, 0, pos.row, wc->win->portRect);
+					Rect last_cell = cell_rect(wc, wc->size_x - 1, pos.row, wc->win->portRect);
+					win_row_rect.top = first_cell.top;
+					win_row_rect.left = first_cell.left;
+					win_row_rect.bottom = first_cell.bottom;
+					win_row_rect.right = last_cell.right;
 				}
-				else if (glyph <= 0xFFFF)
+
+				if (use_gworld)
 				{
-					glyph = UNICODE_BMP_NORMALIZER[glyph];
-					/* if we got lozenge fallback, try Mac Roman overrides */
-					if ((char)glyph == MAC_ROMAN_LOZENGE && orig_cp > 127)
+					/* Switch drawing to GWorld but keep window's GDevice.
+					   KEY FIX: saved_gd is the window's directType GDevice.
+					   This makes Color2Index use direct RGB truncation for
+					   RGBForeColor/DrawText — not CLUT lookup. */
+					SetGWorld(g_row_gworld, saved_gd);
+
+					/* Reset drawing state in GWorld port */
+					TextFont(kFontIDMonaco);
+					TextSize(prefs.font_size);
+					TextFace(normal);
+					TextMode(srcOr);
+
+					/* GWorld row rect: origin at (0,0) */
+					gw_full.top = 0;
+					gw_full.left = 0;
+					gw_full.bottom = con.cell_height;
+					gw_full.right = row_pixel_width;
+
+					/* Fill entire row with default background.
+					   With the window's directType GDevice active, RGBBackColor
+					   maps correctly via Color2Index — EraseRect works. */
+					set_draw_bg(COLOR_DEFAULT_BG);
+					EraseRect(&gw_full);
+				}
+				else
+				{
+					/* Fallback: draw directly to window */
+					RGBBackColor(&prefs.theme_bg);
+					EraseRect(&win_row_rect);
+				}
+
+				pos.col = 0;
+				ok = get_cell_scrolled(wc, pos.row, 0, &run_start_cell);
+				run_length = 0;
+				run_start_col = 0;
+
+				if (use_gworld)
+				{
+					run_rect.top = 0;
+					run_rect.left = 0;
+					run_rect.bottom = con.cell_height;
+					run_rect.right = con.cell_width;
+				}
+				else
+				{
+					run_rect = cell_rect(wc, 0, pos.row, wc->win->portRect);
+				}
+
+				run_inverted = run_start_cell.attrs.reverse ^ (i < select_end && i >= select_start);
+				run_fg = extract_fg(&run_start_cell);
+				run_bg = extract_bg(&run_start_cell);
+
+				run_face = normal;
+				if (run_start_cell.attrs.bold) run_face |= (condense|bold);
+				if (run_start_cell.attrs.italic) run_face |= (condense|italic);
+				if (run_start_cell.attrs.underline) run_face |= underline;
+
+				for (pos.col = 0; pos.col < wc->size_x; pos.col++)
+				{
+					int cell_fg, cell_bg;
+					int sym_code;
+					ok = get_cell_scrolled(wc, pos.row, pos.col, &vtsc);
+
 					{
-						switch (orig_cp)
+						uint32_t glyph = vtsc.chars[0];
+						uint32_t orig_cp = glyph;
+
+						if (glyph == 0) glyph = ' ';
+
+						if (WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset)
+							row_is_symbol[pos.col] = vtsc.attrs.strike ? 1 : 0;
+						else
+							row_is_symbol[pos.col] = 0;
+
+						if (glyph > 127 && !(WC_S(wc).scroll_offset > 0 && pos.row < WC_S(wc).scroll_offset))
 						{
-							case 0x2014: glyph = 0xD1; break; /* em dash */
-							case 0x2013: glyph = 0xD0; break; /* en dash */
-							case 0x2018: glyph = 0xD4; break; /* left single quote */
-							case 0x2019: glyph = 0xD5; break; /* right single quote */
-							case 0x201C: glyph = 0xD2; break; /* left double quote */
-							case 0x201D: glyph = 0xD3; break; /* right double quote */
-							case 0x2026: glyph = 0xC9; break; /* ellipsis */
-							case 0x2122: glyph = 0xAA; break; /* trademark */
+							sym_code = symbol_font_lookup(orig_cp);
+							if (sym_code >= 0)
+							{
+								glyph = sym_code;
+								row_is_symbol[pos.col] = 1;
+							}
+							else if (glyph <= 0xFFFF)
+							{
+								glyph = UNICODE_BMP_NORMALIZER[glyph];
+								if ((char)glyph == MAC_ROMAN_LOZENGE && orig_cp > 127)
+								{
+									switch (orig_cp)
+									{
+										case 0x2014: glyph = 0xD1; break;
+										case 0x2013: glyph = 0xD0; break;
+										case 0x2018: glyph = 0xD4; break;
+										case 0x2019: glyph = 0xD5; break;
+										case 0x201C: glyph = 0xD2; break;
+										case 0x201D: glyph = 0xD3; break;
+										case 0x2026: glyph = 0xC9; break;
+										case 0x2122: glyph = 0xAA; break;
+									}
+								}
+							}
+							else
+							{
+								glyph = MAC_ROMAN_LOZENGE;
+							}
 						}
+
+						row_text[pos.col] = glyph;
 					}
+
+					next_face = normal;
+					if (vtsc.attrs.bold) next_face |= (condense|bold);
+					if (vtsc.attrs.italic) next_face |= (condense|italic);
+					if (vtsc.attrs.underline) next_face |= underline;
+
+					cell_fg = extract_fg(&vtsc);
+					cell_bg = extract_bg(&vtsc);
+
+					if (cell_fg != run_fg || cell_bg != run_bg || next_face != run_face || (vtsc.attrs.reverse ^ (i < select_end && i >= select_start)) != run_inverted)
+					{
+						int paint_bg = run_inverted ? run_fg : run_bg;
+						int paint_fg = run_inverted ? run_bg : run_fg;
+
+						set_draw_bg(paint_bg);
+						EraseRect(&run_rect);
+						set_draw_fg(paint_fg);
+
+						if (use_gworld)
+							MoveTo(run_start_col * con.cell_width, font_ascent);
+						else
+							MoveTo(run_rect.left, vertical_offset);
+
+						TextFace(run_face);
+						TextFont(kFontIDMonaco);
+						draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
+
+						run_inverted = vtsc.attrs.reverse ^ (i < select_end && i >= select_start);
+						run_fg = cell_fg;
+						run_bg = cell_bg;
+						run_face = next_face;
+						run_start_col = pos.col;
+
+						if (use_gworld)
+						{
+							run_rect.left = pos.col * con.cell_width;
+							run_rect.right = run_rect.left + con.cell_width;
+							run_rect.top = 0;
+							run_rect.bottom = con.cell_height;
+						}
+						else
+						{
+							run_rect = cell_rect(wc, pos.col, pos.row, wc->win->portRect);
+						}
+
+						run_length = 1;
+					}
+					else
+					{
+						run_length++;
+					}
+
+					if (pos.col == wc->size_x - 1)
+					{
+						int paint_bg = run_inverted ? run_fg : run_bg;
+						int paint_fg = run_inverted ? run_bg : run_fg;
+
+						set_draw_bg(paint_bg);
+						EraseRect(&run_rect);
+						set_draw_fg(paint_fg);
+
+						if (use_gworld)
+							MoveTo(run_start_col * con.cell_width, font_ascent);
+						else
+							MoveTo(run_rect.left, vertical_offset);
+
+						TextFace(run_face);
+						TextFont(kFontIDMonaco);
+						draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
+					}
+					else
+					{
+						run_rect.right += con.cell_width;
+					}
+
+					i++;
 				}
-				else
+
+				if (use_gworld)
 				{
-					glyph = MAC_ROMAN_LOZENGE;
-				}
-			}
+					Rect gw_src;
 
-			row_text[pos.col] = glyph;
+					/* Switch back to window port for CopyBits */
+					SetGWorld(saved_port, saved_gd);
 
-			next_face = normal;
-			if (vtsc.attrs.bold) next_face |= (condense|bold);
-			if (vtsc.attrs.italic) next_face |= (condense|italic);
-			if (vtsc.attrs.underline) next_face |= underline;
+					gw_src.top = 0;
+					gw_src.left = 0;
+					gw_src.bottom = con.cell_height;
+					gw_src.right = row_pixel_width;
 
-			cell_fg = extract_fg(&vtsc);
-			cell_bg = extract_bg(&vtsc);
-
-			/* if we cannot add this cell to the run */
-			if (cell_fg != run_fg || cell_bg != run_bg || next_face != run_face || (vtsc.attrs.reverse ^ (i < select_end && i >= select_start)) != run_inverted)
-			{
-				/* draw what we've got so far */
-				if (run_inverted)
-				{
-					set_draw_bg(run_fg);
-					set_draw_fg(run_bg);
-				}
-				else
-				{
-					set_draw_bg(run_bg);
-					set_draw_fg(run_fg);
+					CopyBits((BitMap*)*row_pm, &wc->win->portBits,
+					         &gw_src, &win_row_rect, srcCopy, NULL);
 				}
 
-				EraseRect(&run_rect);
-				MoveTo(run_rect.left, vertical_offset);
-				TextFace(run_face);
-				TextFont(kFontIDMonaco);
-				draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
-
-				/* then reset everything to start a new run */
-				run_inverted = vtsc.attrs.reverse ^ (i < select_end && i >= select_start);
-				run_fg = cell_fg;
-				run_bg = cell_bg;
-				run_face = next_face;
-				run_start_col = pos.col;
-				run_rect = cell_rect(wc, pos.col, pos.row, wc->win->portRect);
-				run_length = 1;
+				vertical_offset += con.cell_height;
 			}
-			else
-			{
-				run_length++;
-			}
-
-			/* if we're at the last cell in the row, draw the run */
-			if (pos.col == wc->size_x - 1)
-			{
-				if (run_inverted)
-				{
-					set_draw_bg(run_fg);
-					set_draw_fg(run_bg);
-				}
-				else
-				{
-					set_draw_bg(run_bg);
-					set_draw_fg(run_fg);
-				}
-
-				EraseRect(&run_rect);
-				MoveTo(run_rect.left, vertical_offset);
-				TextFace(run_face);
-				TextFont(kFontIDMonaco);
-				draw_run_with_symbols(row_text, row_is_symbol, run_start_col, run_length);
-			}
-			else
-			{
-				run_rect.right += con.cell_width;
-			}
-
-			i++;
 		}
-
-		vertical_offset += con.cell_height;
 	}
+
+	if (use_gworld)
+		UnlockPixels(row_pm);
+
+	/* Ensure we're on the window port for cursor + cleanup */
+	SetGWorld(saved_port, saved_gd);
 
 	TextFont(kFontIDMonaco);
 
-	/* do the cursor if needed */
+	/* do the cursor if needed - InvertRect is atomic, draw directly to window */
 	if (WC_S(wc).cursor_state && WC_S(wc).cursor_visible)
 	{
 		Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
@@ -1183,7 +1399,6 @@ void draw_screen_color(struct window_context* wc, Rect* r)
 
 	draw_resize_corner(wc);
 }
-
 void erase_row(struct window_context* wc, int i)
 {
 	Rect left = cell_rect(wc, 0, i, (wc->win->portRect));
@@ -1196,13 +1411,30 @@ void erase_row(struct window_context* wc, int i)
 
 void draw_screen_fast(struct window_context* wc, Rect* r)
 {
-	// don't clobber font settings
 	short save_font      = qd.thePort->txFont;
 	short save_font_size = qd.thePort->txSize;
 	short save_font_face = qd.thePort->txFace;
 	RGBColor save_font_fg, save_font_bg;
 	GetForeColor(&save_font_fg);
 	GetBackColor(&save_font_bg);
+
+	struct session* cur_s = &WC_S(wc);
+	int draw_start, draw_end;
+
+	/* determine dirty row range */
+	if (cur_s->force_full_redraw || cur_s->dirty_start_row < 0)
+	{
+		draw_start = 0;
+		draw_end = wc->size_y;
+	}
+	else
+	{
+		draw_start = cur_s->dirty_start_row;
+		draw_end = cur_s->dirty_end_row;
+		if (draw_start < 0) draw_start = 0;
+		if (draw_end > wc->size_y) draw_end = wc->size_y;
+	}
+	clear_dirty(cur_s);
 
 	TextFont(kFontIDMonaco);
 	TextSize(prefs.font_size);
@@ -1240,103 +1472,92 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 			TextMode(srcCopy);
 	}
 
-	int select_start = -1;
-	int select_end = -1;
-	int i = 0;
-
-	if (WC_S(wc).mouse_mode == CLICK_SELECT)
 	{
-		if (WC_S(wc).mouse_state) update_selection_end(wc);
+		int select_start = -1;
+		int select_end = -1;
+		int i;
 
-		if (WC_S(wc).select_start_x != -1)
+		if (WC_S(wc).mouse_mode == CLICK_SELECT)
 		{
-			int a = WC_S(wc).select_start_x + WC_S(wc).select_start_y * wc->size_x;
-			int b = WC_S(wc).select_end_x + WC_S(wc).select_end_y * wc->size_x;
+			if (WC_S(wc).mouse_state) update_selection_end(wc);
 
-			if (a < b)
+			if (WC_S(wc).select_start_x != -1)
 			{
-				select_start = a;
-				select_end = b;
+				int a = WC_S(wc).select_start_x + WC_S(wc).select_start_y * wc->size_x;
+				int b = WC_S(wc).select_end_x + WC_S(wc).select_end_y * wc->size_x;
+
+				if (a < b) { select_start = a; select_end = b; }
+				else { select_start = b; select_end = a; }
 			}
-			else
+		}
+
+		{
+			VTermPos pos = {.row = 0, .col = 0};
+			char row_text[wc->size_x];
+			char row_invert[wc->size_x];
+			char row_is_symbol[wc->size_x];
+			Rect cr;
+			VTermScreenCell here = {0};
+
+			short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+			int vertical_offset = r->top + font_ascent + 2 + top_offset + draw_start * con.cell_height;
+
+			i = draw_start * wc->size_x;
+
+			for (pos.row = draw_start; pos.row < draw_end; pos.row++)
 			{
-				select_start = b;
-				select_end = a;
+				int col_i;
+				erase_row(wc, pos.row);
+
+				for (pos.col = 0; pos.col < wc->size_x; pos.col++)
+				{
+					int ret = get_cell_scrolled(wc, pos.row, pos.col, &here);
+					uint32_t glyph = here.chars[0];
+					uint32_t orig_cp = glyph;
+					int sym_code;
+					int invert;
+
+					if (glyph == 0) glyph = ' ';
+					row_is_symbol[pos.col] = 0;
+
+					if (glyph > 127)
+					{
+						sym_code = symbol_font_lookup(orig_cp);
+						if (sym_code >= 0)
+						{
+							glyph = sym_code;
+							row_is_symbol[pos.col] = 1;
+						}
+						else if (glyph <= 0xFFFF)
+							glyph = UNICODE_BMP_NORMALIZER[glyph];
+						else
+							glyph = MAC_ROMAN_LOZENGE;
+					}
+
+					row_text[pos.col] = glyph;
+					invert = here.attrs.reverse ^ (i < select_end && i >= select_start);
+					row_invert[pos.col] = invert;
+					i++;
+				}
+
+				MoveTo(r->left + 2, vertical_offset);
+				TextFont(kFontIDMonaco);
+				draw_run_with_symbols(row_text, row_is_symbol, 0, wc->size_x);
+
+				for (col_i = 0; col_i < wc->size_x; col_i++)
+				{
+					if (row_invert[col_i])
+					{
+						cr = cell_rect(wc, col_i, pos.row, wc->win->portRect);
+						InvertRect(&cr);
+					}
+				}
+				vertical_offset += con.cell_height;
 			}
 		}
 	}
 
-	VTermPos pos = {.row = 0, .col = 0};
-
-	char row_text[wc->size_x];
-	char row_invert[wc->size_x];
-	char row_is_symbol[wc->size_x];
-	Rect cr;
-
-	VTermScreenCell here = {0};
-
-	short top_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	int vertical_offset = r->top + font_ascent + 2 + top_offset;
-
-	for (pos.row = 0; pos.row < wc->size_y; pos.row++)
-	{
-		erase_row(wc, pos.row);
-
-		for (pos.col = 0; pos.col < wc->size_x; pos.col++)
-		{
-			int ret = get_cell_scrolled(wc, pos.row, pos.col, &here);
-
-			uint32_t glyph = here.chars[0];
-			uint32_t orig_cp = glyph;
-			int sym_code;
-
-			if (glyph == 0) glyph = ' ';
-
-			row_is_symbol[pos.col] = 0;
-
-			// normalize some unicode
-			if (glyph > 127)
-			{
-				sym_code = symbol_font_lookup(orig_cp);
-				if (sym_code >= 0)
-				{
-					glyph = sym_code;
-					row_is_symbol[pos.col] = 1;
-				}
-				else if (glyph <= 0xFFFF)
-				{
-					glyph = UNICODE_BMP_NORMALIZER[glyph];
-				}
-				else
-				{
-					glyph = MAC_ROMAN_LOZENGE;
-				}
-			}
-
-			row_text[pos.col] = glyph;
-
-			bool invert = here.attrs.reverse ^ (i < select_end && i >= select_start);
-			row_invert[pos.col] = invert;
-
-			i++;
-		}
-
-		MoveTo(r->left + 2, vertical_offset);
-		TextFont(kFontIDMonaco);
-		draw_run_with_symbols(row_text, row_is_symbol, 0, wc->size_x);
-
-		for (int i = 0; i < wc->size_x; i++)
-		{
-			if (row_invert[i])
-			{
-				cr = cell_rect(wc, i, pos.row, wc->win->portRect);
-				InvertRect(&cr);
-			}
-		}
-		vertical_offset += con.cell_height;
-	}
-
-	// do the cursor if needed
+	/* do the cursor if needed */
 	if (WC_S(wc).cursor_state && WC_S(wc).cursor_visible)
 	{
 		Rect cursor = cell_rect(wc, WC_S(wc).cursor_x, WC_S(wc).cursor_y, wc->win->portRect);
@@ -1348,8 +1569,6 @@ void draw_screen_fast(struct window_context* wc, Rect* r)
 	TextFace(save_font_face);
 	RGBForeColor(&save_font_fg);
 	RGBBackColor(&save_font_bg);
-
-	//draw_resize_corner(wc);
 }
 
 void draw_screen(struct window_context* wc, Rect* r)
@@ -1364,6 +1583,23 @@ void draw_screen(struct window_context* wc, Rect* r)
 	{
 		draw_screen_color(wc, r);
 	}
+
+	/* draw scrollbar and grow icon */
+	DrawControls(wc->win);
+	DrawGrowIcon(wc->win);
+}
+
+void sync_scrollbar(struct window_context* wc)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+
+	if (wc->vscroll == NULL) return;
+
+	SetControlMaximum(wc->vscroll, s->sb_count);
+	SetControlValue(wc->vscroll, s->sb_count - s->scroll_offset);
+	HiliteControl(wc->vscroll, s->sb_count > 0 ? 0 : 255);
+	s->scrollbar_dirty = 0;
 }
 
 void ruler(struct window_context* wc, Rect* r)
@@ -1489,6 +1725,8 @@ int movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
 	{
 		wc->needs_redraw = 1;
 		SetPort(wc->win);
+		mark_dirty(s, s->cursor_y, s->cursor_y + 1);
+		mark_dirty(s, pos.row, pos.row + 1);
 		/* invalidate old and new cursor positions */
 		{
 			Rect old_r = cell_rect(wc, s->cursor_x, s->cursor_y, wc->win->portRect);
@@ -1507,13 +1745,22 @@ int movecursor(VTermPos pos, VTermPos oldpos, int visible, void *user)
 int damage(VTermRect rect, void *user)
 {
 	int idx = (int)(intptr_t)user;
+	struct session* s = &sessions[idx];
 	struct window_context* wc = window_for_session(idx);
 
 	if (wc == NULL || idx != wc->session_ids[wc->active_session_idx] || wc->win == NULL) return 1;
 
-	// invalidate so BeginUpdate/EndUpdate has a valid update region
+	mark_dirty(s, rect.start_row, rect.end_row);
+
+	/* invalidate only the damaged cell rows, not the whole window */
 	SetPort(wc->win);
-	InvalRect(&(wc->win->portRect));
+	{
+		Rect top_r = cell_rect(wc, 0, rect.start_row, wc->win->portRect);
+		Rect bot_r = cell_rect(wc, wc->size_x, rect.end_row - 1, wc->win->portRect);
+		Rect inval_r;
+		UnionRect(&top_r, &bot_r, &inval_r);
+		InvalRect(&inval_r);
+	}
 	wc->needs_redraw = 1;
 
 	return 1;
@@ -1624,6 +1871,7 @@ static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
 	if (s->scroll_offset > 0 && s->scroll_offset < s->sb_count)
 		s->scroll_offset++;
 
+	s->scrollbar_dirty = 1;
 	return 1;
 }
 
@@ -1669,6 +1917,7 @@ static int sb_popline(int cols, VTermScreenCell *cells, void *user)
 
 	if (s->scroll_offset > 0) s->scroll_offset--;
 
+	s->scrollbar_dirty = 1;
 	return 1;
 }
 
@@ -1695,6 +1944,8 @@ void scroll_up(struct window_context* wc)
 	else
 		s->scroll_offset += page;
 
+	mark_full_dirty(s);
+	s->scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
 	wc->needs_redraw = 1;
@@ -1711,6 +1962,8 @@ void scroll_down(struct window_context* wc)
 	else
 		s->scroll_offset -= page;
 
+	mark_full_dirty(s);
+	s->scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
 	wc->needs_redraw = 1;
@@ -1724,6 +1977,8 @@ void scroll_up_line(struct window_context* wc)
 	if (s->scroll_offset < s->sb_count)
 		s->scroll_offset++;
 
+	mark_full_dirty(s);
+	s->scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
 	wc->needs_redraw = 1;
@@ -1737,6 +1992,8 @@ void scroll_down_line(struct window_context* wc)
 	if (s->scroll_offset > 0)
 		s->scroll_offset--;
 
+	mark_full_dirty(s);
+	s->scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
 	wc->needs_redraw = 1;
@@ -1747,6 +2004,8 @@ void scroll_reset(struct window_context* wc)
 	int sid = wc->session_ids[wc->active_session_idx];
 	sessions[sid].scroll_offset = 0;
 
+	mark_full_dirty(&sessions[sid]);
+	sessions[sid].scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&wc->win->portRect);
 	wc->needs_redraw = 1;
@@ -1782,8 +2041,24 @@ void font_size_change(struct window_context* wc)
 	TextSize(save_font_size);
 	TextFace(save_font_face);
 
-	short top_extra = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
-	SizeWindow(wc->win, con.cell_width * wc->size_x + 4, con.cell_height * wc->size_y + 4 + top_extra, true);
+	{
+		int fi;
+		for (fi = 0; fi < wc->num_sessions; fi++)
+			mark_full_dirty(&sessions[wc->session_ids[fi]]);
+	}
+
+	{
+		short top_extra = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+		SizeWindow(wc->win, con.cell_width * wc->size_x + 4 + 16, con.cell_height * wc->size_y + 4 + top_extra, true);
+		/* reposition scrollbar after font size change */
+		if (wc->vscroll != NULL)
+		{
+			Rect spr = wc->win->portRect;
+			int sb_tab = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+			MoveControl(wc->vscroll, spr.right - 15, spr.top - 1 + sb_tab);
+			SizeControl(wc->vscroll, 16, (spr.bottom - spr.top) - 13 - sb_tab);
+		}
+	}
 	EraseRect(&(wc->win->portRect));
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;
@@ -1949,6 +2224,7 @@ void update_console_colors(struct window_context* wc)
 		vterm_state_set_bold_highbright(vtermstate, prefs.bold_is_bright);
 	}
 
+	mark_full_dirty(&WC_S(wc));
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;

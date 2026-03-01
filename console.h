@@ -42,3 +42,7 @@ void scroll_down_line(struct window_context* wc);
 void scroll_reset(struct window_context* wc);
 
 void output_callback(const char *s, size_t len, void *user);
+
+void console_mark_full_dirty(int session_idx);
+void sync_scrollbar(struct window_context* wc);
+void cleanup_row_gworld(void);

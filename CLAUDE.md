@@ -217,6 +217,38 @@ Converter: `tools/itermcolors2sttheme.py`
 - Uses `RGBForeColor()`/`RGBBackColor()` exclusively (Color QuickDraw). **Never use indexed `BackColor()`/`ForeColor()`** — on a CGrafPort, once RGB colors are set, indexed calls don't reliably override the RGB fields, causing stale color bleed
 - `draw_screen_fast()` (monochrome mode) unchanged, ignores theme colors
 
+### Dirty Row Tracking
+- Per-session fields: `dirty_start_row`, `dirty_end_row` (inclusive/exclusive range), `force_full_redraw`, `scrollbar_dirty`
+- `mark_dirty(session, start, end)` — union with existing dirty range; `mark_full_dirty()` — sets force flag; `clear_dirty()` — resets after draw
+- `console_mark_full_dirty(session_idx)` — public, called from app.c on resize/tab switch/update events
+- `draw_screen_color()` and `draw_screen_fast()` only loop `dirty_start_row..dirty_end_row` instead of all rows
+- Performance: cursor blink redraws 1 row instead of 24 (~24x fewer cells), single char echo = 1 row
+- Every full-window `InvalRect` path must also call `mark_full_dirty` or `console_mark_full_dirty`
+
+### Vertical Scrollbar
+- `ControlHandle vscroll` per `window_context`, created in `new_window()` with `scrollBarProc`
+- Window width += 16px to accommodate scrollbar; terminal `size_x` computed from `(width - 4 - 16) / cell_width`
+- `sync_scrollbar(wc)` maps `scroll_offset` ↔ control value, called from scroll functions and event handlers
+- `scrollbar_dirty` flag set from `sb_pushline`/`sb_popline` callbacks (no control API from worker threads); main event loop drains flag
+- Scrollbar click handling: `FindControl` → `TrackControl` with action proc for arrows/page parts, direct value read for thumb
+- `ControlActionUPP` cached as module-level global (created once at init, disposed at shutdown)
+
+### GWorld Offscreen Row Buffer (Flicker-Free Rendering)
+- 32-bit GWorld (`g_row_gworld`) holds one row; each dirty row composed offscreen then blitted via `CopyBits`
+- `ensure_row_gworld(width, height)` — creates/reuses GWorld; `cleanup_row_gworld()` — disposed at app exit
+- **CRITICAL: `SetGWorld(g_row_gworld, saved_gd)` — pass the WINDOW's GDevice, NOT NULL**
+  - `SetGWorld(gw, NULL)` uses GWorld's own GDevice which has `gdType=clutType` (indexed)
+  - Color2Index then does CLUT lookup instead of direct RGB truncation → shifted/wrong colors
+  - Apple TN: "Attaching direct pixMaps to indexed devices often yields rather blue results"
+  - `saved_gd` obtained from `GetGWorld(&saved_port, &saved_gd)` before switching to GWorld
+- Background fills: `set_draw_bg()` + `EraseRect()` (works correctly with window's directType GDevice)
+- Text rendering: `TextMode(srcOr)` — paints foreground pixels only, background from EraseRect
+- Per-row pipeline: SetGWorld → EraseRect (bg) → per-run EraseRect+DrawText → SetGWorld back → CopyBits
+- CopyBits: `(BitMap*)*row_pm` → `&wc->win->portBits`, srcCopy, NULL region
+- Cursor drawn directly on window after CopyBits (InvertRect is already atomic)
+- Memory: ~13KB at 8bpp, ~38KB at 24bpp for one row buffer. Negligible
+- Graceful degradation: if `NewGWorld` or `LockPixels` fails, falls back to direct window drawing
+
 ### VTerm Color Internals
 - `VTermColor` is a tagged union: `uint8_t type` at offset 0, `indexed.idx`/`rgb.red` at offset 1 (overlap!)
 - Type flags: `VTERM_COLOR_RGB=0x00`, `VTERM_COLOR_INDEXED=0x01`, `VTERM_COLOR_DEFAULT_FG=0x02`, `VTERM_COLOR_DEFAULT_BG=0x04`
@@ -247,6 +279,7 @@ Converter: `tools/itermcolors2sttheme.py`
 - **Right-Ctrl broken in local shell**: Ctrl+C (cancel line), Ctrl+D (close tab), and nc disconnect all required `controlKey` modifier, but QEMU right-Ctrl sends charcode without modifier. Fix: accept bare charcode 3/4, exclude numpad Enter (vkeycode 0x4C) and End key (vkeycode 0x77) by vkeycode.
 - **Thread lifecycle leaks**: Session slots reused while thread still running. `DisposeThread` never called. Fix: track `thread_id` per session, require `thread_id == kNoThreadID` for slot reuse, `session_reap_thread()` for safe disposal.
 - **Copy selection memory leak**: `get_selection()` allocated buffer but caller never freed it. Fix: `free(selection)` after `PutScrap`.
+- **GWorld offscreen color mapping**: `SetGWorld(gworld, NULL)` sets TheGDevice to the GWorld's own device, which has `gdType=clutType` (indexed). Color2Index uses CLUT lookup instead of direct RGB truncation, producing completely wrong colors (blue→orange, default fg invisible on dark bg). Fix: `SetGWorld(gworld, saved_gd)` — pass the window's screen GDevice (directType) so Color QuickDraw maps RGB correctly. Also, `PaintRect` + `PenPat(&qd.white)` doesn't reliably fill backgrounds in GWorlds with a foreign GDevice; use `set_draw_bg()` + `EraseRect()` instead.
 
 ## Gotchas and Lessons Learned
 
@@ -273,3 +306,5 @@ Converter: `tools/itermcolors2sttheme.py`
 - **Charcode 3 = numpad Enter AND Ctrl+C**: Use vkeycode 0x4C to distinguish. Charcode 4 = End key AND Ctrl+D: use vkeycode 0x77 to distinguish. This applies to both SSH handler (app.c) and local shell (shell.c)
 - **session_reap_thread safety**: Never dispose the currently-running thread. Check `MacGetCurrentThread()` first. Handle `threadNotFoundErr` (thread already gone). Force-stop only as last resort
 - **Symbol font rendering**: `symbolfont.r` defines NFNT resources at IDs 29183-29189. Font family FOND at ID 29183, name "SevenTTY Symbols". Uses a high random ID to avoid classic Mac font ID conflicts with system or third-party fonts. Glyph metrics must exactly match Monaco at each size for seamless tiling
+- **GWorld + SetGWorld GDevice parameter**: Always `SetGWorld(gw, window_gd)`, NEVER `SetGWorld(gw, NULL)`. NULL uses the GWorld's own GDevice (often clutType/indexed), causing Color2Index to use CLUT lookup instead of direct RGB. The window's GDevice is directType and gives correct color mapping. Get it with `GetGWorld(&saved_port, &saved_gd)` before switching. See Apple TN "Realistic Color for Real-World Applications" (1990)
+- **GWorld background fills**: Use `RGBBackColor()` + `EraseRect()`, not `PaintRect` + `PenPat(&qd.white)` hack. The PenPat trick doesn't work reliably in GWorlds with a foreign (window) GDevice. EraseRect works fine once the correct directType GDevice is active

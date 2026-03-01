@@ -152,6 +152,12 @@ struct session
 	int sb_count;   // total lines stored (max SCROLLBACK_LINES)
 	int scroll_offset; // how many lines scrolled back (0 = live)
 
+	/* dirty region tracking: skip unchanged rows during redraw */
+	int dirty_start_row;   /* first dirty row, or -1 if clean */
+	int dirty_end_row;     /* exclusive end row */
+	int force_full_redraw; /* 1 = redraw everything next frame */
+	int scrollbar_dirty;   /* set from sb callbacks; main thread syncs control */
+
 	// which window owns this session
 	int window_id;
 };
@@ -163,6 +169,7 @@ struct window_context
 {
 	int in_use;
 	WindowPtr win;
+	ControlHandle vscroll;         /* vertical scrollbar */
 	int size_x;                    // terminal cols
 	int size_y;                    // terminal rows
 	int session_ids[MAX_SESSIONS]; // indices into sessions[]

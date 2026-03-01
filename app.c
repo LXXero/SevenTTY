@@ -1025,6 +1025,10 @@ void init_session(struct session* s)
 	s->ftp_glob_pattern[0] = '\0';
 	s->ftp_glob_vRefNum = 0;
 	s->ftp_glob_dirID = 0;
+	s->dirty_start_row = -1;
+	s->dirty_end_row = -1;
+	s->force_full_redraw = 1;
+	s->scrollbar_dirty = 1;
 	s->window_id = -1;
 }
 
@@ -1106,12 +1110,21 @@ static void adjust_window_for_tabs(struct window_context* wc, int tabs_appeared)
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;
 
+	/* reposition scrollbar */
+	if (wc->vscroll != NULL)
+	{
+		Rect spr = wc->win->portRect;
+		int sb_tab_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
+		MoveControl(wc->vscroll, spr.right - 15, spr.top - 1 + sb_tab_offset);
+		SizeControl(wc->vscroll, 16, (spr.bottom - spr.top) - 13 - sb_tab_offset);
+	}
+
 	/* recalculate terminal size from new window dims */
 	{
 		Rect npr = wc->win->portRect;
 		int tab_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
 		int usable_height = (npr.bottom - npr.top) - tab_offset;
-		int new_x = (npr.right - npr.left - 4) / con.cell_width;
+		int new_x = (npr.right - npr.left - 4 - 16) / con.cell_width;
 		int new_y = (usable_height - 2) / con.cell_height;
 		int i;
 
@@ -1124,6 +1137,7 @@ static void adjust_window_for_tabs(struct window_context* wc, int tabs_appeared)
 		for (i = 0; i < wc->num_sessions; i++)
 		{
 			int sid = wc->session_ids[i];
+			console_mark_full_dirty(sid);
 			if (sessions[sid].in_use && sessions[sid].vterm)
 			{
 				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
@@ -1198,7 +1212,9 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	/* telnet/nc: connection is started by the shell command after
 	   setting host/port on the session. Don't auto-connect here. */
 
-	// redraw since tab bar may have appeared
+	/* redraw since tab bar may have appeared */
+	console_mark_full_dirty(idx);
+	sessions[idx].scrollbar_dirty = 1;
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;
 
@@ -1314,6 +1330,11 @@ void close_session(int idx)
 			DisableItem(menu, FMENU_CLOSE_TAB);
 	}
 
+	{
+		int new_active = wc->session_ids[wc->active_session_idx];
+		console_mark_full_dirty(new_active);
+		sessions[new_active].scrollbar_dirty = 1;
+	}
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;
@@ -1366,6 +1387,8 @@ void switch_session(struct window_context* wc, int idx)
 	/* update window title to match new active session */
 	set_window_title(wc->win, sessions[idx].tab_label, strlen(sessions[idx].tab_label));
 
+	console_mark_full_dirty(idx);
+	sessions[idx].scrollbar_dirty = 1;
 	SetPort(wc->win);
 	InvalRect(&(wc->win->portRect));
 	wc->needs_redraw = 1;
@@ -1404,16 +1427,26 @@ int new_window(void)
 	initial_window_bounds.left += num_windows * 20;
 
 	initial_window_bounds.bottom = initial_window_bounds.top + con.cell_height * wc->size_y + 4;
-	initial_window_bounds.right = initial_window_bounds.left + con.cell_width * wc->size_x + 4;
+	initial_window_bounds.right = initial_window_bounds.left + con.cell_width * wc->size_x + 4 + 16;
 
-	ConstStr255Param title = "\pSevenTTY " APP_VERSION;
+	{
+		ConstStr255Param title = "\pSevenTTY " APP_VERSION;
+		WindowPtr win = NewCWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
+		Rect sb_rect;
 
-	WindowPtr win = NewCWindow(NULL, &initial_window_bounds, title, true, documentProc, (WindowPtr)-1, true, 0);
+		SetPort(win);
+		EraseRect(&win->portRect);
 
-	SetPort(win);
-	EraseRect(&win->portRect);
+		wc->win = win;
 
-	wc->win = win;
+		/* create vertical scrollbar on right edge */
+		sb_rect.top = win->portRect.top - 1;
+		sb_rect.left = win->portRect.right - 15;
+		sb_rect.bottom = win->portRect.bottom - 14;
+		sb_rect.right = win->portRect.right + 1;
+		wc->vscroll = NewControl(win, &sb_rect, "\p", true, 0, 0, 0, scrollBarProc, 0);
+	}
+
 	num_windows++;
 	active_window = wid;
 
@@ -1584,45 +1617,60 @@ void resize_con_window(struct window_context* wc, EventRecord event)
 
 	int tab_offset = (wc->num_sessions > 1) ? TAB_BAR_HEIGHT : 0;
 
-	// limits on window size
+	/* limits on window size — include 16px for scrollbar */
 	Rect window_limits = { .top = con.cell_height*2 + 2 + tab_offset,
 		.bottom = con.cell_height*100 + 2 + tab_offset,
-		.left = con.cell_width*10 + 4,
-		.right = con.cell_width*200 + 4 };
+		.left = con.cell_width*10 + 4 + 16,
+		.right = con.cell_width*200 + 4 + 16 };
 
-	long growResult = GrowWindow(wc->win, event.where, &window_limits);
-
-	if (growResult != 0)
 	{
-		int height = growResult >> 16;
-		int width = growResult & 0xFFFF;
-		int usable_height = height - tab_offset;
+		long growResult = GrowWindow(wc->win, event.where, &window_limits);
 
-		// 'snap' to a size that won't have extra pixels not in a cell
-		int next_height = height - ((usable_height - 4) % con.cell_height);
-		int next_width = width - ((width - 4) % con.cell_width);
-
-		SizeWindow(wc->win, next_width, next_height, true);
-		EraseRect(&(wc->win->portRect));
-		InvalRect(&(wc->win->portRect));
-		wc->needs_redraw = 1;
-
-		wc->size_x = (next_width - 4)/con.cell_width;
-		wc->size_y = (usable_height - 2)/con.cell_height;
-
-		// update vterm size for all sessions in this window
-		int i;
-		for (i = 0; i < wc->num_sessions; i++)
+		if (growResult != 0)
 		{
-			int sid = wc->session_ids[i];
-			if (sessions[sid].in_use && sessions[sid].vterm)
+			int height = growResult >> 16;
+			int width = growResult & 0xFFFF;
+			int usable_height = height - tab_offset;
+			int content_width = width - 16; /* subtract scrollbar */
+			int next_height, next_width;
+			int i;
+
+			/* snap to cell grid (content area only, then add scrollbar back) */
+			next_height = height - ((usable_height - 4) % con.cell_height);
+			next_width = content_width - ((content_width - 4) % con.cell_width) + 16;
+
+			SizeWindow(wc->win, next_width, next_height, true);
+			EraseRect(&(wc->win->portRect));
+			InvalRect(&(wc->win->portRect));
+			wc->needs_redraw = 1;
+
+			wc->size_x = (next_width - 4 - 16) / con.cell_width;
+			wc->size_y = (usable_height - 2) / con.cell_height;
+
+			/* reposition scrollbar */
+			if (wc->vscroll != NULL)
 			{
-				vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
-				if (sessions[sid].type == SESSION_SSH)
-					ssh_request_pty_resize(sid, wc->size_x, wc->size_y);
-				if (sessions[sid].type == SESSION_TELNET)
-					telnet_send_naws(sid);
+				Rect pr = wc->win->portRect;
+				MoveControl(wc->vscroll, pr.right - 15, pr.top - 1 + tab_offset);
+				SizeControl(wc->vscroll, 16, (pr.bottom - pr.top) - 13 - tab_offset);
 			}
+
+			/* update vterm size for all sessions in this window */
+			for (i = 0; i < wc->num_sessions; i++)
+			{
+				int sid = wc->session_ids[i];
+				console_mark_full_dirty(sid);
+				if (sessions[sid].in_use && sessions[sid].vterm)
+				{
+					vterm_set_size(sessions[sid].vterm, wc->size_y, wc->size_x);
+					if (sessions[sid].type == SESSION_SSH)
+						ssh_request_pty_resize(sid, wc->size_x, wc->size_y);
+					if (sessions[sid].type == SESSION_TELNET)
+						telnet_send_naws(sid);
+				}
+			}
+
+			sync_scrollbar(wc);
 		}
 	}
 }
@@ -1906,6 +1954,56 @@ static int has_active_local_worker(void)
 	return 0;
 }
 
+/* ---- scrollbar support ---- */
+
+/* module-level UPP for scrollbar action proc (created once) */
+static ControlActionUPP g_scroll_action_upp = NULL;
+static struct window_context* g_scroll_wc = NULL;
+
+static pascal void scrollbar_action_proc(ControlHandle ctl, short part)
+{
+	(void)ctl;
+	if (g_scroll_wc == NULL) return;
+	switch (part)
+	{
+		case kControlUpButtonPart:   scroll_up_line(g_scroll_wc); break;
+		case kControlDownButtonPart: scroll_down_line(g_scroll_wc); break;
+		case kControlPageUpPart:     scroll_up(g_scroll_wc); break;
+		case kControlPageDownPart:   scroll_down(g_scroll_wc); break;
+	}
+}
+
+static void handle_scrollbar_click(struct window_context* wc, Point pt, short part)
+{
+	int sid = wc->session_ids[wc->active_session_idx];
+	struct session* s = &sessions[sid];
+
+	if (g_scroll_action_upp == NULL)
+		g_scroll_action_upp = NewControlActionUPP(scrollbar_action_proc);
+
+	if (part == kControlIndicatorPart)
+	{
+		TrackControl(wc->vscroll, pt, NULL);
+		{
+			int val = GetControlValue(wc->vscroll);
+			int max_val = GetControlMaximum(wc->vscroll);
+			s->scroll_offset = max_val - val;
+			if (s->scroll_offset < 0) s->scroll_offset = 0;
+			console_mark_full_dirty(sid);
+			SetPort(wc->win);
+			InvalRect(&wc->win->portRect);
+			wc->needs_redraw = 1;
+		}
+	}
+	else
+	{
+		g_scroll_wc = wc;
+		TrackControl(wc->vscroll, pt, g_scroll_action_upp);
+		g_scroll_wc = NULL;
+	}
+	sync_scrollbar(wc);
+}
+
 void event_loop(void)
 {
 	int exit_event_loop = 0;
@@ -1933,6 +2031,13 @@ void event_loop(void)
 				if (!windows[i].in_use) continue;
 				SetPort(windows[i].win);
 				check_cursor(&windows[i]);
+
+				/* drain scrollbar_dirty flag (set by sb_pushline/popline from callbacks) */
+				{
+					int sid = windows[i].session_ids[windows[i].active_session_idx];
+					if (sessions[sid].scrollbar_dirty)
+						sync_scrollbar(&windows[i]);
+				}
 
 				if (windows[i].needs_redraw)
 				{
@@ -1964,6 +2069,8 @@ void event_loop(void)
 					struct window_context* wc = find_window_context(eventWin);
 					if (wc != NULL)
 					{
+						/* system-initiated redraws (expose, move) need full paint */
+						console_mark_full_dirty(wc->session_ids[wc->active_session_idx]);
 						SetPort(eventWin);
 						BeginUpdate(eventWin);
 						draw_screen(wc, &(eventWin->portRect));
@@ -2071,8 +2178,10 @@ void event_loop(void)
 							struct window_context* wc = find_window_context(eventWin);
 							if (wc != NULL)
 							{
-								// activate this window if not already active
 								int wid = (int)(wc - windows);
+								ControlHandle hit_ctl;
+								short hit_part;
+
 								if (wid != active_window)
 								{
 									active_window = wid;
@@ -2080,7 +2189,17 @@ void event_loop(void)
 								}
 								SetPort(eventWin);
 								GetMouse(&local_mouse_position);
-								mouse_click(wc, local_mouse_position, true);
+
+								/* check if click hit the scrollbar */
+								hit_part = FindControl(local_mouse_position, eventWin, &hit_ctl);
+								if (hit_part != 0 && hit_ctl == wc->vscroll)
+								{
+									handle_scrollbar_click(wc, local_mouse_position, hit_part);
+								}
+								else
+								{
+									mouse_click(wc, local_mouse_position, true);
+								}
 							}
 						}
 						break;
@@ -2104,9 +2223,22 @@ void event_loop(void)
 				eventWin = (WindowPtr)event.message;
 				{
 					struct window_context* wc = find_window_context(eventWin);
-					if (wc != NULL && (event.modifiers & activeFlag))
+					if (wc != NULL)
 					{
-						active_window = (int)(wc - windows);
+						if (event.modifiers & activeFlag)
+						{
+							active_window = (int)(wc - windows);
+							if (wc->vscroll != NULL)
+							{
+								int sid = wc->session_ids[wc->active_session_idx];
+								HiliteControl(wc->vscroll, sessions[sid].sb_count > 0 ? 0 : 255);
+							}
+						}
+						else
+						{
+							if (wc->vscroll != NULL)
+								HiliteControl(wc->vscroll, 255);
+						}
 					}
 				}
 				break;
@@ -2898,7 +3030,7 @@ int main(int argc, char** argv)
 
 	event_loop();
 
-	// cleanup all windows and sessions
+	/* cleanup all windows and sessions */
 	{
 		int i;
 		for (i = 0; i < MAX_WINDOWS; i++)
@@ -2907,6 +3039,14 @@ int main(int argc, char** argv)
 				close_window(i);
 		}
 	}
+
+	if (g_scroll_action_upp != NULL)
+	{
+		DisposeControlActionUPP(g_scroll_action_upp);
+		g_scroll_action_upp = NULL;
+	}
+
+	cleanup_row_gworld();
 
 	if (prefs.pubkey_path != NULL && prefs.pubkey_path[0] != '\0') free(prefs.pubkey_path);
 	if (prefs.privkey_path != NULL && prefs.privkey_path[0] != '\0') free(prefs.privkey_path);
