@@ -83,6 +83,7 @@ struct session
 	unsigned char telnet_state;       /* IAC parser state */
 	unsigned char telnet_sb_buf[64];  /* subnegotiation buffer */
 	int telnet_sb_len;
+	unsigned char ansi_fixup_state;  /* 0=normal, 1=saw ESC, 2=saw ESC[ */
 
 	// thread state
 	enum THREAD_COMMAND thread_command;
@@ -99,7 +100,7 @@ struct session
 
 	// command history
 	#define SHELL_HISTORY_SIZE 32
-	char shell_history[SHELL_HISTORY_SIZE][256];
+	char (*shell_history)[256]; /* malloc'd for SESSION_LOCAL only */
 	int shell_history_count; // total entries stored
 	int shell_history_pos;   // current browse position (-1 = editing new line)
 	char shell_saved_line[256]; // saved line when browsing history
@@ -146,8 +147,8 @@ struct session
 	short ftp_glob_vRefNum;      // directory to enumerate
 	long ftp_glob_dirID;         // directory to enumerate
 
-	// scrollback buffer (ring buffer of compact rows)
-	struct sb_cell scrollback[SCROLLBACK_LINES][SCROLLBACK_COLS];
+	// scrollback buffer (ring buffer of compact rows, malloc'd per session)
+	struct sb_cell (*scrollback)[SCROLLBACK_COLS];
 	int sb_head;    // next write position in ring
 	int sb_count;   // total lines stored (max SCROLLBACK_LINES)
 	int scroll_offset; // how many lines scrolled back (0 = live)

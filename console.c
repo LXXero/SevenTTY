@@ -991,7 +991,11 @@ static int get_cell_scrolled(struct window_context* wc, int display_row, int col
 	if (s->scroll_offset > 0 && display_row < s->scroll_offset)
 	{
 		/* this row comes from scrollback */
-		int sb_idx = s->sb_head - s->scroll_offset + display_row;
+		int sb_idx;
+
+		if (s->scrollback == NULL) return 0;
+
+		sb_idx = s->sb_head - s->scroll_offset + display_row;
 		if (sb_idx < 0) sb_idx += SCROLLBACK_LINES;
 
 		memset(cell, 0, sizeof(VTermScreenCell));
@@ -1848,6 +1852,8 @@ static int sb_pushline(int cols, const VTermScreenCell *cells, void *user)
 	int store_cols = cols < SCROLLBACK_COLS ? cols : SCROLLBACK_COLS;
 	int i;
 
+	if (s->scrollback == NULL) return 0;
+
 	/* convert VTermScreenCell to compact sb_cell */
 	for (i = 0; i < store_cols; i++)
 	{
@@ -1901,7 +1907,7 @@ static int sb_popline(int cols, VTermScreenCell *cells, void *user)
 	struct session* s = &sessions[idx];
 	int i;
 
-	if (s->sb_count == 0) return 0;
+	if (s->sb_count == 0 || s->scrollback == NULL) return 0;
 
 	s->sb_count--;
 	s->sb_head = (s->sb_head + SCROLLBACK_LINES - 1) % SCROLLBACK_LINES;

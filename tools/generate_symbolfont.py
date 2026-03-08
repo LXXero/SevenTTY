@@ -1050,7 +1050,7 @@ def emit_rez():
         data = pack_nfnt(pt, cw, ch, asc, dsc, lead)
 
         print(f"/* NFNT for {pt}pt: {cw}x{ch} cells, ascent={asc} descent={dsc} leading={lead} */")
-        print(f"data 'NFNT' ({nfnt_id}, \"SevenTTY Symbols {pt}\", purgeable) {{")
+        print(f"data 'NFNT' ({nfnt_id}, \"SevenTTY Symbols {pt}\") {{")
 
         # Font header (13 words = 26 bytes)
         # Word 0: fontType — 0x9000 = fixedWidth(0x2000) | dontExpand(0x1000) | prop-unused bits
@@ -1115,7 +1115,7 @@ def emit_rez():
     # The FOND ties all sizes together under one font family
     # We'll emit it as raw data since the Rez FOND template is complex
     print("/* Font family resource */")
-    print(f"data 'FOND' ({FOND_ID}, \"SevenTTY Symbols\", purgeable) {{")
+    print(f"data 'FOND' ({FOND_ID}, \"SevenTTY Symbols\") {{")
 
     # FOND resource structure (Inside Macintosh: Text, Chapter 4)
     # All offsets are LongInt (4 bytes), arrays are proper sizes

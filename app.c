@@ -996,6 +996,7 @@ void init_session(struct session* s)
 	s->shell_line[0] = '\0';
 	s->shell_line_len = 0;
 	s->shell_cursor_pos = 0;
+	s->shell_history = NULL;
 	s->wget_url[0] = '\0';
 	s->wget_no_progress = 0;
 	s->scp_user[0] = '\0';
@@ -1025,6 +1026,10 @@ void init_session(struct session* s)
 	s->ftp_glob_pattern[0] = '\0';
 	s->ftp_glob_vRefNum = 0;
 	s->ftp_glob_dirID = 0;
+	s->scrollback = NULL;
+	s->sb_head = 0;
+	s->sb_count = 0;
+	s->scroll_offset = 0;
 	s->dirty_start_row = -1;
 	s->dirty_end_row = -1;
 	s->force_full_redraw = 1;
@@ -1170,6 +1175,27 @@ int new_session(struct window_context* wc, enum SESSION_TYPE type)
 	init_session(&sessions[idx]);
 	sessions[idx].in_use = 1;
 	sessions[idx].type = type;
+
+	/* allocate scrollback buffer (32KB) */
+	sessions[idx].scrollback = (struct sb_cell (*)[SCROLLBACK_COLS])
+		NewPtr(SCROLLBACK_LINES * SCROLLBACK_COLS * sizeof(struct sb_cell));
+	if (sessions[idx].scrollback == NULL)
+	{
+		sessions[idx].in_use = 0;
+		return -1;
+	}
+	memset(sessions[idx].scrollback, 0,
+		SCROLLBACK_LINES * SCROLLBACK_COLS * sizeof(struct sb_cell));
+
+	/* allocate shell history (8KB) for local sessions only */
+	if (type == SESSION_LOCAL)
+	{
+		sessions[idx].shell_history = (char (*)[256])
+			NewPtr(SHELL_HISTORY_SIZE * 256);
+		if (sessions[idx].shell_history != NULL)
+			memset(sessions[idx].shell_history, 0, SHELL_HISTORY_SIZE * 256);
+	}
+
 	add_session_to_window(wc, idx);
 
 	// grow window if tab bar just appeared (1 -> 2 sessions)
@@ -1285,6 +1311,18 @@ void close_session(int idx)
 	{
 		vterm_free(sessions[idx].vterm);
 		sessions[idx].vterm = NULL;
+	}
+
+	/* free dynamic buffers */
+	if (sessions[idx].scrollback != NULL)
+	{
+		DisposePtr((Ptr)sessions[idx].scrollback);
+		sessions[idx].scrollback = NULL;
+	}
+	if (sessions[idx].shell_history != NULL)
+	{
+		DisposePtr((Ptr)sessions[idx].shell_history);
+		sessions[idx].shell_history = NULL;
 	}
 
 	sessions[idx].in_use = 0;
@@ -1932,6 +1970,16 @@ static void reap_detached_sessions(void)
 				vterm_free(s->vterm);
 				s->vterm = NULL;
 			}
+			if (s->scrollback != NULL)
+			{
+				DisposePtr((Ptr)s->scrollback);
+				s->scrollback = NULL;
+			}
+			if (s->shell_history != NULL)
+			{
+				DisposePtr((Ptr)s->shell_history);
+				s->shell_history = NULL;
+			}
 		}
 	}
 }
@@ -2042,9 +2090,7 @@ void event_loop(void)
 				if (windows[i].needs_redraw)
 				{
 					windows[i].needs_redraw = 0;
-					BeginUpdate(windows[i].win);
 					draw_screen(&windows[i], &(windows[i].win->portRect));
-					EndUpdate(windows[i].win);
 				}
 			}
 		}
@@ -2817,7 +2863,7 @@ int ssh_connect(int session_idx)
 
 	if (ok)
 	{
-		err = NewThread(kCooperativeThread, read_thread, (void*)(intptr_t)session_idx, 100000, kCreateIfNeeded, NULL, &read_thread_id);
+		err = NewThread(kCooperativeThread, read_thread, (void*)(intptr_t)session_idx, THREAD_STACK_READ, kCreateIfNeeded, NULL, &read_thread_id);
 
 		if (err < 0)
 		{

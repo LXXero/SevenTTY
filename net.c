@@ -48,6 +48,69 @@ void ssh_write(char* buf, size_t len)
 	ssh_write_s(active_session_global(), buf, len);
 }
 
+/* Translate ANSI.SYS sequences to DEC VT equivalents.
+   ESC[s -> ESC 7 (save cursor), ESC[u -> ESC 8 (restore cursor).
+   Uses per-session state to handle sequences split across chunks.
+   Reads from in, writes to out. Returns output length. */
+static int ansi_sys_fixup(int session_idx, const char* in, int len,
+                          char* out)
+{
+	struct session* s = &sessions[session_idx];
+	int ri = 0, wi = 0;
+
+	while (ri < len)
+	{
+		char c = in[ri];
+
+		switch (s->ansi_fixup_state)
+		{
+			case 0:
+				if (c == '\033')
+					s->ansi_fixup_state = 1;
+				else
+					out[wi++] = c;
+				ri++;
+				break;
+
+			case 1:
+				if (c == '[')
+				{
+					s->ansi_fixup_state = 2;
+					ri++;
+				}
+				else
+				{
+					out[wi++] = '\033';
+					s->ansi_fixup_state = 0;
+				}
+				break;
+
+			case 2:
+				if (c == 's')
+				{
+					out[wi++] = '\033';
+					out[wi++] = '7';
+				}
+				else if (c == 'u')
+				{
+					out[wi++] = '\033';
+					out[wi++] = '8';
+				}
+				else
+				{
+					out[wi++] = '\033';
+					out[wi++] = '[';
+					out[wi++] = c;
+				}
+				s->ansi_fixup_state = 0;
+				ri++;
+				break;
+		}
+	}
+
+	return wi;
+}
+
 // read from the channel and print to console
 void ssh_read(int session_idx)
 {
@@ -64,6 +127,16 @@ void ssh_read(int session_idx)
 			printf_s(session_idx, "channel read error: %s\r\n", libssh2_error_string(rc));
 			s->thread_command = EXIT;
 		}
+	}
+
+	if (rc > 0)
+	{
+		char fixup[SSH_BUFFER_SIZE];
+		int fixup_len = ansi_sys_fixup(session_idx, s->recv_buffer, rc,
+		                               fixup);
+		rc = fixup_len;
+		if (rc > 0)
+			memcpy(s->recv_buffer, fixup, rc);
 	}
 
 	while (rc > 0 && s->vterm != NULL)

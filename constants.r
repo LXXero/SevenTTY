@@ -23,6 +23,10 @@
 /* making this too large is bad for responsiveness on 68k machines */
 #define SSH_BUFFER_SIZE 4*1024
 
+/* thread stack sizes (allocated from app heap) */
+#define THREAD_STACK_READ   48*1024
+#define THREAD_STACK_WORKER 64*1024
+
 /* default terminal string */
 #define DEFAULT_TERM_STRING "xterm-256color"
 
