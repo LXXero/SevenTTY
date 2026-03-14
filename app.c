@@ -1034,6 +1034,8 @@ void init_session(struct session* s)
 	s->dirty_end_row = -1;
 	s->force_full_redraw = 1;
 	s->scrollbar_dirty = 1;
+	s->redir_refnum = 0;
+	s->redir_quiet = 0;
 	s->window_id = -1;
 }
 

@@ -159,6 +159,10 @@ struct session
 	int force_full_redraw; /* 1 = redraw everything next frame */
 	int scrollbar_dirty;   /* set from sb callbacks; main thread syncs control */
 
+	// output redirection: > file / >> file in shell
+	short redir_refnum;   /* open file refnum, 0 = no redirect */
+	int redir_quiet;      /* 1 = suppress terminal output (> only) */
+
 	// which window owns this session
 	int window_id;
 };
@@ -277,3 +281,4 @@ int telnet_connect(int session_idx);
 void telnet_disconnect(int session_idx);
 int nc_inline_connect(int session_idx);
 void nc_inline_disconnect(int session_idx);
+

@@ -85,9 +85,9 @@ void tcp_output_callback(const char *s, size_t len, void *user)
 /* connect timeout: 30 seconds (1800 ticks).  set before OTConnect,
    cleared after.  the notifier cancels the blocking call if exceeded. */
 #define TCP_CONNECT_TIMEOUT  1800
-static unsigned long tcp_connect_deadline = 0;
-static EndpointRef tcp_connect_ep = kOTInvalidEndpointRef;
-static int tcp_connect_session_idx = -1;
+unsigned long tcp_connect_deadline = 0;
+EndpointRef tcp_connect_ep = kOTInvalidEndpointRef;
+int tcp_connect_session_idx = -1;
 
 /* OT notifier: yields to cooperative threads during blocking calls.
    Called at system task time with kOTSyncIdleEvent when
@@ -515,13 +515,16 @@ static int telnet_process(int session_idx, const unsigned char* in, int in_len,
 /* read functions                                                     */
 /* ------------------------------------------------------------------ */
 
+static int ansi_sys_fixup(int session_idx, const char* in, int len, char* out);
+
 static void telnet_read(int session_idx)
 {
 	struct session* s = &sessions[session_idx];
 	OTFlags ot_flags = 0;
 	OTResult rc;
 	unsigned char clean[SSH_BUFFER_SIZE];
-	int clean_len;
+	char fixup[SSH_BUFFER_SIZE];
+	int clean_len, fixup_len;
 
 	/* read half-buffer so CRLF expansion fits in clean[] */
 	rc = OTRcv(s->endpoint, s->recv_buffer, SSH_BUFFER_SIZE / 2, &ot_flags);
@@ -548,7 +551,78 @@ static void telnet_read(int session_idx)
 	                           (int)rc, clean);
 
 	if (clean_len > 0)
-		vterm_input_write(s->vterm, (char*)clean, clean_len);
+	{
+		fixup_len = ansi_sys_fixup(session_idx, (char*)clean, clean_len,
+		                           fixup);
+		vterm_input_write(s->vterm, fixup, fixup_len);
+	}
+}
+
+/* Translate ANSI.SYS escape sequences to DEC VT equivalents.
+   ESC[s (save cursor) -> ESC 7 (DECSC)
+   ESC[u (restore cursor) -> ESC 8 (DECRC)
+   vterm interprets ESC[s as DECSLRM (set left/right margins) which
+   breaks BBS ANSI art that uses ESC[s/u for cursor save/restore.
+   Uses per-session state to handle sequences split across TCP chunks.
+   Reads from in, writes to out. Returns output length. */
+static int ansi_sys_fixup(int session_idx, const char* in, int len,
+                          char* out)
+{
+	struct session* s = &sessions[session_idx];
+	int ri = 0, wi = 0;
+
+	while (ri < len)
+	{
+		char c = in[ri];
+
+		switch (s->ansi_fixup_state)
+		{
+			case 0: /* normal */
+				if (c == '\033')
+					s->ansi_fixup_state = 1;
+				else
+					out[wi++] = c;
+				ri++;
+				break;
+
+			case 1: /* saw ESC */
+				if (c == '[')
+				{
+					s->ansi_fixup_state = 2;
+					ri++;
+				}
+				else
+				{
+					/* not ESC[, emit the ESC and reprocess this byte */
+					out[wi++] = '\033';
+					s->ansi_fixup_state = 0;
+				}
+				break;
+
+			case 2: /* saw ESC[ */
+				if (c == 's')
+				{
+					out[wi++] = '\033';
+					out[wi++] = '7';
+				}
+				else if (c == 'u')
+				{
+					out[wi++] = '\033';
+					out[wi++] = '8';
+				}
+				else
+				{
+					out[wi++] = '\033';
+					out[wi++] = '[';
+					out[wi++] = c;
+				}
+				s->ansi_fixup_state = 0;
+				ri++;
+				break;
+		}
+	}
+
+	return wi;
 }
 
 /* convert bare LF to CRLF for vterm display */
@@ -575,7 +649,8 @@ static void nc_raw_read(int session_idx)
 	OTFlags ot_flags = 0;
 	OTResult rc;
 	char clean[SSH_BUFFER_SIZE];
-	int clean_len;
+	char fixup[SSH_BUFFER_SIZE];
+	int clean_len, fixup_len;
 
 	/* read half-buffer so CRLF expansion fits in clean[] */
 	rc = OTRcv(s->endpoint, s->recv_buffer, SSH_BUFFER_SIZE / 2, &ot_flags);
@@ -599,7 +674,17 @@ static void nc_raw_read(int session_idx)
 	}
 
 	clean_len = lf_to_crlf(s->recv_buffer, (int)rc, clean);
-	vterm_input_write(s->vterm, clean, clean_len);
+	fixup_len = ansi_sys_fixup(session_idx, clean, clean_len, fixup);
+
+	/* write to redirect file if active (nc > file) */
+	if (s->redir_refnum != 0)
+	{
+		long count = (long)fixup_len;
+		FSWrite(s->redir_refnum, &count, fixup);
+	}
+
+	if (!s->redir_quiet)
+		vterm_input_write(s->vterm, fixup, fixup_len);
 }
 
 /* ------------------------------------------------------------------ */
@@ -777,7 +862,7 @@ int telnet_connect(int session_idx)
 	s->thread_command = WAIT;
 
 	err = NewThread(kCooperativeThread, telnet_read_thread,
-	                (void*)(intptr_t)session_idx, 100000,
+	                (void*)(intptr_t)session_idx, THREAD_STACK_READ,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
@@ -916,7 +1001,7 @@ int nc_inline_connect(int session_idx)
 	s->thread_command = WAIT;
 
 	err = NewThread(kCooperativeThread, nc_read_thread,
-	                (void*)(intptr_t)session_idx, 100000,
+	                (void*)(intptr_t)session_idx, THREAD_STACK_READ,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{

@@ -75,10 +75,92 @@ static int local_shell_worker_active(const struct session* s);
 /* utility: write a C string into the session's vterm                 */
 /* ------------------------------------------------------------------ */
 
+/* Mac Roman bytes 0x80-0xFF to Unicode codepoints.
+   Used to convert local shell output to UTF-8 for vterm. */
+static const unsigned short mac_roman_to_unicode[128] = {
+	0x00C4, 0x00C5, 0x00C7, 0x00C9, 0x00D1, 0x00D6, 0x00DC, 0x00E1,
+	0x00E0, 0x00E2, 0x00E4, 0x00E3, 0x00E5, 0x00E7, 0x00E9, 0x00E8,
+	0x00EA, 0x00EB, 0x00ED, 0x00EC, 0x00EE, 0x00EF, 0x00F1, 0x00F3,
+	0x00F2, 0x00F4, 0x00F6, 0x00F5, 0x00FA, 0x00F9, 0x00FB, 0x00FC,
+	0x2020, 0x00B0, 0x00A2, 0x00A3, 0x00A7, 0x2022, 0x00B6, 0x00DF,
+	0x00AE, 0x00A9, 0x2122, 0x00B4, 0x00A8, 0x2260, 0x00C6, 0x00D8,
+	0x221E, 0x00B1, 0x2264, 0x2265, 0x00A5, 0x00B5, 0x2202, 0x2211,
+	0x220F, 0x03C0, 0x222B, 0x00AA, 0x00BA, 0x2126, 0x00E6, 0x00F8,
+	0x00BF, 0x00A1, 0x00AC, 0x221A, 0x0192, 0x2248, 0x2206, 0x00AB,
+	0x00BB, 0x2026, 0x00A0, 0x00C0, 0x00C3, 0x00D5, 0x0152, 0x0153,
+	0x2013, 0x2014, 0x201C, 0x201D, 0x2018, 0x2019, 0x00F7, 0x25CA,
+	0x00FF, 0x0178, 0x2044, 0x20AC, 0x2039, 0x203A, 0xFB01, 0xFB02,
+	0x2021, 0x00B7, 0x201A, 0x201E, 0x2030, 0x00C2, 0x00CA, 0x00C1,
+	0x00CB, 0x00C8, 0x00CD, 0x00CE, 0x00CF, 0x00CC, 0x00D3, 0x00D4,
+	0xF8FF, 0x00D2, 0x00DA, 0x00DB, 0x00D9, 0x0131, 0x02C6, 0x02DC,
+	0x00AF, 0x02D8, 0x02D9, 0x02DA, 0x00B8, 0x02DD, 0x02DB, 0x02C7
+};
+
+/* Write Mac Roman data to vterm as UTF-8.  Bytes 0x00-0x7F pass through
+   unchanged (ASCII = UTF-8).  Bytes 0x80-0xFF are looked up in the Mac
+   Roman table and encoded as multi-byte UTF-8. */
+static void vt_write_mr(int idx, const char* s, size_t len)
+{
+	char buf[512];
+	int bi = 0;
+	size_t i;
+	const unsigned char* p = (const unsigned char*)s;
+	VTerm* vt = sessions[idx].vterm;
+
+	if (!vt) return;
+
+	for (i = 0; i < len; i++)
+	{
+		unsigned char ch = p[i];
+		if (ch < 0x80)
+		{
+			buf[bi++] = ch;
+		}
+		else
+		{
+			unsigned short cp = mac_roman_to_unicode[ch - 0x80];
+			if (cp < 0x80)
+			{
+				buf[bi++] = (char)cp;
+			}
+			else if (cp < 0x800)
+			{
+				buf[bi++] = 0xC0 | (cp >> 6);
+				buf[bi++] = 0x80 | (cp & 0x3F);
+			}
+			else
+			{
+				buf[bi++] = 0xE0 | (cp >> 12);
+				buf[bi++] = 0x80 | ((cp >> 6) & 0x3F);
+				buf[bi++] = 0x80 | (cp & 0x3F);
+			}
+		}
+		if (bi >= 508)
+		{
+			vterm_input_write(vt, buf, bi);
+			bi = 0;
+		}
+	}
+	if (bi > 0)
+		vterm_input_write(vt, buf, bi);
+}
+
+static void redir_write(int idx, const char* s, size_t len)
+{
+	short ref = sessions[idx].redir_refnum;
+	if (ref != 0)
+	{
+		long count = (long)len;
+		FSWrite(ref, &count, s);
+	}
+}
+
 static void vt_write(int idx, const char* s)
 {
-	if (sessions[idx].vterm)
-		vterm_input_write(sessions[idx].vterm, s, strlen(s));
+	size_t len = strlen(s);
+	redir_write(idx, s, len);
+	if (!sessions[idx].redir_quiet && sessions[idx].vterm)
+		vt_write_mr(idx, s, len);
 }
 
 static void copy_cstr_trunc(char* dst, size_t dst_size, const char* src)
@@ -94,14 +176,46 @@ static void copy_cstr_trunc(char* dst, size_t dst_size, const char* src)
 
 static void vt_write_n(int idx, const char* s, size_t n)
 {
-	if (sessions[idx].vterm)
-		vterm_input_write(sessions[idx].vterm, s, n);
+	redir_write(idx, s, n);
+	if (!sessions[idx].redir_quiet && sessions[idx].vterm)
+		vt_write_mr(idx, s, n);
 }
 
 static void vt_char(int idx, char c)
 {
-	if (sessions[idx].vterm)
+	unsigned char uc = (unsigned char)c;
+	redir_write(idx, &c, 1);
+	if (sessions[idx].redir_quiet) return;
+	if (!sessions[idx].vterm) return;
+	if (uc < 0x80)
+	{
 		vterm_input_write(sessions[idx].vterm, &c, 1);
+	}
+	else
+	{
+		char buf[4];
+		unsigned short cp = mac_roman_to_unicode[uc - 0x80];
+		int len = 0;
+		if (cp < 0x80)
+		{
+			buf[0] = (char)cp;
+			len = 1;
+		}
+		else if (cp < 0x800)
+		{
+			buf[0] = 0xC0 | (cp >> 6);
+			buf[1] = 0x80 | (cp & 0x3F);
+			len = 2;
+		}
+		else
+		{
+			buf[0] = 0xE0 | (cp >> 12);
+			buf[1] = 0x80 | ((cp >> 6) & 0x3F);
+			buf[2] = 0x80 | (cp & 0x3F);
+			len = 3;
+		}
+		vterm_input_write(sessions[idx].vterm, buf, len);
+	}
 }
 
 /* simple integer-to-string for printf_s %d (which exists but let's
@@ -4139,6 +4253,8 @@ static void cmd_history(int idx, int argc, char** argv)
 	(void)argc;
 	(void)argv;
 
+	if (s->shell_history == NULL) return;
+
 	for (i = 0; i < avail; i++)
 	{
 		int hi = (start + i) % SHELL_HISTORY_SIZE;
@@ -6246,6 +6362,8 @@ retry_redirect:
 /* ------------------------------------------------------------------ */
 
 /* TCP connect helper: create, bind, connect an OT TCP endpoint.
+   Uses the same notifier and setup as tcp_init_connection (telnet/nc)
+   which is proven to work for FTP via nc.
    Returns endpoint or kOTInvalidEndpointRef on failure. */
 static EndpointRef ftp_tcp_connect(int idx, const char* host,
                                    unsigned short port)
@@ -6289,12 +6407,23 @@ static EndpointRef ftp_tcp_connect(int idx, const char* host,
 	sndCall.addr.len = OTInitDNSAddress(&hostDNSAddress, hostport);
 
 	ot_timeout_provider = ep;
-	ot_timeout_deadline = TickCount() + OT_TIMEOUT_TICKS;
+	ot_timeout_deadline = TickCount() + 1800;
 
 	err = OTConnect(ep, &sndCall, nil);
 
 	ot_timeout_deadline = 0;
 	ot_timeout_provider = nil;
+
+	if (err == kOTLookErr)
+	{
+		OTResult ev = OTLook(ep);
+		if (ev == T_DISCONNECT)
+			OTRcvDisconnect(ep, nil);
+		printf_s(idx, "connection refused\r\n");
+		OTUnbind(ep);
+		OTCloseProvider(ep);
+		return kOTInvalidEndpointRef;
+	}
 
 	if (err != noErr)
 	{
@@ -6307,9 +6436,11 @@ static EndpointRef ftp_tcp_connect(int idx, const char* host,
 		return kOTInvalidEndpointRef;
 	}
 
-	/* switch to non-blocking for data I/O */
-	OTSetNonBlocking(ep);
+	YieldToAnyThread();
+
+	/* switch to non-blocking for send/recv */
 	OTUseSyncIdleEvents(ep, false);
+	OTSetNonBlocking(ep);
 
 	return ep;
 }
@@ -6354,14 +6485,21 @@ static int ftp_recv_line(int idx, EndpointRef ep,
 {
 	struct session* s = &sessions[idx];
 	unsigned long deadline = TickCount() + 1800;
+	OTFlags ot_flags;
 
 	while (1)
 	{
 		int i;
 		OTResult r;
 
-		if (s->thread_command == EXIT || !s->in_use) return -1;
-		if (TickCount() > deadline) return -1;
+		if (s->thread_command == EXIT || !s->in_use)
+			return -1;
+		if (TickCount() > deadline)
+		{
+			printf_s(idx, "\r\n[ftp_recv: 30s timeout, buf_pos=%d]\r\n",
+			         *buf_pos);
+			return -1;
+		}
 
 		/* check if we already have a complete line */
 		for (i = 0; i < *buf_pos; i++)
@@ -6373,15 +6511,21 @@ static int ftp_recv_line(int idx, EndpointRef ep,
 		if (*buf_pos >= buf_size - 1)
 			return -1; /* overflow */
 
-		r = OTRcv(ep, buf + *buf_pos, buf_size - 1 - *buf_pos, nil);
+		ot_flags = 0;
+		r = OTRcv(ep, buf + *buf_pos, buf_size - 1 - *buf_pos, &ot_flags);
 		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
 		if (r == kOTLookErr)
 		{
 			OTResult ev = OTLook(ep);
+			printf_s(idx, "\r\n[ftp_recv: OTLookErr, ev=%d]\r\n", (int)ev);
 			if (ev == T_ORDREL) OTRcvOrderlyDisconnect(ep);
 			return -1;
 		}
-		if (r <= 0) return -1;
+		if (r <= 0)
+		{
+			printf_s(idx, "\r\n[ftp_recv: OTRcv=%d]\r\n", (int)r);
+			return -1;
+		}
 		*buf_pos += r;
 		deadline = TickCount() + 1800;
 	}
@@ -6408,7 +6552,7 @@ static int ftp_command(int idx, EndpointRef ctrl_ep,
 		char cmd_line[600];
 		snprintf(cmd_line, sizeof(cmd_line), "%s\r\n", cmd);
 		if (ftp_send_str(idx, ctrl_ep, cmd_line) < 0)
-			return -1;
+			return -2; /* send failed */
 	}
 
 	/* read response lines */
@@ -6420,12 +6564,10 @@ static int ftp_command(int idx, EndpointRef ctrl_ep,
 		char* line_start;
 
 		line_len = ftp_recv_line(idx, ctrl_ep, line_buf, sizeof(line_buf), &line_pos);
-		if (line_len < 0) return -1;
+		if (line_len < 0)
+			return -1;
 
-		/* null-terminate the line */
-		line_buf[line_len] = '\0';
-
-		/* copy to response buffer */
+		/* copy to response buffer (best-effort; overflow is OK) */
 		if (resp_total + line_len < resp_buf_size - 1)
 		{
 			memcpy(resp_buf + resp_total, line_buf, line_len);
@@ -6433,19 +6575,8 @@ static int ftp_command(int idx, EndpointRef ctrl_ep,
 			resp_buf[resp_total] = '\0';
 		}
 
-		/* shift remaining data in line_buf */
-		if (line_len < line_pos)
-		{
-			memmove(line_buf, line_buf + line_len, line_pos - line_len);
-			line_pos -= line_len;
-		}
-		else
-		{
-			line_pos = 0;
-		}
-
-		/* parse 3-digit code */
-		line_start = resp_buf + resp_total - line_len;
+		/* parse 3-digit code from line_buf BEFORE shifting it */
+		line_start = line_buf;
 		if (line_len >= 4 && line_start[0] >= '1' && line_start[0] <= '5' &&
 		    line_start[1] >= '0' && line_start[1] <= '9' &&
 		    line_start[2] >= '0' && line_start[2] <= '9')
@@ -6474,6 +6605,17 @@ static int ftp_command(int idx, EndpointRef ctrl_ep,
 			return -1;
 		}
 		/* else: text-only continuation line in multiline, keep reading */
+
+		/* shift remaining data in line_buf for next recv */
+		if (line_len < line_pos)
+		{
+			memmove(line_buf, line_buf + line_len, line_pos - line_len);
+			line_pos -= line_len;
+		}
+		else
+		{
+			line_pos = 0;
+		}
 	}
 }
 
@@ -6513,7 +6655,11 @@ static int ftp_login(int idx, EndpointRef ctrl_ep,
 
 	snprintf(cmd, sizeof(cmd), "USER %s", user);
 	code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
-	if (code < 0) return 0;
+	if (code < 0)
+	{
+		printf_s(idx, "ftp: USER command failed (code %d)\r\n", code);
+		return 0;
+	}
 
 	if (code == 230) return 1; /* logged in without password */
 
@@ -6523,7 +6669,7 @@ static int ftp_login(int idx, EndpointRef ctrl_ep,
 		snprintf(cmd, sizeof(cmd), "PASS %s", pass);
 		code = ftp_command(idx, ctrl_ep, cmd, resp, sizeof(resp));
 		if (code == 230) return 1;
-		vt_write(idx, "ftp: login failed\r\n");
+		printf_s(idx, "ftp: PASS rejected (%d)\r\n", code);
 		return 0;
 	}
 
@@ -6642,6 +6788,9 @@ static int ftp_parse_url(const char* url,
 		if (ndigits == 0 || pv == 0 || pv > 65535) return 0;
 		*port = (unsigned short)pv;
 	}
+
+	/* skip optional colon between port and path (ftp://host:port:/path) */
+	if (*p == ':') p++;
 
 	/* path */
 	if (*p == '/')
@@ -6817,6 +6966,7 @@ static int ftp_download(int idx, EndpointRef ctrl_ep,
 	while (1)
 	{
 		OTResult r;
+		OTFlags ot_flags = 0;
 		char buf[32768];
 
 		if (s->thread_command == EXIT || !s->in_use)
@@ -6831,7 +6981,7 @@ static int ftp_download(int idx, EndpointRef ctrl_ep,
 			break;
 		}
 
-		r = OTRcv(data_ep, buf, sizeof(buf), nil);
+		r = OTRcv(data_ep, buf, sizeof(buf), &ot_flags);
 		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
 		if (r == kOTLookErr)
 		{
@@ -7138,12 +7288,13 @@ static int ftp_list(int idx, EndpointRef ctrl_ep, const char* remote_path)
 	while (1)
 	{
 		OTResult r;
+		OTFlags ot_flags = 0;
 		char buf[4096];
 
 		if (s->thread_command == EXIT || !s->in_use) break;
 		if (TickCount() > recv_deadline) break;
 
-		r = OTRcv(data_ep, buf, sizeof(buf) - 1, nil);
+		r = OTRcv(data_ep, buf, sizeof(buf) - 1, &ot_flags);
 		if (r == kOTNoDataErr) { YieldToAnyThread(); continue; }
 		if (r == kOTLookErr)
 		{
@@ -7772,7 +7923,7 @@ static void cmd_ftp(int idx, int argc, char** argv)
 	s->endpoint = kOTInvalidEndpointRef;
 
 	err = NewThread(kCooperativeThread, ftp_worker_thread,
-	                (void*)(long)idx, 100000,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
@@ -7881,7 +8032,7 @@ static void cmd_wget(int idx, int argc, char** argv)
 	s->endpoint = kOTInvalidEndpointRef;
 
 	err = NewThread(kCooperativeThread, wget_worker_thread,
-	                (void*)(long)idx, 100000,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
@@ -8890,7 +9041,7 @@ static void cmd_scp(int idx, int argc, char** argv)
 	s->endpoint = kOTInvalidEndpointRef;
 
 	err = NewThread(kCooperativeThread, scp_worker_thread,
-	                (void*)(long)idx, 100000,
+	                (void*)(long)idx, THREAD_STACK_WORKER,
 	                kCreateIfNeeded, NULL, &tid);
 	if (err != noErr)
 	{
@@ -9822,9 +9973,66 @@ static void shell_complete(int idx)
 /* command dispatch                                                   */
 /* ------------------------------------------------------------------ */
 
+/* open a file for output redirection.
+   mode: 0 = truncate (>), 1 = append (>>).
+   returns file refnum or 0 on failure. */
+static short redir_open(int idx, const char* path, int append)
+{
+	struct session* s = &sessions[idx];
+	FSSpec spec;
+	OSErr e;
+	short refnum = 0;
+
+	e = resolve_path(idx, path, &spec);
+	if (e == fnfErr)
+	{
+		/* create it */
+		e = FSpCreate(&spec, 'SeT7', 'TEXT', smSystemScript);
+		if (e != noErr)
+		{
+			vt_write(idx, "redirect: cannot create file\r\n");
+			return 0;
+		}
+	}
+	else if (e != noErr)
+	{
+		vt_write(idx, "redirect: bad path\r\n");
+		return 0;
+	}
+
+	e = FSpOpenDF(&spec, fsRdWrPerm, &refnum);
+	if (e != noErr)
+	{
+		vt_write(idx, "redirect: cannot open file\r\n");
+		return 0;
+	}
+
+	if (append)
+		SetFPos(refnum, fsFromLEOF, 0);
+	else
+		SetEOF(refnum, 0);
+
+	return refnum;
+}
+
+static void redir_close(int idx)
+{
+	struct session* s = &sessions[idx];
+	if (s->redir_refnum != 0)
+	{
+		FSClose(s->redir_refnum);
+		s->redir_refnum = 0;
+		s->redir_quiet = 0;
+	}
+}
+
 static void shell_execute(int idx, char* line)
 {
 	char line_copy[256];
+	char* redir_file = NULL;
+	int redir_append = 0;
+	int i;
+
 	strncpy(line_copy, line, sizeof(line_copy) - 1);
 	line_copy[255] = '\0';
 
@@ -9832,6 +10040,33 @@ static void shell_execute(int idx, char* line)
 	int argc = parse_args(line_copy, argv, MAX_ARGS);
 
 	if (argc == 0) return;
+
+	/* scan for > or >> redirection */
+	for (i = 1; i < argc; i++)
+	{
+		if (strcmp(argv[i], ">>") == 0 || strcmp(argv[i], ">") == 0)
+		{
+			redir_append = (argv[i][1] == '>');
+			if (i + 1 < argc)
+				redir_file = argv[i + 1];
+			else
+			{
+				vt_write(idx, "syntax error: missing filename after redirect\r\n");
+				return;
+			}
+			/* remove > and filename from argv */
+			argc = i;
+			break;
+		}
+	}
+
+	if (redir_file != NULL)
+	{
+		struct session* s = &sessions[idx];
+		s->redir_refnum = redir_open(idx, redir_file, redir_append);
+		if (s->redir_refnum == 0) return;
+		s->redir_quiet = 1;
+	}
 
 	char* cmd = argv[0];
 
@@ -9954,6 +10189,10 @@ static void shell_execute(int idx, char* line)
 			vt_write(idx, ": command not found (type 'help')\r\n");
 		}
 	}
+
+	/* close redirect unless nc took over (it runs async) */
+	if (sessions[idx].worker_mode != WORKER_NC)
+		redir_close(idx);
 }
 
 /* ------------------------------------------------------------------ */
@@ -10077,6 +10316,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 				s->recv_buffer != NULL ||
 				s->send_buffer != NULL)
 				return;
+			redir_close(session_idx);
 			vt_write(session_idx, "\r\n(connection closed)\r\n");
 			shell_prompt(session_idx);
 			return;
@@ -10091,6 +10331,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 				((modifiers & controlKey) || (vkeycode != 0x4C && vkeycode != 0x77)))
 			{
 				nc_inline_disconnect(session_idx);
+				redir_close(session_idx);
 				s->shell_line_len = 0;
 				s->shell_line[0] = '\0';
 				vt_write(session_idx, "\r\n(disconnected)\r\n");
@@ -10135,6 +10376,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 		if (c == 3 || c == 4 || c == '\033')
 		{
 			nc_inline_disconnect(session_idx);
+			redir_close(session_idx);
 			vt_write(session_idx, "\r\n(cancelled)\r\n");
 			shell_prompt(session_idx);
 			return;
@@ -10315,7 +10557,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 	/* Up arrow: previous history entry */
 	if (c == kUpArrowCharCode)
 	{
-		if (s->shell_history_count == 0) return;
+		if (s->shell_history == NULL || s->shell_history_count == 0) return;
 
 		int next_pos;
 		if (s->shell_history_pos < 0)
@@ -10387,6 +10629,7 @@ void shell_input(int session_idx, unsigned char c, int modifiers, unsigned char 
 			s->shell_line[s->shell_line_len] = '\0';
 
 			/* add to history */
+			if (s->shell_history != NULL)
 			{
 				int hi = s->shell_history_count % SHELL_HISTORY_SIZE;
 				strncpy(s->shell_history[hi], s->shell_line, 255);

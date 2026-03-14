@@ -1724,11 +1724,30 @@ void printf_i(const char* str, ...)
 
 void printf_s(int session_idx, const char* str, ...)
 {
-	if (sessions[session_idx].vterm == NULL) return;
+	char buf[512];
+	int len;
 	va_list args;
+	struct session* s = &sessions[session_idx];
+
+	if (s->vterm == NULL) return;
+
 	va_start(args, str);
-	vprintf_to_vterm(sessions[session_idx].vterm, str, args);
+	len = vsnprintf(buf, sizeof(buf), str, args);
 	va_end(args);
+
+	if (len <= 0) return;
+	if (len >= (int)sizeof(buf)) len = (int)sizeof(buf) - 1;
+
+	/* write to redirect file if active */
+	if (s->redir_refnum != 0)
+	{
+		long count = len;
+		FSWrite(s->redir_refnum, &count, buf);
+	}
+
+	/* write to terminal (unless quiet redirect) */
+	if (!s->redir_quiet)
+		vterm_input_write(s->vterm, buf, len);
 }
 
 int bell(void* user)
